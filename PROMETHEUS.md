@@ -352,12 +352,240 @@ print(result.text)
 
 ---
 
+## Sprint 3: Model Adapter Layer ✓
+
+### `prometheus.adapter` — ModelAdapter
+`src/prometheus/adapter/__init__.py` — novel code
+
+```python
+class ModelAdapter:
+    def __init__(formatter=None, strictness="NONE", max_retries=3)
+    # formatter  defaults to AnthropicFormatter (passthrough)
+    # strictness "NONE" | "MEDIUM" | "STRICT" — controls validation depth
+
+    def format_request(system_prompt, tools) -> (str, list[dict])
+    # Calls formatter.format_system_prompt() + formatter.format_tools()
+    # Returns (formatted_system_prompt, formatted_tools)
+
+    def validate_and_repair(tool_name, tool_input, tool_registry) -> (str, dict, list[str])
+    # Returns (final_name, final_input, repairs_made) or raises ValueError
+
+    def extract_tool_calls(text, tool_registry=None) -> list[ToolUseBlock]
+    # Delegates to StructuredOutputEnforcer
+
+    def handle_retry(tool_name, error, tool_registry) -> (RetryAction, str)
+    # Delegates to RetryEngine
+```
+
+### `prometheus.adapter.validator` — ToolCallValidator
+`src/prometheus/adapter/validator.py` — novel code
+
+```python
+class Strictness(str, Enum):
+    NONE = "NONE"    # skip all validation (Claude API)
+    MEDIUM = "MEDIUM"  # validate + auto-repair (Qwen, Mistral)
+    STRICT = "STRICT"  # validate + repair + coerce aggressively
+
+@dataclass ValidationResult:
+    valid: bool; error: str; error_type: str
+    # error_type: unknown_tool | invalid_json | missing_param | wrong_type | extra_param
+
+@dataclass RepairResult:
+    repaired: bool; tool_name: str; tool_input: dict
+    repairs_made: list[str]; error: str
+
+class ToolCallValidator:
+    def __init__(strictness: Strictness | str = Strictness.NONE)
+    def validate(tool_name, tool_input, tool_registry) -> ValidationResult
+    def repair(tool_name, tool_input, error, tool_registry) -> RepairResult
+    # Repair strategies: fuzzy Levenshtein name match, JSON extraction from markdown,
+    # type coercion (str "5" → int 5), strip unknown params
+```
+
+### `prometheus.adapter.formatter` — Model-specific prompt formatting
+`src/prometheus/adapter/formatter.py` — novel code
+
+```python
+class ModelPromptFormatter(ABC):
+    def format_tools(tools: list[dict]) -> list[dict]
+    def format_system_prompt(base_prompt, tools, context=None) -> str
+    def parse_tool_calls(raw_response: str) -> list[ToolUseBlock]
+
+class AnthropicFormatter(ModelPromptFormatter)   # passthrough — Anthropic handles natively
+class QwenFormatter(ModelPromptFormatter)        # OpenAI format + explicit examples in system prompt
+class GemmaFormatter(ModelPromptFormatter)       # <tool_call>...</tool_call> native format
+```
+
+### `prometheus.adapter.retry` — RetryEngine
+`src/prometheus/adapter/retry.py` — novel code
+
+```python
+class RetryAction(str, Enum):
+    RETRY = "RETRY"   # send retry prompt to model
+    ABORT = "ABORT"   # max retries exceeded
+
+class RetryEngine:
+    def __init__(max_retries: int = 3)
+    def handle_failure(tool_name, error, tool_registry, session_key=None) -> (RetryAction, str)
+    def build_retry_prompt(tool_name, error, tool_registry) -> str
+    def retry_count(session_key: str) -> int
+    def reset(session_key: str | None = None) -> None
+```
+
+### `prometheus.adapter.enforcer` — StructuredOutputEnforcer
+`src/prometheus/adapter/enforcer.py` — novel code
+
+```python
+class StructuredOutputEnforcer:
+    def extract_tool_calls(raw_response, tool_registry=None) -> list[ToolUseBlock]
+    # Handles: clean JSON, JSON in ```json...``` blocks, mixed prose+JSON,
+    # multiple calls, partial/truncated JSON (best-effort repair)
+    # Optionally filters against tool_registry
+
+    def generate_grammar(tool_schemas: list[dict]) -> str
+    # Returns GBNF grammar string for llama.cpp constrained decoding
+    # Pass to LlamaCppProvider(grammar=...) to constrain model output
+```
+
+### `prometheus.telemetry.tracker` — ToolCallTelemetry
+`src/prometheus/telemetry/tracker.py` — novel code
+
+```python
+class ToolCallTelemetry:
+    def __init__(db_path: str | Path = "~/.prometheus/telemetry.db")
+    # SQLite storage — auto-creates parent dirs
+
+    def record(model, tool_name, success, retries=0, latency_ms=0.0,
+               error_type=None, error_detail=None) -> None
+
+    def report() -> dict
+    # Returns {
+    #   "models": {"<model>": {"<tool>": {calls, successes, failures,
+    #                                      success_rate, avg_retries, avg_latency_ms}}},
+    #   "tools":  {"<tool>": {calls, success_rate, avg_retries, avg_latency_ms, error_types}},
+    #   "total_calls": int,
+    #   "overall_success_rate": float,
+    # }
+
+    def close() -> None
+```
+
+### Real Provider Implementations
+
+#### `prometheus.providers.llama_cpp` — LlamaCppProvider
+`src/prometheus/providers/llama_cpp.py` — novel code
+
+```python
+class LlamaCppProvider(ModelProvider):
+    def __init__(base_url="http://localhost:8080", timeout=120.0, grammar=None)
+    # grammar: optional GBNF grammar string from StructuredOutputEnforcer.generate_grammar()
+    # Passes grammar to llama-server via the `grammar` request field
+    def set_grammar(grammar: str | None) -> None
+    async def stream_message(request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]
+```
+
+#### `prometheus.providers.ollama` — OllamaProvider
+`src/prometheus/providers/ollama.py` — novel code
+
+```python
+class OllamaProvider(ModelProvider):
+    def __init__(base_url="http://localhost:11434", timeout=120.0, force_json=False)
+    # force_json=True adds format="json" to requests for structured output
+    async def stream_message(request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]
+```
+
+#### `prometheus.providers.anthropic` — AnthropicProvider
+`src/prometheus/providers/anthropic.py` — novel code
+
+```python
+class AnthropicProvider(ModelProvider):
+    def __init__(api_key=None, model="claude-sonnet-4-6", timeout=120.0,
+                 prompt_caching=False, base_url=...)
+    # api_key: reads ANTHROPIC_API_KEY env var if not provided
+    # prompt_caching=True adds cache_control headers on long system prompts (≥1024 chars)
+    async def stream_message(request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]
+```
+
+### Updated AgentLoop signature (Sprint 3 additions)
+
+```python
+class AgentLoop:
+    def __init__(provider, model="qwen3.5-32b", max_tokens=4096, max_turns=200,
+                 tool_registry=None, hook_executor=None, permission_checker=None,
+                 adapter=None,    # NEW: ModelAdapter
+                 telemetry=None,  # NEW: ToolCallTelemetry
+                 cwd=None)
+```
+
+### LoopContext additions
+
+```python
+@dataclass LoopContext:
+    ...
+    adapter: object | None = None    # ModelAdapter — wired in Sprint 3
+    telemetry: object | None = None  # ToolCallTelemetry — wired in Sprint 3
+```
+
+### Sprint 3 wiring in the agent loop
+
+```
+Before LLM call:
+  adapter.format_request(system_prompt, tools)  → formatted_system, formatted_tools
+
+After LLM response:
+  if no tool_uses but text contains JSON:
+    adapter.extract_tool_calls(text, registry)  → inject as ToolUseBlocks
+
+Before tool execution:
+  adapter.validate_and_repair(name, input, registry)  → repaired name + input
+  on failure: adapter.handle_retry(...)  → RetryAction.RETRY + retry_prompt (returned to model)
+
+After tool execution:
+  telemetry.record(model, tool_name, success, retries, latency_ms, error_type)
+```
+
+### Sprint 3 full wiring example
+
+```python
+from prometheus.engine import AgentLoop
+from prometheus.providers.llama_cpp import LlamaCppProvider
+from prometheus.tools.base import ToolRegistry
+from prometheus.tools.builtin import BashTool, FileReadTool, FileWriteTool, GrepTool, GlobTool
+from prometheus.adapter import ModelAdapter
+from prometheus.adapter.formatter import QwenFormatter
+from prometheus.telemetry.tracker import ToolCallTelemetry
+
+registry = ToolRegistry()
+for tool in [BashTool('/tmp/prom-test'), FileReadTool(), FileWriteTool(), GrepTool(), GlobTool()]:
+    registry.register(tool)
+
+adapter = ModelAdapter(formatter=QwenFormatter(), strictness='MEDIUM')
+telemetry = ToolCallTelemetry('~/.prometheus/telemetry.db')
+provider = LlamaCppProvider(base_url='http://localhost:8080')
+
+loop = AgentLoop(
+    provider=provider,
+    tool_registry=registry,
+    adapter=adapter,
+    telemetry=telemetry,
+)
+result = loop.run(
+    system_prompt='You are a coding assistant.',
+    user_message='List all Python files in /tmp/prom-test, then create test.py.',
+    tools=registry.list_schemas(),
+)
+print(result.text)
+print(telemetry.report())
+```
+
+---
+
 ## Sprint Status
 
 - [x] Sprint 0: Skeleton
 - [x] Sprint 1: Agent loop
 - [x] Sprint 2: Tools + hooks (extract OpenHarness tools/ + hooks/)
-- [ ] Sprint 3: Model Adapter Layer (novel code)
+- [x] Sprint 3: Model Adapter Layer (novel code)
 - [ ] Sprint 4: Security + context management
 - [ ] Sprint 5: Skills + memory
 - [ ] Sprint 6: Gateway (Telegram)

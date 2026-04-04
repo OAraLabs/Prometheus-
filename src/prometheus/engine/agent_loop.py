@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable
@@ -61,6 +62,8 @@ class LoopContext:
     tool_registry: object | None = None       # ToolRegistry — wired in Sprint 2
     permission_checker: object | None = None  # PermissionChecker — wired in Sprint 4
     hook_executor: object | None = None       # HookExecutor — wired in Sprint 2
+    adapter: object | None = None             # ModelAdapter — wired in Sprint 3
+    telemetry: object | None = None           # ToolCallTelemetry — wired in Sprint 3
     cwd: Path = field(default_factory=Path.cwd)
     max_turns: int = 200
     permission_prompt: PermissionPrompt | None = None
@@ -81,6 +84,14 @@ async def run_loop(
     if context.tool_registry is not None and hasattr(context.tool_registry, "to_api_schema"):
         tool_schema = context.tool_registry.to_api_schema()
 
+    # Sprint 3: format tools + system prompt for the target model
+    active_system_prompt = context.system_prompt
+    active_tools = tool_schema
+    if context.adapter is not None and hasattr(context.adapter, "format_request"):
+        active_system_prompt, active_tools = context.adapter.format_request(
+            context.system_prompt, tool_schema
+        )
+
     for turn in range(context.max_turns):
         final_message: ConversationMessage | None = None
         usage = UsageSnapshot()
@@ -89,9 +100,9 @@ async def run_loop(
             ApiMessageRequest(
                 model=context.model,
                 messages=messages,
-                system_prompt=context.system_prompt,
+                system_prompt=active_system_prompt,
                 max_tokens=context.max_tokens,
-                tools=tool_schema,
+                tools=active_tools,
             )
         ):
             if isinstance(event, ApiTextDeltaEvent):
@@ -104,6 +115,22 @@ async def run_loop(
 
         if final_message is None:
             raise RuntimeError("Model stream finished without a final message")
+
+        # Sprint 3: try to extract tool calls from text when none came back structured
+        if (
+            not final_message.tool_uses
+            and final_message.text
+            and context.adapter is not None
+        ):
+            extracted = context.adapter.extract_tool_calls(
+                final_message.text, context.tool_registry
+            )
+            if extracted:
+                from prometheus.engine.messages import TextBlock
+                final_message = ConversationMessage(
+                    role="assistant",
+                    content=extracted,
+                )
 
         messages.append(final_message)
         yield AssistantTurnComplete(message=final_message, usage=usage), usage
@@ -173,6 +200,36 @@ async def _execute_tool_call(
             is_error=True,
         )
 
+    # Sprint 3: validate + auto-repair the tool call before execution
+    retries_used = 0
+    repair_log: list[str] = []
+    if context.adapter is not None:
+        try:
+            tool_name, tool_input, repair_log = context.adapter.validate_and_repair(
+                tool_name, tool_input, context.tool_registry
+            )
+        except ValueError as exc:
+            # Validation failed and repair failed — ask retry engine
+            action, retry_prompt = context.adapter.handle_retry(
+                tool_name, str(exc), context.tool_registry
+            )
+            retries_used = 1
+            if context.telemetry is not None:
+                context.telemetry.record(
+                    model=context.model,
+                    tool_name=tool_name,
+                    success=False,
+                    retries=retries_used,
+                    latency_ms=0.0,
+                    error_type="validation_failed",
+                    error_detail=str(exc),
+                )
+            return ToolResultBlock(
+                tool_use_id=tool_use_id,
+                content=retry_prompt,
+                is_error=True,
+            )
+
     tool = context.tool_registry.get(tool_name)
     if tool is None:
         return ToolResultBlock(
@@ -217,6 +274,7 @@ async def _execute_tool_call(
                 )
 
     from prometheus.tools.base import ToolExecutionContext
+    _t0 = time.monotonic()
     result = await tool.execute(
         parsed_input,
         ToolExecutionContext(
@@ -228,11 +286,23 @@ async def _execute_tool_call(
             },
         ),
     )
+    _latency_ms = (time.monotonic() - _t0) * 1000.0
     tool_result = ToolResultBlock(
         tool_use_id=tool_use_id,
         content=result.output,
         is_error=result.is_error,
     )
+
+    # Sprint 3: record telemetry
+    if context.telemetry is not None:
+        context.telemetry.record(
+            model=context.model,
+            tool_name=tool_name,
+            success=not result.is_error,
+            retries=retries_used,
+            latency_ms=_latency_ms,
+            error_type="tool_error" if result.is_error else None,
+        )
 
     # Post-tool hook (Sprint 2)
     if context.hook_executor is not None:
@@ -273,6 +343,8 @@ class AgentLoop:
         tool_registry=None,
         hook_executor=None,
         permission_checker=None,
+        adapter=None,
+        telemetry=None,
         cwd: Path | None = None,
     ) -> None:
         self._provider = provider
@@ -282,6 +354,8 @@ class AgentLoop:
         self._tool_registry = tool_registry
         self._hook_executor = hook_executor
         self._permission_checker = permission_checker
+        self._adapter = adapter
+        self._telemetry = telemetry
         self._cwd = cwd or Path.cwd()
 
     async def run_async(
@@ -302,6 +376,8 @@ class AgentLoop:
             tool_registry=self._tool_registry,
             hook_executor=self._hook_executor,
             permission_checker=self._permission_checker,
+            adapter=self._adapter,
+            telemetry=self._telemetry,
             cwd=self._cwd,
         )
 
