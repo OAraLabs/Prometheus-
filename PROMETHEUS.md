@@ -183,11 +183,180 @@ print(result.text)
 
 ---
 
+## Sprint 2: Tools + Hooks ✓
+
+### `prometheus.tools.base`
+`src/prometheus/tools/base.py` — adapted from OpenHarness (MIT)
+
+```python
+@dataclass ToolExecutionContext:
+    cwd: Path
+    metadata: dict[str, Any]          # carries tool_registry, ask_user_prompt, etc.
+
+@dataclass(frozen=True) ToolResult:
+    output: str
+    is_error: bool = False
+    metadata: dict[str, Any]
+
+class BaseTool(ABC):
+    name: str
+    description: str
+    input_model: type[BaseModel]
+    async def execute(arguments, context) -> ToolResult
+    def is_read_only(arguments) -> bool
+    def to_api_schema() -> dict        # Anthropic format: {name, description, input_schema}
+    def to_openai_schema() -> dict     # OpenAI format: {type: "function", function: {...}}
+
+class ToolRegistry:
+    def register(tool: BaseTool) -> None
+    def get(name: str) -> BaseTool | None
+    def list_tools() -> list[BaseTool]
+    def to_api_schema() -> list[dict]          # Anthropic format
+    def list_schemas() -> list[dict]           # alias for to_api_schema()
+    def to_openai_schemas() -> list[dict]      # OpenAI function-calling format
+    def list_schemas_for_task(task_description: str) -> list[dict]
+    # keyword-matches task against tool name+description; falls back to all schemas
+```
+
+### `prometheus.tools.builtin`
+`src/prometheus/tools/builtin/` — adapted from OpenHarness (MIT)
+
+```python
+# All import from prometheus.tools.builtin
+
+BashTool(workspace=None, max_output=10_000)
+    # name="bash" — runs /bin/bash -lc <command>
+    # workspace locking: raises error if cwd resolves outside workspace root
+    # configurable timeout (default 30s, max 600s)
+    # output truncation at max_output chars
+
+FileReadTool()
+    # name="read_file" — reads text files with line numbers
+    # supports offset + limit for windowed reads (default 200 lines)
+    # rejects binary files (null bytes)
+
+FileWriteTool()
+    # name="write_file" — creates or overwrites files
+    # auto-creates parent directories
+
+FileEditTool()
+    # name="edit_file" — str_replace semantics (old_str → new_str)
+    # replace_all=True for global replacement
+
+GrepTool()
+    # name="grep" — pure-Python regex search across file tree
+    # file_glob filter, case_sensitive flag, limit (default 200 matches)
+
+GlobTool()
+    # name="glob" — glob pattern file listing
+    # optional root override, limit (default 200 paths)
+```
+
+### `prometheus.hooks`
+`src/prometheus/hooks/` — adapted from OpenHarness (MIT)
+
+```python
+# events.py
+class HookEvent(str, Enum):
+    SESSION_START = "session_start"
+    SESSION_END = "session_end"
+    PRE_TOOL_USE = "pre_tool_use"
+    POST_TOOL_USE = "post_tool_use"
+
+# schemas.py — Pydantic hook definitions
+CommandHookDefinition(command, timeout_seconds=30, matcher=None, block_on_failure=False)
+HttpHookDefinition(url, headers={}, timeout_seconds=30, matcher=None, block_on_failure=False)
+PromptHookDefinition(prompt, model=None, timeout_seconds=30, matcher=None, block_on_failure=True)
+AgentHookDefinition(prompt, model=None, timeout_seconds=60, matcher=None, block_on_failure=True)
+# matcher: fnmatch against tool_name — None matches all tools
+
+# types.py
+@dataclass(frozen=True) HookResult:
+    hook_type: str; success: bool; output: str; blocked: bool; reason: str; metadata: dict
+
+@dataclass(frozen=True) AggregatedHookResult:
+    results: list[HookResult]
+    @property blocked -> bool     # True if any result has blocked=True
+    @property reason -> str       # first blocking reason
+
+# registry.py — in-memory registry (loader.py deferred to Sprint 5)
+class HookRegistry:
+    def add(event: HookEvent, hook: HookDefinition) -> None
+    def get(event: HookEvent) -> list[HookDefinition]
+    def clear(event: HookEvent | None = None) -> None
+
+# executor.py
+@dataclass HookExecutionContext:
+    cwd: Path
+    provider: ModelProvider       # used by prompt/agent hooks
+    default_model: str
+
+class HookExecutor:
+    def __init__(registry: HookRegistry, context: HookExecutionContext)
+    async def execute(event: HookEvent, payload: dict) -> AggregatedHookResult
+    def update_registry(registry: HookRegistry) -> None
+    # Runs all hooks registered for event whose matcher matches payload["tool_name"]
+    # Command hooks: /bin/bash -lc; sets PROMETHEUS_HOOK_EVENT + PROMETHEUS_HOOK_PAYLOAD env vars
+    # HTTP hooks: POST {event, payload} JSON
+    # Prompt/agent hooks: calls provider.stream_message(), parses {"ok": bool} JSON response
+```
+
+### Wiring into AgentLoop
+
+`agent_loop._execute_tool_call()` already wires both hooks:
+
+```python
+# Before tool dispatch:
+pre = await hook_executor.execute(HookEvent.PRE_TOOL_USE, {tool_name, tool_input, event})
+if pre.blocked:
+    return ToolResultBlock(is_error=True, content=pre.reason)
+
+# Dispatch tool via registry.get(tool_name).execute(parsed_input, ToolExecutionContext(...))
+
+# After tool dispatch:
+await hook_executor.execute(HookEvent.POST_TOOL_USE, {tool_name, tool_input, tool_output, ...})
+```
+
+Full wiring example:
+
+```python
+from prometheus.engine import AgentLoop
+from prometheus.providers.stub import StubProvider
+from prometheus.tools.base import ToolRegistry
+from prometheus.tools.builtin import BashTool, FileReadTool, FileWriteTool
+from prometheus.hooks import HookExecutor, HookExecutionContext, HookRegistry, HookEvent
+from prometheus.hooks.schemas import CommandHookDefinition
+
+registry = ToolRegistry()
+registry.register(BashTool(workspace="/tmp/prometheus-test"))
+registry.register(FileReadTool())
+registry.register(FileWriteTool())
+
+hook_reg = HookRegistry()
+hook_reg.add(HookEvent.PRE_TOOL_USE, CommandHookDefinition(command="echo pre-hook ok"))
+
+provider = StubProvider(base_url="http://localhost:8080")
+hook_executor = HookExecutor(
+    hook_reg,
+    HookExecutionContext(cwd=Path.cwd(), provider=provider, default_model="qwen3.5-32b"),
+)
+
+loop = AgentLoop(provider=provider, tool_registry=registry, hook_executor=hook_executor)
+result = loop.run(
+    system_prompt="You are a coding assistant with access to tools.",
+    user_message='Create hello.py with print("hello world"), then run it.',
+    tools=registry.list_schemas(),
+)
+print(result.text)
+```
+
+---
+
 ## Sprint Status
 
 - [x] Sprint 0: Skeleton
 - [x] Sprint 1: Agent loop
-- [ ] Sprint 2: Tools + hooks (extract OpenHarness tools/ + hooks/)
+- [x] Sprint 2: Tools + hooks (extract OpenHarness tools/ + hooks/)
 - [ ] Sprint 3: Model Adapter Layer (novel code)
 - [ ] Sprint 4: Security + context management
 - [ ] Sprint 5: Skills + memory
