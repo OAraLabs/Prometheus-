@@ -580,17 +580,572 @@ print(telemetry.report())
 
 ---
 
+## Sprint 4: Security + Context Management ✓
+
+### `prometheus.permissions.modes`
+`src/prometheus/permissions/modes.py` — new code
+
+```python
+class TrustLevel(IntEnum):
+    BLOCKED = 0     # always deny
+    APPROVE = 1     # requires user confirmation
+    AUTO = 2        # allow automatically
+    AUTONOMOUS = 3  # allow (background ops)
+
+class PermissionMode(str, Enum):
+    DEFAULT = "default"       # destructive ops require approval
+    STRICT = "strict"         # file writes + network require approval
+    AUTONOMOUS = "autonomous" # no user confirmations
+```
+
+### `prometheus.permissions.checker`
+`src/prometheus/permissions/checker.py` — new code
+
+```python
+@dataclass(frozen=True)
+class PermissionDecision:
+    allowed: bool              # False for DENY and APPROVE; True for ALLOW
+    requires_confirmation: bool  # True only for APPROVE
+    reason: str
+    action: str          # "ALLOW" | "DENY" | "APPROVE"
+    trust_level: TrustLevel
+
+    @classmethod allow(reason="", level=AUTO) -> PermissionDecision   # allowed=True
+    @classmethod approve(reason="") -> PermissionDecision             # allowed=False, requires_confirmation=True
+    @classmethod deny(reason) -> PermissionDecision                   # allowed=False
+
+class SecurityGate:
+    def __init__(denied_commands=None, denied_paths=None,
+                 workspace_root=None, mode=PermissionMode.DEFAULT)
+    @classmethod from_config(config_path=None) -> SecurityGate
+    # Loads security section from prometheus.yaml
+
+    def evaluate(tool_name, *, is_read_only=False,
+                 file_path=None, command=None) -> PermissionDecision
+    # Used by agent_loop.py permission_checker slot
+
+    def pre_tool_use(tool_name, tool_input: dict, context: dict) -> PermissionDecision
+    # Acceptance-test interface: gate.pre_tool_use('bash', {'command': 'rm -rf /'}, {})
+```
+
+Trust rules applied in order:
+1. AUTONOMOUS mode → ALLOW all except always-blocked patterns
+2. Always-blocked regex (rm -rf /, mkfs, dd to /dev/, fork bomb …) → DENY
+3. denied_commands list from config → DENY
+4. denied_paths list from config → DENY
+5. write_file/edit_file in STRICT mode → APPROVE
+6. write_file/edit_file outside workspace_root → APPROVE
+7. bash with git push / curl / wget / ssh / pip install → APPROVE
+8. Everything else → ALLOW
+
+### `prometheus.permissions.sandbox`
+`src/prometheus/permissions/sandbox.py` — new code
+
+```python
+class SandboxedExecution:
+    def __init__(workspace: str | Path, timeout=30, max_output=10_000,
+                 strip_env_keys: list[str] | None = None)
+    async def run(command: str, env_override=None) -> ToolResult
+    @property workspace -> Path
+    # Strips API keys / tokens / secrets from subprocess env automatically
+    # Enforces timeout; truncates output at max_output chars
+```
+
+### `prometheus.context.token_estimation`
+`src/prometheus/context/token_estimation.py` — new code
+
+```python
+def estimate_tokens(text: str) -> int
+# len(text) // 4 — 4-chars-per-token heuristic; fast, no dependencies
+```
+
+### `prometheus.context.budget`
+`src/prometheus/context/budget.py` — new code
+
+```python
+@dataclass
+class TokenBudget:
+    effective_limit: int
+    reserved_output: int = 2000
+    model_overrides: dict[str, int]
+
+    @classmethod from_config(model=None, config_path=None) -> TokenBudget
+    # Reads context section from prometheus.yaml; applies model_overrides
+
+    def add(category: str, text: str) -> None   # accumulates by category
+    def reset() -> None
+    @property used -> int                        # sum across all categories
+    def usage_by_category() -> dict[str, int]
+    def headroom() -> int                        # effective_limit - reserved_output - used
+    def is_approaching_limit(threshold=0.75) -> bool
+```
+
+### `prometheus.context.truncation`
+`src/prometheus/context/truncation.py` — new code
+
+```python
+class ToolResultTruncator:
+    def __init__(max_tokens=4000)
+    @classmethod from_config(config_path=None) -> ToolResultTruncator
+    def truncate(tool_name: str, output: str) -> str
+    def __call__(tool_name, output) -> str   # callable interface
+
+    # Strategies:
+    # bash      → keep last 100 lines
+    # read_file → first 50 + last 50 lines + "[... N lines truncated ...]"
+    # grep      → top 20 results
+    # default   → hard-truncate at max_tokens*4 chars + "[truncated at N tokens]"
+```
+
+### `prometheus.context.compression`
+`src/prometheus/context/compression.py` — new code
+
+```python
+class ContextCompressor:
+    def __init__(budget: TokenBudget, fresh_tail_count=32)
+    @classmethod from_config(budget, config_path=None) -> ContextCompressor
+
+    def maybe_compress(messages: list[ConversationMessage]) -> list[ConversationMessage]
+    # No-op if budget.is_approaching_limit() is False
+    # Prunes ToolResultBlock.content from messages older than fresh_tail_count user turns
+    # Replaces pruned content with "[content pruned — context compression]"
+    # Full LCM summarization deferred to Sprint 7
+```
+
+### `prometheus.context.dynamic_tools`
+`src/prometheus/context/dynamic_tools.py` — new code
+
+```python
+CORE_TOOLS: frozenset[str]   # {"bash", "read_file", "write_file"}
+
+class DynamicToolLoader:
+    def __init__(registry: ToolRegistry)
+    def active_schemas(task_description: str | None = None) -> list[dict]
+    # None → all tools; otherwise CORE_TOOLS + keyword-matched extras
+    # Keywords: grep/search → grep; find/list/files → glob;
+    #           edit/modify/replace/patch → edit_file
+    def on_demand(tool_name: str) -> dict | None
+    # Returns schema if tool registered, else None
+    def all_schemas() -> list[dict]
+```
+
+### Sprint 4 wiring into AgentLoop
+
+```python
+from prometheus.permissions import SecurityGate
+from prometheus.context import TokenBudget, ToolResultTruncator, ContextCompressor, DynamicToolLoader
+
+# Permission gate (slots into existing permission_checker= param)
+gate = SecurityGate.from_config()   # reads config/prometheus.yaml security section
+
+# Context management
+budget = TokenBudget.from_config(model="qwen3.5-32b")
+truncator = ToolResultTruncator.from_config()
+compressor = ContextCompressor.from_config(budget)
+
+loop = AgentLoop(
+    provider=provider,
+    tool_registry=registry,
+    permission_checker=gate,   # evaluate() called before every tool execution
+    # APPROVE decisions (allowed=False, requires_confirmation=True) trigger
+    # permission_prompt callback in agent_loop — if no prompt is wired, they block.
+)
+
+# Truncation + compression used outside AgentLoop (Sprint 5 will wire fully):
+output = truncator.truncate(tool_name, raw_output)
+messages = compressor.maybe_compress(messages)
+```
+
+---
+
 ## Sprint Status
 
 - [x] Sprint 0: Skeleton
 - [x] Sprint 1: Agent loop
 - [x] Sprint 2: Tools + hooks (extract OpenHarness tools/ + hooks/)
 - [x] Sprint 3: Model Adapter Layer (novel code)
-- [ ] Sprint 4: Security + context management
-- [ ] Sprint 5: Skills + memory
-- [ ] Sprint 6: Gateway (Telegram)
+- [x] Sprint 4: Security + context management
+- [x] Sprint 5: Skills + memory + tasks
+- [x] Sprint 6: Gateway (Telegram) + Cron + Daemon
 - [ ] Sprint 7: Learning loop + LCM
 - [ ] Sprint 8: Multi-agent + benchmarks
+
+---
+
+## Sprint 5: Skills + Memory + Tasks
+
+### `prometheus.skills`
+
+**`SkillDefinition`** *(frozen dataclass)* — `src/prometheus/skills/types.py`
+```python
+SkillDefinition(name: str, description: str, content: str, source: str, path: str | None)
+```
+
+**`SkillRegistry`** — `src/prometheus/skills/registry.py`
+```python
+SkillRegistry()
+  .register(skill: SkillDefinition) -> None
+  .get(name: str) -> SkillDefinition | None          # case-insensitive fallback
+  .list_skills() -> list[SkillDefinition]             # sorted by name
+```
+
+**`loader`** — `src/prometheus/skills/loader.py`
+```python
+get_builtin_skills() -> list[SkillDefinition]         # reads skills/builtin/*.md
+load_user_skills() -> list[SkillDefinition]           # reads ~/.prometheus/skills/*.md
+load_skill_registry(cwd=None) -> SkillRegistry        # builtin + user merged
+```
+
+**Builtin skills** — `src/prometheus/skills/builtin/`: `commit.md`, `debug.md`, `plan.md`
+
+**Wires into**: `SkillTool` (`tools/builtin/skill.py`) exposes registry to agent via `skill` tool name.
+
+---
+
+### `prometheus.memory`
+
+**`MemoryStore`** *(SQLite + FTS5)* — `src/prometheus/memory/store.py`
+```python
+MemoryStore(db_path: str | Path | None = None)        # default: ~/.prometheus/memory.db
+  # Messages
+  .add_message(session_id, role, content, *, message_id, compressed) -> str
+  .get_messages(session_id, *, since, compressed, limit) -> list[dict]
+  # Memories
+  .persist_memory(entity_type, entity_name, fact, confidence, *, relationship,
+                  source_event_ids, tags, memory_id) -> str   # deduplicates on name+fact
+  .search_memories(*, query, entity, entity_type, min_confidence, limit) -> list[dict]
+  .get_memory(memory_id: str) -> dict | None
+  # Summaries
+  .add_summary(summary_text, source_message_ids, *, level, summary_id) -> str
+  .get_summaries(*, level, limit) -> list[dict]
+  .close() / context manager
+```
+
+Tables: `messages` (FTS5), `memories` (FTS5), `summaries`.
+
+**`MemoryPointer`** — `src/prometheus/memory/pointer.py`
+```python
+MemoryPointer(pointer_path: str | Path | None = None, max_chars: int = 8000)
+  .add_pointer(text: str) -> None
+  .remove_pointer(text: str) -> bool
+  .replace_pointer(old_text, new_text) -> bool
+  .get_all() -> list[str]
+  .format_for_prompt() -> str                         # "## Memory Pointers\n- ..."
+  .clear() -> None
+```
+Backed by `~/.prometheus/MEMORY.md` with `fcntl` exclusive locking and char-limit pruning.
+
+**`FileMemoryStore`** — `src/prometheus/memory/hermes_memory_tool.py`
+```python
+FileMemoryStore(path: Path, max_chars: int)
+  .add(entry: str) -> str
+  .replace(old_text, new_text) -> str
+  .remove(text: str) -> str
+  .list_entries() -> list[str]
+  .format_for_prompt(header: str) -> str
+
+get_memory_store() -> FileMemoryStore       # MEMORY.md, 12 000 char cap
+get_user_store() -> FileMemoryStore         # USER.md, 8 000 char cap
+format_memory_for_prompt() -> str           # both sections combined
+```
+
+**`MemoryTool`** *(BaseTool)* — `src/prometheus/memory/hermes_memory_tool.py`
+```
+name="memory"  inputs: operation (add|replace|remove|list), target (memory|user),
+               entry, old_entry
+```
+
+**`MemoryExtractor`** — `src/prometheus/memory/extractor.py`
+```python
+MemoryExtractor(store: MemoryStore, provider: ModelProvider, *, model, obsidian_writer, batch_size)
+  .run_once(session_id=None) -> int                   # returns # memories persisted
+  .run_forever(interval=1800, session_id=None) -> None # 30-min background loop
+```
+Reads `messages` table → batches of 15 → LLM extraction prompt → writes to `memories` + optional Obsidian vault.
+
+**`ObsidianWriter`** — `src/prometheus/memory/extractor.py`
+```python
+ObsidianWriter(vault_path: str | Path)
+  .write_fact(fact: dict) -> None   # appends to vault/Memory/<entity_name>.md
+```
+
+---
+
+### `prometheus.tasks`
+
+**`TaskType`** — `"local_bash" | "local_agent" | "remote_agent" | "in_process_teammate"`
+**`TaskStatus`** — `"pending" | "running" | "completed" | "failed" | "killed"`
+
+**`TaskRecord`** *(dataclass)* — `src/prometheus/tasks/types.py`
+```python
+TaskRecord(id, type, status, description, cwd, output_file, command, prompt,
+           created_at, started_at, ended_at, return_code, metadata)
+```
+
+**`BackgroundTaskManager`** — `src/prometheus/tasks/manager.py`
+```python
+BackgroundTaskManager()
+  # Async create
+  await .create_shell_task(*, command, description, cwd, task_type) -> TaskRecord
+  await .create_agent_task(*, prompt, description, cwd, task_type, model, api_key, command) -> TaskRecord
+  # Read
+  .get_task(task_id: str) -> TaskRecord | None
+  .list_tasks(*, status: TaskStatus | None) -> list[TaskRecord]
+  .read_task_output(task_id, *, max_bytes=12000) -> str
+  # Mutate
+  .update_task(task_id, *, description, progress, status_note) -> TaskRecord
+  await .stop_task(task_id) -> TaskRecord
+  await .write_to_task(task_id, data: str) -> None
+
+get_task_manager() -> BackgroundTaskManager   # process-wide singleton
+```
+Output streamed to `~/.prometheus/data/tasks/<id>.log`. Agent tasks restart on broken pipe.
+
+---
+
+### New tools (`prometheus.tools.builtin`)
+
+| File | Tool name | Input fields |
+|------|-----------|-------------|
+| `skill.py` | `skill` | `name` |
+| `task_create.py` | `task_create` | `type`, `description`, `command`, `prompt`, `model` |
+| `task_get.py` | `task_get` | `task_id` |
+| `task_list.py` | `task_list` | `status?` |
+| `task_update.py` | `task_update` | `task_id`, `description?`, `progress?`, `status_note?` |
+| `task_stop.py` | `task_stop` | `task_id` |
+| `task_output.py` | `task_output` | `task_id`, `max_bytes?` |
+| `todo_write.py` | `todo_write` | `item`, `checked?`, `path?` |
+
+All extend `BaseTool` from `prometheus.tools.base`.
+
+---
+
+## Sprint 6: Gateway (Telegram) + Cron + Daemon
+
+### `prometheus.gateway.config`
+`src/prometheus/gateway/config.py` — novel code
+
+```python
+class Platform(str, Enum):           # TELEGRAM, CLI, API
+
+@dataclass
+class PlatformConfig:
+    platform: Platform
+    token: str = ""
+    webhook_url: str | None = None
+    allowed_chat_ids: list[int] = []
+    proxy_url: str | None = None
+    max_message_length: int = 4096
+    parse_mode: str = "MarkdownV2"
+    connect_timeout: float = 30.0
+    read_timeout: float = 30.0
+    write_timeout: float = 30.0
+    extra: dict[str, Any] = {}
+
+    @property is_restricted -> bool
+    def chat_allowed(chat_id: int) -> bool
+```
+
+### `prometheus.gateway.platform_base`
+`src/prometheus/gateway/platform_base.py` — novel code (architecture inspired by Hermes)
+
+```python
+class MessageType(str, Enum):        # TEXT, COMMAND, CALLBACK, EDITED, PHOTO, DOCUMENT, VOICE
+
+@dataclass
+class MessageEvent:
+    chat_id: int
+    user_id: int
+    text: str
+    message_id: int
+    platform: Platform
+    message_type: MessageType = TEXT
+    username: str | None = None
+    timestamp: datetime = now(utc)
+    raw: dict[str, Any] = {}
+    def session_key() -> str         # "{platform}:{chat_id}"
+
+@dataclass(frozen=True)
+class SendResult:
+    success: bool
+    message_id: int | None = None
+    error: str | None = None
+
+class BasePlatformAdapter(ABC):
+    def __init__(config: PlatformConfig)
+    @property platform -> Platform
+    @property running -> bool
+    async def start() -> None
+    async def stop() -> None
+    async def send(chat_id, text, *, reply_to=None, parse_mode=None) -> SendResult
+    async def on_message(event: MessageEvent) -> None
+```
+
+### `prometheus.gateway.telegram`
+`src/prometheus/gateway/telegram.py` — novel code (architecture inspired by Hermes)
+
+```python
+def escape_markdown_v2(text: str) -> str
+def chunk_message(text: str, max_length=4096) -> list[str]
+
+class TelegramAdapter(BasePlatformAdapter):
+    def __init__(config: PlatformConfig, agent_loop: AgentLoop,
+                 tool_registry: ToolRegistry,
+                 system_prompt="You are Prometheus, a helpful AI assistant.")
+    async def start() -> None           # builds Application, registers handlers, starts polling
+    async def stop() -> None            # graceful shutdown
+    async def send(chat_id, text, *, reply_to=None, parse_mode=None) -> SendResult
+    async def on_message(event: MessageEvent) -> None
+    # Internal:
+    async def _cmd_start(update, context) -> None       # /start handler
+    async def _cmd_clear(update, context) -> None       # /clear handler
+    async def _handle_text(update, context) -> None     # text message handler
+    async def _dispatch_to_agent(event: MessageEvent) -> None
+    # Dispatches to agent_loop.run_async(system_prompt, event.text, tools)
+    # Sends result.text back via self.send()
+```
+
+### `prometheus.gateway.telegram_network`
+`src/prometheus/gateway/telegram_network.py` — novel code
+
+```python
+@dataclass
+class TelegramNetworkConfig:
+    proxy_url: str | None = None
+    base_url: str | None = None
+    base_file_url: str | None = None
+    connect_timeout: float = 30.0
+    read_timeout: float = 30.0
+    write_timeout: float = 30.0
+    pool_timeout: float = 10.0
+    def to_bot_kwargs() -> dict
+    def to_request_kwargs() -> dict
+```
+
+### `prometheus.gateway.cron_service`
+`src/prometheus/gateway/cron_service.py` — adapted from OpenHarness (MIT)
+
+```python
+def load_cron_jobs() -> list[dict]
+def save_cron_jobs(jobs: list[dict]) -> None
+def validate_cron_expression(expression: str) -> bool
+def next_run_time(expression: str, base: datetime | None) -> datetime
+def upsert_cron_job(job: dict) -> None
+def delete_cron_job(name: str) -> bool
+def get_cron_job(name: str) -> dict | None
+def set_job_enabled(name: str, enabled: bool) -> bool
+def mark_job_run(name: str, *, success: bool) -> None
+# JSON registry at ~/.prometheus/data/cron_jobs.json via get_cron_registry_path()
+```
+
+### `prometheus.gateway.cron_scheduler`
+`src/prometheus/gateway/cron_scheduler.py` — adapted from OpenHarness (MIT)
+
+```python
+TICK_INTERVAL_SECONDS = 30
+
+# History
+def append_history(entry: dict) -> None         # JSONL at data/cron_history.jsonl
+def load_history(*, limit=50, job_name=None) -> list[dict]
+
+# PID management
+def read_pid() -> int | None
+def write_pid() -> None
+def remove_pid() -> None
+def is_scheduler_running() -> bool
+def stop_scheduler() -> bool
+
+# Job execution
+async def execute_job(job: dict) -> dict        # /bin/bash -lc, 300s timeout
+async def run_scheduler_loop(*, once=False) -> None   # main loop, signal-aware
+def scheduler_status() -> dict
+```
+
+### `prometheus.gateway.heartbeat`
+`src/prometheus/gateway/heartbeat.py` — novel code
+
+```python
+class Heartbeat:
+    def __init__(*, interval=30, gateway: BasePlatformAdapter | None = None,
+                 task_manager: BackgroundTaskManager | None = None)
+    async def check() -> dict           # cron_jobs_due, gateway_running, tasks_running
+    async def run_forever() -> None     # loop until stop()
+    def stop() -> None
+```
+
+### `prometheus.gateway.archive_writer`
+`src/prometheus/gateway/archive_writer.py` — novel code (inspired by OpenClaw)
+
+```python
+class ArchiveWriter:
+    def __init__(path: str | Path | None = None)   # default: ~/.prometheus/data/archive.jsonl
+    def archive_event(event_type: str, data: dict | None = None) -> None
+    def read_events(*, event_type=None, limit=100) -> list[dict]
+```
+
+### New tools (`prometheus.tools.builtin`)
+
+| File | Tool name | Input fields |
+|------|-----------|-------------|
+| `cron_create.py` | `cron_create` | `name`, `schedule`, `command`, `cwd?`, `enabled?` |
+| `cron_delete.py` | `cron_delete` | `name` |
+| `cron_list.py` | `cron_list` | *(none)* — read-only |
+
+All adapted from OpenHarness (MIT), imports changed to `prometheus.*`.
+
+### `scripts/daemon.py` — Main daemon entry point
+```python
+def load_config(config_path=None) -> dict
+def build_tool_registry(workspace=None) -> ToolRegistry
+async def run_daemon(args) -> None
+def main() -> None
+
+# Wires: LlamaCppProvider → ToolRegistry (builtin + cron tools) → AgentLoop
+#        → TelegramAdapter + Heartbeat + CronScheduler + MemoryExtractor
+# All run via asyncio.gather with SIGTERM/SIGINT graceful shutdown
+```
+
+Usage:
+```bash
+python scripts/daemon.py --telegram-only --debug
+python scripts/daemon.py --config config/prometheus.yaml
+```
+
+### `scripts/health_check.sh`
+Checks cron scheduler PID, daemon log freshness, cron registry, archive events.
+
+### `scripts/prometheus.service`
+Systemd unit file for running daemon as a service.
+
+### Sprint 6 wiring
+
+```python
+from prometheus.providers.llama_cpp import LlamaCppProvider
+from prometheus.tools.base import ToolRegistry
+from prometheus.tools.builtin import BashTool, FileReadTool, FileWriteTool, CronCreateTool, ...
+from prometheus.engine import AgentLoop
+from prometheus.gateway import TelegramAdapter, PlatformConfig, Platform, Heartbeat
+from prometheus.gateway.cron_scheduler import run_scheduler_loop
+
+provider = LlamaCppProvider(base_url="http://localhost:8080")
+registry = ToolRegistry()
+# register all builtin + cron tools ...
+agent_loop = AgentLoop(provider=provider, tool_registry=registry)
+
+tg_config = PlatformConfig(platform=Platform.TELEGRAM, token="BOT_TOKEN")
+telegram = TelegramAdapter(config=tg_config, agent_loop=agent_loop,
+                           tool_registry=registry)
+
+await asyncio.gather(
+    telegram.start(),
+    run_scheduler_loop(),
+    Heartbeat(gateway=telegram).run_forever(),
+)
+```
+
+### Dependencies added
+- `python-telegram-bot>=21.0` — Telegram Bot API
+- `croniter>=2.0` — cron expression parsing
 
 ---
 
@@ -601,4 +1156,7 @@ uv sync
 uv run prometheus
 # or
 ./scripts/start.sh
+
+# Daemon mode (Sprint 6):
+python scripts/daemon.py --telegram-only --debug
 ```

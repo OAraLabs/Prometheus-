@@ -43,7 +43,12 @@ infrastructure:
 
 gateway:
   telegram_enabled: false
-  telegram_token: ""
+  telegram_token: ""                # set via PROMETHEUS_TELEGRAM_TOKEN env var
+  allowed_chat_ids: []              # empty = allow all; set to restrict
+  proxy_url: null                   # optional SOCKS5/HTTP proxy for Telegram
+  system_prompt: "You are Prometheus, a sovereign AI agent. You have access to tools for file operations, shell commands, and cron job management. Be concise and helpful."
+  heartbeat_interval: 30            # seconds between health checks
+  cron_enabled: true                # run cron scheduler alongside gateway
 
 learning:
   periodic_nudge_interval: 15  # turns
