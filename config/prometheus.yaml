@@ -1,0 +1,52 @@
+system:
+  name: "Prometheus"
+  version: "0.1.0"
+
+model:
+  provider: "llama_cpp"
+  base_url: "http://localhost:8080"
+  model: "qwen3.5-32b"
+  fallback_provider: "ollama"
+  fallback_url: "http://localhost:11434"
+
+context:
+  effective_limit: 24000
+  compression_trigger: 0.75
+  tool_result_max: 4000
+  reserved_output: 2000
+  fresh_tail_count: 32
+  model_overrides:
+    "qwen3.5-32b": { effective_limit: 24000 }
+    "gemma4-26b-moe": { effective_limit: 32000 }
+    "gemma4-31b": { effective_limit: 48000 }
+
+security:
+  permission_mode: "default"
+  workspace_root: "~/.prometheus/workspace"
+  denied_commands:
+    - "rm -rf /"
+    - "rm -rf ~"
+    - "DROP TABLE"
+    - "mkfs"
+  denied_paths:
+    - "/etc"
+    - "/sys"
+    - "/boot"
+    - "~/.ssh"
+
+infrastructure:
+  mini_host: "MINI_HOST"
+  mini_port: 8005
+  gpu_host: "GPU_HOST"
+  archive_enabled: true
+  telemetry_enabled: true
+
+gateway:
+  telegram_enabled: false
+  telegram_token: ""
+
+learning:
+  periodic_nudge_interval: 15  # turns
+  auto_skill_creation: true
+  memory_md_max_chars: 2200
+  user_md_max_chars: 1375
