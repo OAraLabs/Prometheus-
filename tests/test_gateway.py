@@ -413,6 +413,17 @@ class TestTelegramCommands:
         assert "connection refused" in result_text
 
     @pytest.mark.asyncio
+    async def test_cmd_skills(self):
+        adapter = _make_adapter()
+        await adapter._cmd_skills(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "Skills" in text
+        # Should find at least the 3 builtins
+        assert "plan" in text
+        assert "commit" in text
+        assert "debug" in text
+
+    @pytest.mark.asyncio
     async def test_cmd_context(self):
         adapter = _make_adapter(model_name="gemma4-26b")
         adapter.system_prompt = "You are a test assistant."

@@ -126,6 +126,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("sentinel", self._cmd_sentinel))
         self._app.add_handler(CommandHandler("benchmark", self._cmd_benchmark))
         self._app.add_handler(CommandHandler("context", self._cmd_context))
+        self._app.add_handler(CommandHandler("skills", self._cmd_skills))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text)
         )
@@ -148,6 +149,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 BotCommand("sentinel", "SENTINEL subsystem status"),
                 BotCommand("benchmark", "Run a quick smoke test"),
                 BotCommand("context", "Context window usage"),
+                BotCommand("skills", "List available skills"),
             ])
         except Exception as exc:
             logger.warning("Failed to register command menu: %s", exc)
@@ -262,6 +264,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "/sentinel  — SENTINEL subsystem status\n"
             "/benchmark — Run a quick smoke test\n"
             "/context   — Context window usage\n"
+            "/skills    — List available skills\n"
             "/reset     — Clear conversation context\n"
             "/help      — This message\n"
             "\n"
@@ -514,6 +517,43 @@ class TelegramAdapter(BasePlatformAdapter):
                 f"Benchmark: FAIL\nError: {exc}",
                 parse_mode=None,
             )
+
+    async def _cmd_skills(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /skills command — list available skills."""
+        if update.effective_chat is None:
+            return
+
+        try:
+            from prometheus.skills.loader import load_skill_registry
+            registry = load_skill_registry()
+            skills = registry.list_skills()
+        except Exception as exc:
+            await self.send(
+                update.effective_chat.id,
+                f"Skills: error loading registry — {exc}",
+                parse_mode=None,
+            )
+            return
+
+        if not skills:
+            await self.send(
+                update.effective_chat.id,
+                "No skills available.",
+                parse_mode=None,
+            )
+            return
+
+        lines = [f"Skills ({len(skills)})\n"]
+        for skill in skills:
+            source_tag = f" [{skill.source}]" if skill.source else ""
+            lines.append(f"  {skill.name}{source_tag}")
+            if skill.description:
+                lines.append(f"    {skill.description[:80]}")
+
+        lines.append("\nUse the skill tool to load a skill by name.")
+        await self.send(update.effective_chat.id, "\n".join(lines), parse_mode=None)
 
     async def _cmd_context(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
