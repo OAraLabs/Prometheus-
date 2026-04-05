@@ -921,55 +921,67 @@ All extend `BaseTool` from `prometheus.tools.base`.
 
 ### Wiki Maintenance
 
-`src/prometheus/memory/wiki_compiler.py` — novel code
-
-The wiki subsystem transforms extracted memory facts into a navigable,
-cross-linked Markdown wiki at `~/.prometheus/wiki/`.
-
-**Directory structure:**
+Transforms extracted memory facts into a persistent, cross-linked Markdown
+wiki at `~/.prometheus/wiki/`. Inspired by the LLM Wiki pattern — knowledge
+is compiled once and kept current, not re-derived on every query.
 
 ```
 ~/.prometheus/wiki/
-├── index.md          # Auto-generated index organized by category
-├── log.md            # Chronological compilation log
-├── .last_compile_ts  # Watermark for incremental compilation
-├── people/           # Person entities
-├── clients/          # Organization entities
-├── projects/         # Task and tool entities
-├── topics/           # Concept, place, and preference entities
-└── queries/          # Auto-filed query results (compounding loop)
+├── index.md            # Auto-generated, organized by category
+├── log.md              # Append-only chronological compile log
+├── .last_compile_ts    # Watermark for incremental compilation
+├── people/             # person entities
+├── clients/            # organization entities
+├── projects/           # task + tool entities
+├── topics/             # concept, place, preference entities
+└── queries/            # Auto-filed query results (compounding loop)
 ```
 
-**WikiCompiler** (`wiki_compiler.py`):
-
+**`WikiCompiler`** — `src/prometheus/memory/wiki_compiler.py`
 ```python
-class WikiCompiler:
-    def __init__(self, store: MemoryStore, wiki_root: Path | None = None) -> None
-    def compile(self, new_facts: list[dict]) -> None
-    def get_watermark(self) -> float
+WikiCompiler(store: MemoryStore, wiki_root: Path | None = None)  # default: ~/.prometheus/wiki/
+  .compile(new_facts: list[dict]) -> None   # thread-safe (threading.Lock)
+  .get_watermark() -> float                 # last compile timestamp from .last_compile_ts
+  .wiki_root -> Path                        # property
 ```
 
-- Wired as `post_extract_callback` on `MemoryExtractor` — runs automatically
-  after every 30-minute extraction pass
-- Groups facts by entity name, creates pages for entities with 2+ mentions
-- Entity pages use YAML frontmatter (`type`, `first_seen`, `last_updated`,
-  `source_count`) and `[[wiki-links]]` for cross-references
-- Regenerates `index.md` after each compilation
-- Appends entries to `log.md` for chronological tracking
+Entity type mapping: `person→people/`, `organization→clients/`,
+`task|tool→projects/`, `concept|place|preference→topics/`.
 
-**Agent reads `index.md` first** when answering knowledge questions via
-`wiki_query`, then drills into specific entity pages.
+Page creation requires 2+ `mention_count` in `MemoryStore`. Pages use YAML
+frontmatter (`type`, `first_seen`, `last_updated`, `source_count`) and
+`[[wiki-links]]` for cross-references detected by substring match (3+ char
+entity names). Regenerates `index.md` and appends to `log.md` after each pass.
 
-**Compounding loop:** When `WikiQueryTool` synthesises an answer spanning 2+
-pages (and > 200 chars), it writes the result to `wiki/queries/` and updates
-`index.md` — so future queries can find it directly.
+**Wiring into `MemoryExtractor`** (Sprint 5):
+```python
+# extractor.py — new parameter
+MemoryExtractor(..., post_extract_callback: Callable[[list[dict]], None] | None = None)
+  .run_once(session_id) -> tuple[int, list[dict]]   # was: -> int
+  # run_forever() calls post_extract_callback(facts) after each pass
+```
+`daemon.py` passes `WikiCompiler.compile` as `post_extract_callback`.
+`lcm_engine.py:238` updated to unpack the new tuple return.
 
-**New tools (Sprint 5 extension):**
+**`WikiCompileTool`** *(BaseTool)* — `src/prometheus/tools/builtin/wiki_compile.py`
+```
+name="wiki_compile"  inputs: entity_name? (str | None)
+```
+Module-level `set_wiki_compiler(compiler, store)` setter (same pattern as
+`lcm_grep.py`). Reads `.last_compile_ts` watermark, queries `MemoryStore`
+for newer facts, calls `compile()`.
 
-| File | Tool name | Input fields | Purpose |
-|------|-----------|-------------|---------|
-| `wiki_compile.py` | `wiki_compile` | `entity_name?` | On-demand wiki compilation |
-| `wiki_query.py` | `wiki_query` | `query` | Search wiki for knowledge answers |
+**`WikiQueryTool`** *(BaseTool)* — `src/prometheus/tools/builtin/wiki_query.py`
+```
+name="wiki_query"  inputs: query (str)
+```
+Reads `index.md`, scores entries by keyword overlap, reads top-5 pages,
+returns concatenated content. **Compounding loop:** files result to
+`wiki/queries/` when it spans 2+ pages *and* exceeds 200 chars — prevents
+trivial lookups from becoming wiki pages.
+
+Both tools registered in `build_tool_registry()` (`scripts/daemon.py`) and
+exported from `prometheus.tools.builtin.__init__`.
 
 ---
 
