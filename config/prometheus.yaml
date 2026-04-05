@@ -4,10 +4,10 @@ system:
 
 model:
   provider: "llama_cpp"
-  base_url: "http://localhost:8080"
-  model: "qwen3.5-32b"
+  base_url: "http://GPU_HOST:8080"
+  model: "gemma4-26b"
   fallback_provider: "ollama"
-  fallback_url: "http://localhost:11434"
+  fallback_url: "http://GPU_HOST:11434"
 
 context:
   effective_limit: 24000
@@ -42,7 +42,7 @@ infrastructure:
   telemetry_enabled: true
 
 gateway:
-  telegram_enabled: false
+  telegram_enabled: true
   telegram_token: ""                # set via PROMETHEUS_TELEGRAM_TOKEN env var
   allowed_chat_ids: []              # empty = allow all; set to restrict
   proxy_url: null                   # optional SOCKS5/HTTP proxy for Telegram

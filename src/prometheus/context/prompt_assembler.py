@@ -69,7 +69,11 @@ def build_runtime_system_prompt(
     # Static section
     # ------------------------------------------------------------------
     custom_prompt = config.get("system_prompt")
-    static_prompt = build_system_prompt(custom_prompt=custom_prompt, cwd=cwd)
+    env = get_environment_info(cwd=cwd)
+    model_cfg = config.get("model", {})
+    env.model_name = model_cfg.get("model", "")
+    env.model_provider = model_cfg.get("provider", "")
+    static_prompt = build_system_prompt(custom_prompt=custom_prompt, env=env)
 
     # Tool schema injection point — callers can embed schemas into the
     # static section by including them in the custom_prompt.  The base

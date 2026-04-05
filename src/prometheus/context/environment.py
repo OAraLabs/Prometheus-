@@ -34,6 +34,8 @@ class EnvironmentInfo:
     is_git_repo: bool
     git_branch: str | None = None
     hostname: str = ""
+    model_name: str = ""
+    model_provider: str = ""
     extra: dict[str, str] = field(default_factory=dict)
 
 

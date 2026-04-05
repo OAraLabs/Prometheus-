@@ -114,6 +114,12 @@ def _format_environment_section(env: EnvironmentInfo) -> str:
         f"- Python: {env.python_version}",
     ]
 
+    if env.model_name:
+        model_line = f"- Model: {env.model_name}"
+        if env.model_provider:
+            model_line += f" (provider: {env.model_provider})"
+        lines.append(model_line)
+
     if env.is_git_repo:
         git_line = "- Git: yes"
         if env.git_branch:

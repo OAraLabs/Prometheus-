@@ -106,6 +106,15 @@ async def run_daemon(args: argparse.Namespace) -> None:
         base_url=model_config.get("base_url", "http://localhost:8080"),
     )
 
+    # Detect actual loaded model from the server (falls back to config)
+    config_model = model_config.get("model", "qwen3.5-32b")
+    detected = await provider.detect_loaded_model()
+    model_name = detected or config_model
+    if detected:
+        model_config["model"] = detected
+    else:
+        logger.info("Using model name from config: %s", config_model)
+
     # Tool registry
     workspace = security_config.get("workspace_root")
     registry = build_tool_registry(workspace=workspace)
@@ -113,7 +122,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
     # Agent loop
     agent_loop = AgentLoop(
         provider=provider,
-        model=model_config.get("model", "qwen3.5-32b"),
+        model=model_name,
         tool_registry=registry,
     )
 
@@ -188,7 +197,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         extractor = MemoryExtractor(
             store=memory_store,
             provider=provider,
-            model=model_config.get("model", "qwen3.5-32b"),
+            model=model_name,
             post_extract_callback=wiki_compiler.compile,
         )
 
@@ -251,7 +260,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 knowledge_synth = KnowledgeSynthesizer(
                     store=memory_store,
                     provider=provider,
-                    model=model_config.get("model", "qwen3.5-32b"),
+                    model=model_name,
                     budget_tokens=sentinel_config.get("dream_budget_tokens", 2000),
                 )
 

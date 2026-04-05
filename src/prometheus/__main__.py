@@ -64,6 +64,25 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
 # Provider factory
 # ---------------------------------------------------------------------------
 
+def _detect_model_or_fallback(base_url: str, config_model: str) -> str:
+    """Query /v1/models to discover the loaded model; fall back to config value."""
+    import httpx as _httpx
+    url = f"{base_url.rstrip('/')}/v1/models"
+    try:
+        resp = _httpx.get(url, timeout=10.0)
+        resp.raise_for_status()
+        models = resp.json().get("data", [])
+        if models:
+            detected = models[0].get("id")
+            if detected:
+                log.info("Detected loaded model: %s", detected)
+                return detected
+    except Exception as exc:
+        log.warning("Could not detect model from %s: %s", url, exc)
+    log.info("Using model name from config: %s", config_model)
+    return config_model
+
+
 def create_provider(model_cfg: dict[str, Any]) -> tuple[ModelProvider, str]:
     """Instantiate the model provider from config.  Returns (provider, model_name)."""
     provider_name = model_cfg.get("provider", "llama_cpp")
@@ -165,7 +184,7 @@ def create_security_gate(security_cfg: dict[str, Any]):
     """Create the permission checker (Sprint 4)."""
     from prometheus.permissions.checker import SecurityGate
     return SecurityGate(
-        permission_mode=security_cfg.get("permission_mode", "default"),
+        mode=security_cfg.get("permission_mode", "default"),
         workspace_root=security_cfg.get("workspace_root"),
         denied_commands=security_cfg.get("denied_commands"),
         denied_paths=security_cfg.get("denied_paths"),
@@ -382,6 +401,14 @@ def main() -> None:
 
     # Build components
     provider, model_name = create_provider(model_cfg)
+
+    # Detect actual loaded model from the server (falls back to config)
+    if model_cfg.get("provider", "llama_cpp") in ("llama_cpp",):
+        model_name = _detect_model_or_fallback(
+            model_cfg.get("base_url", "http://localhost:8080"), model_name,
+        )
+        model_cfg["model"] = model_name
+
     registry = create_tool_registry(security_cfg)
     adapter = create_adapter(model_cfg)
     security_gate = create_security_gate(security_cfg)

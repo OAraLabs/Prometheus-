@@ -62,6 +62,29 @@ class LlamaCppProvider(ModelProvider):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._grammar = grammar
+        self.detected_model: str | None = None
+
+    async def detect_loaded_model(self) -> str | None:
+        """Query /v1/models to discover the model actually loaded on the server.
+
+        Returns the model id string, or None if the endpoint is unreachable.
+        Caches the result in ``self.detected_model``.
+        """
+        url = f"{self._base_url}/v1/models"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                body = resp.json()
+                # OpenAI-compatible: data[0].id
+                models = body.get("data", [])
+                if models:
+                    self.detected_model = models[0].get("id")
+                    log.info("Detected loaded model: %s", self.detected_model)
+                    return self.detected_model
+        except Exception as exc:
+            log.warning("Could not detect model from %s: %s", url, exc)
+        return None
 
     def set_grammar(self, grammar: str | None) -> None:
         """Update the GBNF grammar used for constrained decoding."""
