@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import logging
 import re
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -87,13 +89,18 @@ class TelegramAdapter(BasePlatformAdapter):
         agent_loop: AgentLoop,
         tool_registry: ToolRegistry,
         system_prompt: str = "You are Prometheus, a helpful AI assistant.",
+        model_name: str = "",
+        model_provider: str = "",
     ) -> None:
         super().__init__(config)
         self.agent_loop = agent_loop
         self.tool_registry = tool_registry
         self.system_prompt = system_prompt
+        self.model_name = model_name
+        self.model_provider = model_provider
         self._app: Application | None = None
         self._sessions: dict[str, list[dict[str, Any]]] = {}
+        self._start_time: float = 0.0
 
     async def start(self) -> None:
         """Build the telegram Application and start long-polling."""
@@ -111,6 +118,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # Register handlers
         self._app.add_handler(CommandHandler("start", self._cmd_start))
         self._app.add_handler(CommandHandler("clear", self._cmd_clear))
+        self._app.add_handler(CommandHandler("status", self._cmd_status))
+        self._app.add_handler(CommandHandler("help", self._cmd_help))
+        self._app.add_handler(CommandHandler("reset", self._cmd_reset))
+        self._app.add_handler(CommandHandler("model", self._cmd_model))
+        self._app.add_handler(CommandHandler("wiki", self._cmd_wiki))
+        self._app.add_handler(CommandHandler("sentinel", self._cmd_sentinel))
+        self._app.add_handler(CommandHandler("benchmark", self._cmd_benchmark))
+        self._app.add_handler(CommandHandler("context", self._cmd_context))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text)
         )
@@ -119,6 +134,24 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
         self._running = True
+        self._start_time = time.monotonic()
+
+        # Register command menu with Telegram
+        try:
+            await self._app.bot.set_my_commands([
+                BotCommand("start", "Check if Prometheus is online"),
+                BotCommand("status", "Model, uptime, tools, SENTINEL state"),
+                BotCommand("help", "List commands and capabilities"),
+                BotCommand("reset", "Clear conversation context"),
+                BotCommand("model", "Show current model and provider"),
+                BotCommand("wiki", "Wiki stats and recent entries"),
+                BotCommand("sentinel", "SENTINEL subsystem status"),
+                BotCommand("benchmark", "Run a quick smoke test"),
+                BotCommand("context", "Context window usage"),
+            ])
+        except Exception as exc:
+            logger.warning("Failed to register command menu: %s", exc)
+
         logger.info("Telegram adapter started (polling)")
 
     async def stop(self) -> None:
@@ -212,6 +245,322 @@ class TelegramAdapter(BasePlatformAdapter):
             "Conversation cleared.",
             parse_mode=None,
         )
+
+    async def _cmd_help(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /help command — list commands and capabilities."""
+        if update.effective_chat is None:
+            return
+        text = (
+            "Prometheus — Sovereign AI Agent\n"
+            "\n"
+            "Commands:\n"
+            "/status    — Model, uptime, tools, memory, SENTINEL\n"
+            "/model     — Current model name and provider\n"
+            "/wiki      — Wiki stats and recent entries\n"
+            "/sentinel  — SENTINEL subsystem status\n"
+            "/benchmark — Run a quick smoke test\n"
+            "/context   — Context window usage\n"
+            "/reset     — Clear conversation context\n"
+            "/help      — This message\n"
+            "\n"
+            "Send any message to chat with the agent."
+        )
+        await self.send(update.effective_chat.id, text, parse_mode=None)
+
+    async def _cmd_reset(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /reset command — clear conversation context."""
+        if update.effective_chat is None:
+            return
+        session_key = f"{Platform.TELEGRAM.value}:{update.effective_chat.id}"
+        self._sessions.pop(session_key, None)
+        await self.send(
+            update.effective_chat.id,
+            "Conversation context reset.",
+            parse_mode=None,
+        )
+
+    async def _cmd_model(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /model command — show current model and provider."""
+        if update.effective_chat is None:
+            return
+        name = self.model_name or "(unknown)"
+        provider = self.model_provider or "(unknown)"
+        await self.send(
+            update.effective_chat.id,
+            f"Model: {name}\nProvider: {provider}",
+            parse_mode=None,
+        )
+
+    async def _cmd_status(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /status command — model, uptime, tools, memory, SENTINEL."""
+        if update.effective_chat is None:
+            return
+
+        lines: list[str] = ["Prometheus Status\n"]
+
+        # Model
+        lines.append(f"Model: {self.model_name or '(unknown)'}")
+        lines.append(f"Provider: {self.model_provider or '(unknown)'}")
+
+        # Uptime
+        if self._start_time:
+            elapsed = int(time.monotonic() - self._start_time)
+            h, remainder = divmod(elapsed, 3600)
+            m, s = divmod(remainder, 60)
+            lines.append(f"Uptime: {h}h {m}m {s}s")
+
+        # Tools
+        lines.append(f"Tools: {len(self.tool_registry.list_tools())}")
+
+        # Memory stats
+        try:
+            from prometheus.tools.builtin.wiki_compile import _memory_store
+            if _memory_store is not None:
+                facts = _memory_store.get_all_memories(limit=10000)
+                lines.append(f"Memory facts: {len(facts)}")
+            else:
+                lines.append("Memory: not initialized")
+        except Exception:
+            lines.append("Memory: unavailable")
+
+        # SENTINEL state
+        try:
+            from prometheus.tools.builtin.sentinel_status import (
+                _autodream,
+                _observer,
+            )
+            if _observer is not None and _autodream is not None:
+                state = "dreaming" if _autodream.dreaming else (
+                    "active" if _observer.started else "idle"
+                )
+                lines.append(f"\nSENTINEL: {state}")
+                lines.append(f"Dream cycles: {_autodream.cycle_count}")
+                if _autodream.last_results:
+                    lines.append("Last dream results:")
+                    for r in _autodream.last_results:
+                        status = "OK" if not r.error else f"FAIL: {r.error}"
+                        lines.append(f"  {r.phase}: {status} ({r.duration_seconds:.1f}s)")
+            else:
+                lines.append("\nSENTINEL: not initialized")
+        except Exception:
+            lines.append("\nSENTINEL: unavailable")
+
+        await self.send(update.effective_chat.id, "\n".join(lines), parse_mode=None)
+
+    async def _cmd_wiki(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /wiki command — wiki stats and recent entries."""
+        if update.effective_chat is None:
+            return
+
+        wiki_index = Path.home() / ".prometheus" / "wiki" / "index.md"
+        if not wiki_index.exists():
+            await self.send(
+                update.effective_chat.id,
+                "Wiki: no index found at ~/.prometheus/wiki/index.md",
+                parse_mode=None,
+            )
+            return
+
+        try:
+            content = wiki_index.read_text(encoding="utf-8")
+            entries: list[str] = []
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("- ["):
+                    entries.append(line)
+
+            lines = [f"Wiki: {len(entries)} pages"]
+
+            # Last modified
+            mtime = wiki_index.stat().st_mtime
+            from datetime import datetime, timezone
+            updated = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            lines.append(f"Last updated: {updated.strftime('%Y-%m-%d %H:%M UTC')}")
+
+            # Show last 5 entries
+            if entries:
+                lines.append("\nRecent entries:")
+                for entry in entries[-5:]:
+                    lines.append(f"  {entry}")
+
+            await self.send(
+                update.effective_chat.id, "\n".join(lines), parse_mode=None
+            )
+        except Exception as exc:
+            await self.send(
+                update.effective_chat.id,
+                f"Wiki: error reading index — {exc}",
+                parse_mode=None,
+            )
+
+    async def _cmd_sentinel(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /sentinel command — reuses SentinelStatusTool logic."""
+        if update.effective_chat is None:
+            return
+
+        try:
+            from prometheus.tools.builtin.sentinel_status import (
+                _autodream,
+                _observer,
+                _signal_bus,
+            )
+        except ImportError:
+            await self.send(
+                update.effective_chat.id,
+                "SENTINEL module not available.",
+                parse_mode=None,
+            )
+            return
+
+        if _signal_bus is None or _observer is None or _autodream is None:
+            await self.send(
+                update.effective_chat.id,
+                "SENTINEL not initialized. Is the daemon running with sentinel enabled?",
+                parse_mode=None,
+            )
+            return
+
+        lines: list[str] = ["SENTINEL Status\n"]
+
+        # Observer
+        idle_secs = int(time.time() - _observer.last_activity)
+        lines.append("Observer:")
+        lines.append(f"  Active: {_observer.started}")
+        lines.append(f"  Last activity: {idle_secs}s ago")
+        lines.append(f"  Pending nudges: {len(_observer.pending_nudges)}")
+
+        # AutoDream
+        lines.append("\nAutoDream Engine:")
+        lines.append(f"  Dreaming: {_autodream.dreaming}")
+        lines.append(f"  Cycles completed: {_autodream.cycle_count}")
+        if _autodream.last_cycle_time:
+            ago = int(time.time() - _autodream.last_cycle_time)
+            lines.append(f"  Last cycle: {ago}s ago")
+
+        # Signal bus
+        lines.append("\nSignal Bus:")
+        lines.append(f"  Total signals: {_signal_bus.signal_count}")
+        lines.append(f"  Subscribers: {_signal_bus.subscriber_count}")
+
+        # Recent signals
+        recent = _signal_bus.recent(limit=10)
+        if recent:
+            lines.append("\nRecent Signals:")
+            for sig in recent:
+                ago = int(time.time() - sig.timestamp)
+                lines.append(f"  [{sig.kind}] from {sig.source} ({ago}s ago)")
+
+        # Last dream results
+        if _autodream.last_results:
+            lines.append("\nLast Dream Cycle:")
+            for r in _autodream.last_results:
+                status = "OK" if not r.error else f"FAIL: {r.error}"
+                lines.append(f"  {r.phase}: {status} ({r.duration_seconds:.1f}s)")
+                for k, v in r.summary.items():
+                    lines.append(f"    {k}: {v}")
+
+        # Pending nudges
+        if _observer.pending_nudges:
+            lines.append("\nPending Nudges:")
+            for nudge in _observer.pending_nudges[:5]:
+                lines.append(f"  [{nudge.nudge_type}] {nudge.message[:80]}")
+
+        await self.send(update.effective_chat.id, "\n".join(lines), parse_mode=None)
+
+    async def _cmd_benchmark(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /benchmark command — run a quick smoke test."""
+        if update.effective_chat is None:
+            return
+
+        chat_id = update.effective_chat.id
+        await self.send(chat_id, "Running benchmark...", parse_mode=None)
+
+        try:
+            t0 = time.monotonic()
+            result = await self.agent_loop.run_async(
+                system_prompt="You are a helpful assistant. Be concise.",
+                user_message="What is 2+2? Reply with just the number.",
+                tools=[],
+            )
+            elapsed = time.monotonic() - t0
+
+            response = (result.text or "").strip()
+            passed = "4" in response
+
+            lines = [
+                f"Benchmark: {'PASS' if passed else 'FAIL'}",
+                f"Latency: {elapsed:.2f}s",
+                f"Response: {response[:100]}",
+                f"Tokens: {result.usage.input_tokens} in / {result.usage.output_tokens} out",
+            ]
+            await self.send(chat_id, "\n".join(lines), parse_mode=None)
+        except Exception as exc:
+            await self.send(
+                chat_id,
+                f"Benchmark: FAIL\nError: {exc}",
+                parse_mode=None,
+            )
+
+    async def _cmd_context(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /context command — show context window usage."""
+        if update.effective_chat is None:
+            return
+
+        from prometheus.context.token_estimation import estimate_tokens
+
+        # Read effective_limit from config (with model override)
+        try:
+            from prometheus.context.budget import TokenBudget
+            budget = TokenBudget.from_config(model=self.model_name)
+            effective_limit = budget.effective_limit
+            reserved_output = budget.reserved_output
+        except Exception:
+            effective_limit = 24000
+            reserved_output = 2000
+
+        # Estimate system prompt cost
+        prompt_tokens = estimate_tokens(self.system_prompt)
+
+        # Available for conversation
+        available = effective_limit - reserved_output
+        headroom = max(0, available - prompt_tokens)
+        usage_pct = (prompt_tokens / available * 100) if available > 0 else 0
+
+        lines = [
+            "Context Window\n",
+            f"Window size:    {effective_limit:,} tokens",
+            f"Reserved output: {reserved_output:,} tokens",
+            f"Available:       {available:,} tokens",
+            f"",
+            f"System prompt:   {prompt_tokens:,} tokens ({usage_pct:.0f}%)",
+            f"Headroom:        {headroom:,} tokens",
+            f"",
+            f"Model: {self.model_name or '(unknown)'}",
+        ]
+
+        # Show bar visualization
+        bar_len = 20
+        filled = round(usage_pct / 100 * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        lines.append(f"[{bar}] {usage_pct:.0f}% used")
+
+        await self.send(update.effective_chat.id, "\n".join(lines), parse_mode=None)
 
     async def _handle_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

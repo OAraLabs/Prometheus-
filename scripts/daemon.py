@@ -157,6 +157,8 @@ async def run_daemon(args: argparse.Namespace) -> None:
             agent_loop=agent_loop,
             tool_registry=registry,
             system_prompt=system_prompt,
+            model_name=model_name,
+            model_provider=model_config.get("provider", "llama_cpp"),
         )
         await telegram.start()
         archive.archive_event("telegram_started")

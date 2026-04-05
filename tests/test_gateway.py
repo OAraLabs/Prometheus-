@@ -274,6 +274,157 @@ class TestTelegramAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Telegram slash commands
+# ---------------------------------------------------------------------------
+
+
+def _make_update(chat_id: int = 123) -> MagicMock:
+    """Create a mock Telegram Update with effective_chat set."""
+    update = MagicMock()
+    update.effective_chat = MagicMock()
+    update.effective_chat.id = chat_id
+    update.effective_user = MagicMock()
+    update.effective_user.id = 456
+    return update
+
+
+def _make_adapter(**kwargs) -> TelegramAdapter:
+    """Create a TelegramAdapter with mocked send and agent_loop."""
+    config = PlatformConfig(platform=Platform.TELEGRAM, token="test")
+    agent_loop = kwargs.pop("agent_loop", AsyncMock())
+    adapter = TelegramAdapter(
+        config=config,
+        agent_loop=agent_loop,
+        tool_registry=kwargs.pop("tool_registry", ToolRegistry()),
+        model_name=kwargs.pop("model_name", "test-model-v1"),
+        model_provider=kwargs.pop("model_provider", "llama_cpp"),
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id=1))
+    adapter._start_time = kwargs.pop("start_time", 0.0)
+    return adapter
+
+
+class TestTelegramCommands:
+    """Tests for Telegram slash command handlers."""
+
+    @pytest.mark.asyncio
+    async def test_cmd_help(self):
+        adapter = _make_adapter()
+        await adapter._cmd_help(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "/status" in text
+        assert "/reset" in text
+        assert "/benchmark" in text
+
+    @pytest.mark.asyncio
+    async def test_cmd_model(self):
+        adapter = _make_adapter(model_name="gemma4-26b", model_provider="llama_cpp")
+        await adapter._cmd_model(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "gemma4-26b" in text
+        assert "llama_cpp" in text
+
+    @pytest.mark.asyncio
+    async def test_cmd_reset(self):
+        adapter = _make_adapter()
+        key = "telegram:123"
+        adapter._sessions[key] = [{"role": "user", "content": "hi"}]
+        await adapter._cmd_reset(_make_update(chat_id=123), MagicMock())
+        assert key not in adapter._sessions
+        text = adapter.send.call_args[0][1]
+        assert "reset" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_cmd_status(self):
+        import time as _time
+        adapter = _make_adapter(start_time=_time.monotonic() - 60)
+        await adapter._cmd_status(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "Uptime" in text
+        assert "Tools" in text
+        assert "test-model-v1" in text
+
+    @pytest.mark.asyncio
+    async def test_cmd_sentinel_not_initialized(self, monkeypatch):
+        monkeypatch.setattr(
+            "prometheus.tools.builtin.sentinel_status._signal_bus", None
+        )
+        monkeypatch.setattr(
+            "prometheus.tools.builtin.sentinel_status._observer", None
+        )
+        monkeypatch.setattr(
+            "prometheus.tools.builtin.sentinel_status._autodream", None
+        )
+        adapter = _make_adapter()
+        await adapter._cmd_sentinel(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "not initialized" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_cmd_wiki_no_index(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        adapter = _make_adapter()
+        await adapter._cmd_wiki(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "no index" in text.lower()
+
+    @pytest.mark.asyncio
+    async def test_cmd_wiki_with_index(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        wiki_dir = tmp_path / ".prometheus" / "wiki"
+        wiki_dir.mkdir(parents=True)
+        index = wiki_dir / "index.md"
+        index.write_text(
+            "- [Alpha](alpha.md) — first entry\n"
+            "- [Beta](beta.md) — second entry\n"
+            "- [Gamma](gamma.md) — third entry\n"
+        )
+        adapter = _make_adapter()
+        await adapter._cmd_wiki(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "3 pages" in text
+        assert "Alpha" in text
+
+    @pytest.mark.asyncio
+    async def test_cmd_benchmark_pass(self):
+        mock_result = MagicMock()
+        mock_result.text = "4"
+        mock_result.usage = MagicMock()
+        mock_result.usage.input_tokens = 10
+        mock_result.usage.output_tokens = 5
+        agent_loop = AsyncMock()
+        agent_loop.run_async = AsyncMock(return_value=mock_result)
+        adapter = _make_adapter(agent_loop=agent_loop)
+        await adapter._cmd_benchmark(_make_update(), MagicMock())
+        # First call is "Running benchmark...", second is results
+        assert adapter.send.call_count == 2
+        result_text = adapter.send.call_args_list[1][0][1]
+        assert "PASS" in result_text
+
+    @pytest.mark.asyncio
+    async def test_cmd_benchmark_fail(self):
+        agent_loop = AsyncMock()
+        agent_loop.run_async = AsyncMock(side_effect=RuntimeError("connection refused"))
+        adapter = _make_adapter(agent_loop=agent_loop)
+        await adapter._cmd_benchmark(_make_update(), MagicMock())
+        assert adapter.send.call_count == 2
+        result_text = adapter.send.call_args_list[1][0][1]
+        assert "FAIL" in result_text
+        assert "connection refused" in result_text
+
+    @pytest.mark.asyncio
+    async def test_cmd_context(self):
+        adapter = _make_adapter(model_name="gemma4-26b")
+        adapter.system_prompt = "You are a test assistant."
+        await adapter._cmd_context(_make_update(), MagicMock())
+        text = adapter.send.call_args[0][1]
+        assert "Window size" in text
+        assert "System prompt" in text
+        assert "Headroom" in text
+        assert "gemma4-26b" in text
+
+
+# ---------------------------------------------------------------------------
 # Cron service
 # ---------------------------------------------------------------------------
 
