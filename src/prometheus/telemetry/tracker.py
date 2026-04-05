@@ -92,7 +92,7 @@ class ToolCallTelemetry:
     # Read
     # ------------------------------------------------------------------
 
-    def report(self) -> dict[str, Any]:
+    def report(self, since: float | None = None) -> dict[str, Any]:
         """Return aggregated success rates per model and per tool.
 
         Returns a dict structured as::
@@ -126,12 +126,15 @@ class ToolCallTelemetry:
                 "overall_success_rate": float,
             }
         """
-        rows = self._conn.execute(
-            """
-            SELECT model, tool_name, success, retries, latency_ms, error_type
-            FROM tool_calls
-            """
-        ).fetchall()
+        query = (
+            "SELECT model, tool_name, success, retries, latency_ms, error_type"
+            " FROM tool_calls"
+        )
+        params: tuple = ()
+        if since is not None:
+            query += " WHERE timestamp >= ?"
+            params = (since,)
+        rows = self._conn.execute(query, params).fetchall()
 
         if not rows:
             return {

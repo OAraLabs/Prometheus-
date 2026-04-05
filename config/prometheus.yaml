@@ -55,3 +55,15 @@ learning:
   auto_skill_creation: true
   memory_md_max_chars: 2200
   user_md_max_chars: 1375
+
+sentinel:
+  enabled: true
+  idle_threshold_minutes: 15        # how long before "idle" triggers
+  nudge_cooldown_minutes: 60        # min time between proactive Telegram nudges
+  dream_interval_minutes: 30        # time between dream cycles during idle
+  dream_budget_tokens: 2000         # max LLM tokens per dream cycle
+  stale_threshold_days: 90          # when facts start losing confidence
+  confidence_decay_rate: 0.05       # per-cycle decay for stale facts
+  digest_lookback_hours: 24         # telemetry digest window
+  auto_fix_wiki: true               # let wiki linter auto-fix safe issues
+  synthesis_enabled: true           # enable LLM-powered knowledge synthesis

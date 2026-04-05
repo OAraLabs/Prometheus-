@@ -1717,3 +1717,196 @@ tests/
   test_coordinator.py     — 37 tests (definitions, teams, subagent, health)
   test_benchmarks.py      — 31 tests (suite, scoring, runner, agent tool)
 ```
+
+---
+
+## Sprint 9 — SENTINEL: Proactive Daemon + AutoDream
+
+Transforms Prometheus from reactive (waits for messages) to proactive (observes, acts, consolidates). Two subsystems: **Activity Observer** watches signals and sends Telegram nudges, **AutoDream Engine** uses idle time for wiki maintenance, memory consolidation, telemetry analysis, and knowledge synthesis.
+
+### Architecture
+
+```
+SENTINEL LAYER (signal-driven)
+├── SignalBus              — async pub/sub for ActivitySignal events
+├── Activity Observer      — pattern detection → Telegram nudges
+│   ├── Extraction spike   — high fact count in one pass
+│   ├── Error streak       — consecutive tool failures
+│   └── Nudge cooldown     — per-type cooldown prevents spam
+│
+└── AutoDream Engine       — triggered by idle_start signal
+    ├── Phase 1: WikiLint             — orphans, broken links, stale pages (no LLM)
+    ├── Phase 2: MemoryConsolidation  — dedup, decay, tombstone (no LLM)
+    ├── Phase 3: TelemetryDigest      — anomaly detection (no LLM)
+    └── Phase 4: KnowledgeSynthesis   — cross-entity insights (LLM, budget-capped)
+```
+
+### New Classes
+
+**`sentinel/signals.py`** — Signal bus
+
+```python
+@dataclass
+class ActivitySignal:
+    kind: str               # "idle_start", "idle_end", "extraction_complete", etc.
+    timestamp: float
+    payload: dict[str, Any]
+    source: str
+
+class SignalBus:
+    def subscribe(kind: str, callback: SignalCallback) -> None   # "*" for wildcard
+    async def emit(signal: ActivitySignal) -> None               # broadcast, exceptions caught
+    def recent(kind: str | None, *, limit: int) -> list[ActivitySignal]
+```
+
+**`sentinel/observer.py`** — Activity observer
+
+```python
+class ActivityObserver:
+    def __init__(bus: SignalBus, gateway: BasePlatformAdapter | None, *, config: dict)
+    async def start() -> None              # subscribes to "*" on bus
+    async def _send_nudge(nudge_type: str, message: str) -> None  # respects cooldown
+    # Properties: started, last_activity, pending_nudges, nudge_history
+```
+
+**`sentinel/autodream.py`** — AutoDream engine
+
+```python
+@dataclass
+class DreamResult:
+    phase: str
+    duration_seconds: float
+    summary: dict[str, Any]
+    error: str | None
+
+class AutoDreamEngine:
+    def __init__(bus: SignalBus, *, wiki_linter, memory_consolidator,
+                 telemetry_digest, knowledge_synth, config: dict)
+    async def start() -> None              # subscribes to idle_start/idle_end
+    async def run_cycle() -> list[DreamResult]  # runs all 4 phases
+    # Properties: dreaming, cycle_count, last_cycle_time, last_results
+```
+
+**`sentinel/wiki_lint.py`** — Wiki linter
+
+```python
+@dataclass
+class LintIssue:
+    severity: str    # "error" | "warning" | "info"
+    category: str    # "orphan" | "broken_link" | "stale" | "duplicate" | "missing_crossref" | "imbalance"
+    page: str
+    detail: str
+    fixable: bool
+
+class WikiLinter:
+    def __init__(wiki_root: Path | None)
+    def lint() -> LintResult              # scans for 6 issue types
+    def auto_fix(result: LintResult) -> int  # fixes safe issues
+    def summary(issues: list[LintIssue]) -> str
+```
+
+**`sentinel/memory_consolidator.py`** — Memory cleaner
+
+```python
+class MemoryConsolidator:
+    def __init__(store: MemoryStore, *, decay_rate=0.05, min_confidence=0.1,
+                 stale_days=90, similarity_threshold=0.80)
+    def consolidate() -> ConsolidationResult  # dedup + decay + tombstone
+```
+
+**`sentinel/telemetry_digest.py`** — Telemetry health report
+
+```python
+class TelemetryDigest:
+    def __init__(telemetry: ToolCallTelemetry, *, period_hours=24, baseline_hours=168)
+    def generate() -> DigestResult        # compares current vs baseline
+    # Flags: success_rate_drop >5%, retry_increase >10%, latency_spike >50%
+```
+
+**`sentinel/knowledge_synth.py`** — LLM-powered insight generation
+
+```python
+class KnowledgeSynthesizer:
+    def __init__(store: MemoryStore, provider: ModelProvider, *, model, budget_tokens=2000)
+    async def synthesize(budget_tokens: int | None) -> list[SynthInsight]
+    # Writes to wiki/queries/insight-{date}-{topic}.md
+```
+
+### New Tools
+
+**`tools/builtin/sentinel_status.py`** — `sentinel_status` tool
+
+```python
+class SentinelStatusTool(BaseTool):
+    # Returns: observer state, dream state, signal bus stats, pending nudges
+    # Input: SentinelStatusInput(verbose: bool = False)
+```
+
+**`tools/builtin/wiki_lint_tool.py`** — `wiki_lint` tool
+
+```python
+class WikiLintTool(BaseTool):
+    # Triggers wiki lint on demand, returns issue list
+    # Input: WikiLintInput(severity: str | None, auto_fix: bool = False)
+```
+
+### Modified Files
+
+| File | Change |
+|------|--------|
+| `gateway/heartbeat.py` | Added `signal_bus` property + setter, idle detection via `_check_idle()`, emits `idle_start`/`idle_end` |
+| `memory/extractor.py` | Added `signal_bus` property + setter, emits `extraction_complete` after `run_once()` |
+| `memory/store.py` | Added `update_memory(id, **fields)`, `delete_memory(id)`, `get_all_memories(min_confidence, limit)` |
+| `telemetry/tracker.py` | Added `since: float | None` param to `report()` for time-windowed queries |
+| `tools/builtin/__init__.py` | Exports `SentinelStatusTool`, `WikiLintTool` |
+| `scripts/daemon.py` | Creates SignalBus + all SENTINEL components, wires into heartbeat/extractor, registers tools |
+| `config/prometheus.yaml` | Added `sentinel:` section with 10 config keys |
+
+### Daemon Wiring (scripts/daemon.py)
+
+SENTINEL is wired after the memory extractor block. Signal bus is passed to heartbeat and extractor via property setters to avoid restructuring existing init order.
+
+```python
+signal_bus = SignalBus()
+heartbeat.signal_bus = signal_bus       # enables idle detection
+extractor.signal_bus = signal_bus       # emits extraction_complete
+observer = ActivityObserver(signal_bus, gateway=telegram, config=sentinel_config)
+autodream = AutoDreamEngine(signal_bus, wiki_linter=..., ...)
+await observer.start()                  # subscribes to "*"
+await autodream.start()                 # subscribes to idle_start/idle_end
+```
+
+### Config (`prometheus.yaml`)
+
+```yaml
+sentinel:
+  enabled: true
+  idle_threshold_minutes: 15
+  nudge_cooldown_minutes: 60
+  dream_interval_minutes: 30
+  dream_budget_tokens: 2000
+  stale_threshold_days: 90
+  confidence_decay_rate: 0.05
+  digest_lookback_hours: 24
+  auto_fix_wiki: true
+  synthesis_enabled: true
+```
+
+### Sprint 9 File Tree
+
+```
+sentinel/
+  __init__.py               — package exports (SignalBus, ActivitySignal)
+  signals.py                — ActivitySignal dataclass, SignalBus async pub/sub
+  observer.py               — ActivityObserver, PendingNudge
+  autodream.py              — AutoDreamEngine, DreamResult
+  wiki_lint.py              — WikiLinter, LintIssue, LintResult
+  memory_consolidator.py    — MemoryConsolidator, ConsolidationResult
+  telemetry_digest.py       — TelemetryDigest, DigestAnomaly, DigestResult
+  knowledge_synth.py        — KnowledgeSynthesizer, SynthInsight
+tools/builtin/
+  sentinel_status.py          — SentinelStatusTool + set_sentinel_components()
+  wiki_lint_tool.py         — WikiLintTool + set_wiki_linter()
+tests/
+  test_sentinel.py            — 33 tests (signals, observer, autodream, linter, consolidator, digest, tools)
+```

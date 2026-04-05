@@ -203,6 +203,91 @@ async def run_daemon(args: argparse.Namespace) -> None:
     except Exception as exc:
         logger.warning("Memory extractor not available: %s", exc)
 
+    # SENTINEL proactive subsystem (Sprint 9)
+    sentinel_config = config.get("sentinel", {})
+    if sentinel_config.get("enabled", True):
+        try:
+            from prometheus.sentinel.signals import SignalBus
+            from prometheus.sentinel.autodream import AutoDreamEngine
+            from prometheus.sentinel.observer import ActivityObserver
+            from prometheus.sentinel.wiki_lint import WikiLinter
+            from prometheus.sentinel.memory_consolidator import MemoryConsolidator
+            from prometheus.sentinel.telemetry_digest import TelemetryDigest
+            from prometheus.sentinel.knowledge_synth import KnowledgeSynthesizer
+            from prometheus.tools.builtin.sentinel_status import set_sentinel_components
+            from prometheus.tools.builtin.wiki_lint_tool import (
+                set_wiki_linter as set_lint_wiki_linter,
+            )
+            from prometheus.tools.builtin.sentinel_status import SentinelStatusTool
+            from prometheus.tools.builtin.wiki_lint_tool import WikiLintTool
+
+            signal_bus = SignalBus()
+
+            # Leaf components
+            wiki_linter = WikiLinter()
+            set_lint_wiki_linter(wiki_linter)
+
+            mem_consolidator = None
+            if "memory_store" in dir():
+                mem_consolidator = MemoryConsolidator(
+                    memory_store,
+                    stale_days=sentinel_config.get("stale_threshold_days", 90),
+                    decay_rate=sentinel_config.get("confidence_decay_rate", 0.05),
+                )
+
+            tel_digest = None
+            try:
+                from prometheus.telemetry.tracker import ToolCallTelemetry
+                telemetry = ToolCallTelemetry()
+                tel_digest = TelemetryDigest(
+                    telemetry,
+                    period_hours=sentinel_config.get("digest_lookback_hours", 24),
+                )
+            except Exception:
+                logger.debug("SENTINEL: telemetry digest not available")
+
+            knowledge_synth = None
+            if "memory_store" in dir() and sentinel_config.get("synthesis_enabled", True):
+                knowledge_synth = KnowledgeSynthesizer(
+                    store=memory_store,
+                    provider=provider,
+                    model=model_config.get("model", "qwen3.5-32b"),
+                    budget_tokens=sentinel_config.get("dream_budget_tokens", 2000),
+                )
+
+            # Orchestrators
+            autodream = AutoDreamEngine(
+                signal_bus,
+                wiki_linter=wiki_linter,
+                memory_consolidator=mem_consolidator,
+                telemetry_digest=tel_digest,
+                knowledge_synth=knowledge_synth,
+                config=sentinel_config,
+            )
+            observer = ActivityObserver(
+                signal_bus,
+                gateway=telegram,
+                config=sentinel_config,
+            )
+
+            # Wire signal bus into existing subsystems
+            heartbeat.signal_bus = signal_bus
+            if "extractor" in dir():
+                extractor.signal_bus = signal_bus
+
+            # Start (signal-reactive, no separate tasks needed)
+            await observer.start()
+            await autodream.start()
+
+            # Wire tool singletons and register
+            set_sentinel_components(signal_bus, observer, autodream)
+            registry.register(SentinelStatusTool())
+            registry.register(WikiLintTool())
+
+            logger.info("SENTINEL proactive subsystem started")
+        except Exception as exc:
+            logger.warning("SENTINEL not available: %s", exc)
+
     logger.info("Prometheus daemon running. Press Ctrl+C to stop.")
 
     # Wait for shutdown

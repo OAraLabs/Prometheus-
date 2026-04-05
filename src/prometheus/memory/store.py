@@ -259,6 +259,72 @@ class MemoryStore:
             results.append(d)
         return results
 
+    def get_all_memories(
+        self,
+        *,
+        min_confidence: float = 0.0,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Return all memories above *min_confidence*, newest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM memories WHERE confidence >= ?"
+            " ORDER BY timestamp DESC LIMIT ?",
+            (min_confidence, limit),
+        ).fetchall()
+        results = []
+        for row in rows:
+            d = dict(row)
+            d["source_event_ids"] = json.loads(d["source_event_ids"])
+            d["tags"] = json.loads(d["tags"])
+            results.append(d)
+        return results
+
+    def update_memory(self, memory_id: str, **fields: object) -> None:
+        """Update arbitrary columns on a memory by ID."""
+        if not fields:
+            return
+        allowed = {
+            "entity_type", "entity_name", "relationship", "fact",
+            "confidence", "source_event_ids", "last_mentioned",
+            "mention_count", "tags",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return
+
+        # Serialize JSON fields
+        for key in ("source_event_ids", "tags"):
+            if key in updates and isinstance(updates[key], list):
+                updates[key] = json.dumps(updates[key])
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [memory_id]
+        self._conn.execute(
+            f"UPDATE memories SET {set_clause} WHERE id = ?", values  # noqa: S608
+        )
+
+        # Update FTS5 if entity_name or fact changed
+        if "entity_name" in updates or "fact" in updates:
+            row = self._conn.execute(
+                "SELECT entity_name, fact FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO memories_fts (id, entity_name, fact)"
+                    " VALUES (?, ?, ?)",
+                    (memory_id, row["entity_name"], row["fact"]),
+                )
+        self._conn.commit()
+
+    def delete_memory(self, memory_id: str) -> None:
+        """Delete a memory and its FTS5 entry."""
+        self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        self._conn.execute(
+            "DELETE FROM memories_fts WHERE id = ?", (memory_id,)
+        )
+        self._conn.commit()
+
     def get_memory(self, memory_id: str) -> dict | None:
         """Return a single memory by ID."""
         row = self._conn.execute(

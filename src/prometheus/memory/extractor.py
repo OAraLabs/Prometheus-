@@ -77,6 +77,7 @@ class MemoryExtractor:
         obsidian_writer: ObsidianWriter | None = None,
         batch_size: int = _BATCH_SIZE,
         post_extract_callback: Callable[[list[dict]], None] | None = None,
+        signal_bus: object | None = None,
     ) -> None:
         self._store = store
         self._provider = provider
@@ -84,8 +85,18 @@ class MemoryExtractor:
         self._obsidian = obsidian_writer
         self._batch_size = batch_size
         self._post_extract_callback = post_extract_callback
+        self._signal_bus = signal_bus
         self._last_run: float = 0.0
         self._last_processed_ts: float = 0.0
+
+    @property
+    def signal_bus(self) -> object | None:
+        return self._signal_bus
+
+    @signal_bus.setter
+    def signal_bus(self, bus: object) -> None:
+        """Set signal bus after construction (used by daemon.py wiring)."""
+        self._signal_bus = bus
 
     async def run_once(self, session_id: str | None = None) -> tuple[int, list[dict]]:
         """Run one extraction pass.
@@ -123,6 +134,19 @@ class MemoryExtractor:
             self._last_processed_ts = max(float(m["timestamp"]) for m in messages)
         self._last_run = time.time()
         log.info("MemoryExtractor: persisted %d memories from %d messages", total_persisted, len(messages))
+
+        # SENTINEL: emit extraction_complete signal (Sprint 9)
+        if self._signal_bus and all_facts:
+            try:
+                from prometheus.sentinel.signals import ActivitySignal
+                await self._signal_bus.emit(ActivitySignal(
+                    kind="extraction_complete",
+                    payload={"count": total_persisted, "facts": len(all_facts)},
+                    source="memory_extractor",
+                ))
+            except Exception:
+                log.debug("MemoryExtractor: signal emission failed (SENTINEL not available)")
+
         return total_persisted, all_facts
 
     async def run_forever(
