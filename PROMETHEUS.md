@@ -15,7 +15,7 @@ prometheus/
   context/      Context management + compression (Sprint 4)
   providers/    ModelProvider ABC + StubProvider (Sprint 1) ✓
   gateway/      Telegram / messaging interface (Sprint 6)
-  learning/     Learning loop + skill creation (Sprint 7)
+  learning/     Learning loop + skill creation (Sprint 7) ✓
   tasks/        Task persistence (Sprint 5)
   memory/       LCM + persistent memory (Sprint 5)
   skills/       Skill loading from .md files (Sprint 5)
@@ -1146,6 +1146,307 @@ await asyncio.gather(
 ### Dependencies added
 - `python-telegram-bot>=21.0` — Telegram Bot API
 - `croniter>=2.0` — cron expression parsing
+
+---
+
+## Sprint 7: Learning Loop + LCM ✓
+
+### File tree additions
+
+```
+learning/
+  __init__.py         PeriodicNudge, SkillCreator, SkillRefiner
+  nudge.py            Self-evaluation injection every N turns
+  skill_creator.py    Auto-generate SKILL.md from tool traces
+  skill_refiner.py    Refine skills based on execution deviations
+
+memory/
+  lcm_types.py        MessagePart, SummaryNode, CompactionConfig, AssemblyResult, CompactionResult, LCMStats
+  lcm_fts5.py         sanitize_fts5_query(), tokenize_for_fts5()
+  lcm_conversation_store.py  SQLite message store with FTS5
+  lcm_summary_store.py       SQLite DAG summary store with FTS5
+  lcm_compaction.py    Incremental DAG compaction engine
+  lcm_assembler.py     Context assembly from summaries + fresh tail
+  lcm_summarize.py     LLM summarization with circuit breaker
+  lcm_engine.py        Top-level LCM orchestrator
+
+tools/builtin/
+  lcm_grep.py          FTS5 search over messages + summaries
+  lcm_expand.py        Expand summary back to source messages
+  lcm_describe.py      Inspect summary metadata / LCM stats
+
+context/
+  system_prompt.py     Prometheus identity + SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+  prompt_assembler.py  Runtime system prompt assembly (static + dynamic)
+  prometheusmd.py      PROMETHEUS.md discovery and loading
+```
+
+### `prometheus.learning.nudge.PeriodicNudge`
+`src/prometheus/learning/nudge.py`
+
+```python
+@dataclass
+class PeriodicNudge:
+    interval: int = 15          # turns between nudges
+    prompt: str = _NUDGE_PROMPT # < 200 tokens
+    enabled: bool = True
+
+    @classmethod
+    def from_config(cls, config_path: str | None = None) -> PeriodicNudge
+    def maybe_inject(self, turn_count: int) -> dict | None  # returns nudge msg or None
+    def reset(self) -> None
+```
+
+### `prometheus.learning.skill_creator.SkillCreator`
+`src/prometheus/learning/skill_creator.py`
+
+```python
+class SkillCreator:
+    def __init__(self, provider: ModelProvider, *, model: str = "default",
+                 min_tool_calls: int = 3, auto_dir: Path | None = None) -> None
+
+    @classmethod
+    def from_config(cls, provider: ModelProvider, config_path: str | None = None) -> SkillCreator
+    async def maybe_create(self, task_description: str,
+                           tool_trace: list[dict]) -> Path | None
+    # Writes to ~/.prometheus/skills/auto/<slug>.md
+```
+
+### `prometheus.learning.skill_refiner.SkillRefiner`
+`src/prometheus/learning/skill_refiner.py`
+
+```python
+class SkillRefiner:
+    def __init__(self, provider: ModelProvider, *, model: str = "default") -> None
+
+    async def maybe_refine(self, skill_path: Path,
+                           tool_trace: list[dict], outcome: str) -> bool
+    # Creates .bak backup before updating
+```
+
+### `prometheus.memory.lcm_types`
+`src/prometheus/memory/lcm_types.py`
+
+```python
+@dataclass
+class MessagePart:
+    role: str; content: str; timestamp: float; message_id: str
+    session_id: str = ""; turn_index: int = 0; token_count: int = 0
+
+@dataclass
+class SummaryNode:
+    id: str; parent_ids: list[str]; source_message_ids: list[str]
+    summary_text: str; depth: int = 0; token_count: int = 0
+    created_at: float; is_leaf: bool = True
+
+@dataclass
+class CompactionConfig:
+    context_threshold: int = 18_000; fresh_tail_count: int = 32
+    summary_model: str = "default"; max_summary_depth: int = 5
+    compaction_batch_size: int = 10
+
+@dataclass
+class AssemblyResult:
+    summaries: list[SummaryNode]; fresh_messages: list[MessagePart]
+    total_tokens: int = 0; compression_ratio: float = 1.0
+
+@dataclass
+class CompactionResult:
+    summaries_created: int = 0; messages_compacted: int = 0
+    new_depth: int = 0; tokens_saved: int = 0
+
+@dataclass
+class LCMStats:
+    total_messages: int = 0; total_summaries: int = 0; max_depth: int = 0
+    total_compactions: int = 0; last_compaction_at: float | None = None
+```
+
+### `prometheus.memory.lcm_conversation_store.LCMConversationStore`
+`src/prometheus/memory/lcm_conversation_store.py` — SQLite + FTS5, WAL mode, shared `lcm.db`
+
+```python
+class LCMConversationStore:
+    def __init__(self, db_path: Path | None = None) -> None
+
+    def insert_message(self, msg: MessagePart) -> str
+    def get_messages(self, session_id: str, *, since_turn: int | None = None,
+                     limit: int = 500) -> list[MessagePart]
+    def get_fresh_tail(self, session_id: str, count: int) -> list[MessagePart]
+    def mark_compacted(self, message_ids: list[str]) -> int
+    def search(self, query: str, *, session_id: str | None = None,
+               limit: int = 20) -> list[MessagePart]
+    def count_uncompacted(self, session_id: str) -> int
+    def close(self) -> None
+```
+
+### `prometheus.memory.lcm_summary_store.LCMSummaryStore`
+`src/prometheus/memory/lcm_summary_store.py` — DAG summary storage, shared `lcm.db`
+
+```python
+class LCMSummaryStore:
+    def __init__(self, db_path: Path | None = None) -> None
+
+    def insert_summary(self, node: SummaryNode) -> str  # marks parents non-leaf
+    def get_by_id(self, summary_id: str) -> SummaryNode | None
+    def get_leaves(self, *, max_depth: int | None = None) -> list[SummaryNode]
+    def get_by_depth(self, depth: int, *, limit: int = 100) -> list[SummaryNode]
+    def get_roots(self) -> list[SummaryNode]
+    def get_children(self, parent_id: str) -> list[SummaryNode]
+    def get_ancestors(self, node_id: str) -> list[SummaryNode]  # BFS walk up DAG
+    def search(self, query: str, *, limit: int = 20) -> list[SummaryNode]
+    def get_stats(self) -> dict
+    def close(self) -> None
+```
+
+### `prometheus.memory.lcm_compaction.LCMCompactor`
+`src/prometheus/memory/lcm_compaction.py` — the heart of LCM
+
+```python
+class LCMCompactor:
+    def __init__(self, conversation_store: LCMConversationStore,
+                 summary_store: LCMSummaryStore,
+                 summarizer: LCMSummarizer,
+                 config: CompactionConfig) -> None
+
+    async def compact(self, session_id: str) -> CompactionResult
+    def should_compact(self, session_id: str) -> bool
+    # Internal: _summarize_messages, _cascade_summaries (6+ leaves → merge up),
+    #           _summarize_nodes
+```
+
+### `prometheus.memory.lcm_assembler.LCMAssembler`
+`src/prometheus/memory/lcm_assembler.py`
+
+```python
+class LCMAssembler:
+    def __init__(self, conversation_store: LCMConversationStore,
+                 summary_store: LCMSummaryStore,
+                 config: CompactionConfig) -> None
+
+    def assemble(self, session_id: str, token_budget: int) -> AssemblyResult
+    def format_summary_preamble(self, summaries: list[SummaryNode]) -> str
+```
+
+### `prometheus.memory.lcm_summarize.LCMSummarizer`
+`src/prometheus/memory/lcm_summarize.py`
+
+```python
+class LCMCircuitBreakerOpen(Exception): ...
+
+class LCMSummarizer:
+    def __init__(self, provider: ModelProvider, *, model: str = "default",
+                 max_retries: int = 2) -> None
+
+    async def summarize_messages(self, messages: list[MessagePart]) -> str
+    async def summarize_summaries(self, summaries: list[SummaryNode]) -> str
+    def reset(self) -> None
+    @property
+    def circuit_open(self) -> bool
+    # Circuit breaker: 3 consecutive failures → LCMCircuitBreakerOpen
+```
+
+### `prometheus.memory.lcm_engine.LCMEngine`
+`src/prometheus/memory/lcm_engine.py` — top-level orchestrator
+
+```python
+class LCMEngine:
+    def __init__(self, provider: ModelProvider, *,
+                 config: CompactionConfig | None = None,
+                 db_path: Path | None = None) -> None
+
+    async def ingest(self, session_id: str, role: str, content: str,
+                     *, turn_index: int = 0) -> str
+    def assemble(self, session_id: str, token_budget: int) -> AssemblyResult
+    async def compact(self, session_id: str) -> CompactionResult
+    async def maybe_compact(self, session_id: str) -> CompactionResult | None
+    async def pre_compaction_flush(self, session_id: str) -> None
+    def get_stats(self, session_id: str) -> LCMStats
+    def close(self) -> None
+    # Context manager support: __enter__, __exit__
+```
+
+### LCM Agent Tools
+`src/prometheus/tools/builtin/lcm_grep.py`, `lcm_expand.py`, `lcm_describe.py`
+
+```python
+# lcm_grep — FTS5 search over messages + summaries
+class LCMGrepTool(BaseTool):
+    name = "lcm_grep"
+    # Input: query, session_id?, search_target ("messages"|"summaries"|"both"), limit
+
+# lcm_expand — expand a summary back to originals
+class LCMExpandTool(BaseTool):
+    name = "lcm_expand"
+    # Input: summary_id, depth?
+
+# lcm_describe — inspect summary metadata or overall stats
+class LCMDescribeTool(BaseTool):
+    name = "lcm_describe"
+    # Input: summary_id?, session_id?
+
+# Engine wiring:
+set_lcm_engine(engine: LCMEngine) -> None  # module-level setter for tool access
+```
+
+### `prometheus.context.system_prompt`
+`src/prometheus/context/system_prompt.py`
+
+```python
+SYSTEM_PROMPT_DYNAMIC_BOUNDARY: str = "--- SYSTEM_PROMPT_DYNAMIC_BOUNDARY ---"
+
+def build_system_prompt(custom_prompt: str | None = None,
+                        env: EnvironmentInfo | None = None,
+                        cwd: str | None = None) -> str
+```
+
+### `prometheus.context.prompt_assembler`
+`src/prometheus/context/prompt_assembler.py`
+
+```python
+def build_runtime_system_prompt(
+    *, cwd: str, config: dict | None = None,
+    memory_content: str = "", skills: list | None = None,
+    task_state: str = "", loaded_skill_content: str = "",
+) -> str
+# Assembles: STATIC (base prompt + env) + DYNAMIC_BOUNDARY + DYNAMIC (PROMETHEUS.md, memory, skills, tasks)
+```
+
+### `prometheus.context.prometheusmd`
+`src/prometheus/context/prometheusmd.py`
+
+```python
+def discover_prometheus_md_files(cwd: str | Path) -> list[Path]
+def load_prometheus_md_prompt(cwd: str | Path, *, max_chars_per_file: int = 12000) -> str | None
+```
+
+### Sprint 7 wiring
+
+```python
+from prometheus.providers.llama_cpp import LlamaCppProvider
+from prometheus.memory.lcm_engine import LCMEngine
+from prometheus.learning import PeriodicNudge, SkillCreator, SkillRefiner
+from prometheus.tools.builtin.lcm_grep import set_lcm_engine
+from prometheus.context.prompt_assembler import build_runtime_system_prompt
+
+provider = LlamaCppProvider(base_url="http://localhost:8080")
+
+# LCM engine — manages conversation persistence + DAG compaction
+lcm = LCMEngine(provider=provider)
+set_lcm_engine(lcm)  # wire into lcm_grep/expand/describe tools
+
+# Learning loop
+nudge = PeriodicNudge.from_config()
+skill_creator = SkillCreator(provider)
+skill_refiner = SkillRefiner(provider)
+
+# Agent loop integration:
+# 1. On each message: await lcm.ingest(session_id, role, content, turn_index=n)
+# 2. Before LLM call: result = lcm.assemble(session_id, token_budget=24000)
+# 3. Every N turns: nudge_msg = nudge.maybe_inject(turn_count)
+# 4. After task: skill_path = await skill_creator.maybe_create(desc, trace)
+# 5. After skill-guided task: await skill_refiner.maybe_refine(path, trace, outcome)
+# 6. Periodically: await lcm.maybe_compact(session_id)
+```
 
 ---
 
