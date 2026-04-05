@@ -1,5 +1,6 @@
 """Builtin tool exports."""
 
+from prometheus.tools.builtin.agent import AgentTool
 from prometheus.tools.builtin.bash import BashTool
 from prometheus.tools.builtin.cron_create import CronCreateTool
 from prometheus.tools.builtin.cron_delete import CronDeleteTool
@@ -14,6 +15,7 @@ from prometheus.tools.builtin.lcm_expand import LCMExpandTool
 from prometheus.tools.builtin.lcm_grep import LCMGrepTool
 
 __all__ = [
+    "AgentTool",
     "BashTool",
     "CronCreateTool",
     "CronDeleteTool",

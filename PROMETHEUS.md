@@ -19,7 +19,8 @@ prometheus/
   tasks/        Task persistence (Sprint 5)
   memory/       LCM + persistent memory (Sprint 5)
   skills/       Skill loading from .md files (Sprint 5)
-  coordinator/  Multi-agent coordination (Sprint 8)
+  coordinator/  Multi-agent coordination (Sprint 8) ✓
+  benchmarks/   Benchmark suite + runner (Sprint 8) ✓
   telemetry/    Tool call tracking (Sprint 3)
   config/       Settings + path management ✓
 ```
@@ -1460,4 +1461,195 @@ uv run prometheus
 
 # Daemon mode (Sprint 6):
 python scripts/daemon.py --telegram-only --debug
+
+# Benchmarks (Sprint 8):
+python -m prometheus.benchmarks.runner --model qwen3.5-32b --tier 1
+python -m prometheus.benchmarks.runner --tier 2 --json
+python -m prometheus.benchmarks.runner --case t1_bash_echo --verbose
+```
+
+---
+
+## Sprint 8: Multi-Agent + Benchmark Suite ✓
+
+### `prometheus.coordinator.agent_definitions` — AgentDefinition
+`src/prometheus/coordinator/agent_definitions.py` — adapted from OpenHarness (MIT)
+
+```python
+@dataclass
+class AgentDefinition:
+    def __init__(name, description, system_prompt="", tools=[], model="",
+                 read_only=False, max_turns=50, metadata={})
+
+# Built-in agents: general-purpose, explorer, planner, worker, verification
+
+get_all_agent_definitions() -> dict[str, AgentDefinition]
+get_agent_definition(name) -> AgentDefinition | None
+register_agent_definition(defn: AgentDefinition) -> None
+```
+
+### `prometheus.coordinator.coordinator_mode` — TeamRegistry
+`src/prometheus/coordinator/coordinator_mode.py` — adapted from OpenHarness (MIT)
+
+```python
+@dataclass
+class TeamRecord:
+    name: str; description: str; agents: list[str]; metadata: dict
+
+class TeamRegistry:
+    def create_team(name, description="", agents=None) -> TeamRecord
+    def get_team(name) -> TeamRecord | None
+    def list_teams() -> list[TeamRecord]
+    def add_agent_to_team(team_name, agent_name) -> bool
+    def remove_agent_from_team(team_name, agent_name) -> bool
+
+get_team_registry() -> TeamRegistry   # module-level singleton
+is_coordinator_mode(agent_count) -> bool
+get_coordinator_system_prompt(team=None) -> str
+```
+
+### `prometheus.coordinator.subagent` — SubagentSpawner
+`src/prometheus/coordinator/subagent.py` — novel code
+
+```python
+@dataclass(frozen=True)
+class SubagentResult:
+    agent_id: str; agent_type: str; text: str; turns: int
+    success: bool; error: str | None; metadata: dict
+
+class SubagentSpawner:
+    def __init__(provider, *, parent_tool_registry=None, model="qwen3.5-32b",
+                 max_tokens=4096, cwd=None, adapter=None, telemetry=None)
+
+    async def spawn(task, *, agent_type="general-purpose", tools_subset=None,
+                    model=None, system_prompt=None, max_turns=None) -> SubagentResult
+    # Spawns a fresh AgentLoop with isolated messages[]. Result returned
+    # without polluting the parent conversation.
+
+    async def spawn_parallel(tasks: list[dict]) -> list[SubagentResult]
+    # Runs multiple subagents concurrently via asyncio.gather()
+```
+
+**Wiring**: `SubagentSpawner` creates a new `AgentLoop` (Sprint 1) per subagent, optionally filtering the parent `ToolRegistry` (Sprint 2) to a tool subset. Agent definitions resolve via `get_agent_definition()`.
+
+### `prometheus.tools.builtin.agent` — AgentTool
+`src/prometheus/tools/builtin/agent.py` — adapted from OpenHarness agent_tool.py (MIT)
+
+```python
+class AgentToolInput(BaseModel):
+    description: str; prompt: str
+    subagent_type: str = "general-purpose"
+    model: str | None = None
+
+class AgentTool(BaseTool):
+    name = "Agent"
+    # Reads SubagentSpawner from context.metadata["subagent_spawner"]
+    async def execute(arguments: AgentToolInput, context: ToolExecutionContext) -> ToolResult
+```
+
+**Wiring**: Registered in `tools/builtin/__init__.py`. Uses `BaseTool` interface (Sprint 2). Requires `subagent_spawner` key in `ToolExecutionContext.metadata`.
+
+### `prometheus.coordinator.health` — HealthMonitor
+`src/prometheus/coordinator/health.py` — novel code
+
+```python
+class HealthState(str, Enum): HEALTHY, DEGRADED, CRITICAL
+
+@dataclass
+class ComponentHealth:
+    name: str; healthy: bool; detail: str; latency_ms: float
+
+@dataclass
+class HealthStatus:
+    state: HealthState; components: list[ComponentHealth]; timestamp: float
+    @property degraded_components -> list[ComponentHealth]
+    def summary() -> str
+
+# Individual check functions:
+check_llama_cpp(base_url="http://127.0.0.1:8080") -> ComponentHealth
+check_sqlite(db_path=None) -> ComponentHealth
+check_tailscale() -> ComponentHealth
+check_gpu_memory() -> ComponentHealth
+check_disk(path="/") -> ComponentHealth
+
+class HealthMonitor:
+    def __init__(*, interval=60, llama_url="...", db_path=None, disk_path="/",
+                 alert_callback=None, checks=["llama_cpp","sqlite","tailscale","gpu_memory","disk"])
+
+    async def check() -> HealthStatus
+    async def run_forever() -> None  # alerts via callback on state transition to degraded
+    def stop() -> None
+```
+
+**Wiring**: Extends Sprint 6's `Heartbeat` (gateway) with infrastructure checks. `alert_callback` can post to Telegram via the gateway adapter.
+
+### `prometheus.benchmarks.suite` — BenchmarkSuite
+`src/prometheus/benchmarks/suite.py` — novel code
+
+```python
+class TestTier(IntEnum): TIER_1 = 1, TIER_2 = 2
+
+@dataclass
+class TestCase:
+    id: str; name: str; tier: int; prompt: str
+    expected_tools: list[str]; expected_output_contains: list[str]
+    expected_output_not_contains: list[str]; expected_file_exists: list[str]
+    expected_file_contains: dict[str, str]; max_turns: int
+    setup_commands: list[str]; teardown_commands: list[str]; tags: list[str]
+
+class BenchmarkSuite:
+    def filter_tier(tier) -> list[TestCase]
+    def filter_tags(tags) -> list[TestCase]
+    def get(case_id) -> TestCase | None
+    def to_yaml() -> str
+    @classmethod from_yaml(yaml_str) -> BenchmarkSuite
+    @classmethod from_file(path) -> BenchmarkSuite
+
+load_suite(tier=None) -> BenchmarkSuite
+# Built-in: 22 Tier 1 atomic tests + 5 Tier 2 multi-step tests
+```
+
+### `prometheus.benchmarks.runner` — BenchmarkRunner
+`src/prometheus/benchmarks/runner.py` — novel code
+
+```python
+class Score(str, Enum): SUCCESS, PARTIAL, RETRY_SUCCESS, FAIL, CRASH
+
+@dataclass
+class ScoreResult:
+    case_id: str; case_name: str; score: Score
+    turns: int; latency_ms: float; details: str; tool_calls: list[str]
+
+class BenchmarkRunner:
+    def __init__(provider, tool_registry, *, model="qwen3.5-32b",
+                 max_tokens=4096, cwd=None, adapter=None)
+
+    async def run_case(case: TestCase) -> ScoreResult
+    async def run_suite(suite, *, concurrency=1) -> list[ScoreResult]
+
+# CLI: python -m prometheus.benchmarks.runner --model MODEL --tier 1|2
+#      --json --verbose --case CASE_ID --concurrency N
+```
+
+**Wiring**: `BenchmarkRunner` creates an `AgentLoop` (Sprint 1) per test case with a `ToolRegistry` (Sprint 2). Scoring evaluates tool calls from `ConversationMessage.tool_uses`, output text, and file system assertions.
+
+### Sprint 8 File Tree
+
+```
+coordinator/
+  __init__.py             — package exports
+  agent_definitions.py    — AgentDefinition + builtin agents (adapted from OpenHarness)
+  coordinator_mode.py     — TeamRecord, TeamRegistry, coordinator system prompt
+  subagent.py             — SubagentSpawner, SubagentResult (novel)
+  health.py               — HealthMonitor + 5 check functions (novel)
+tools/builtin/
+  agent.py                — AgentTool (BaseTool adapter for SubagentSpawner)
+benchmarks/
+  __init__.py             — package exports
+  __main__.py             — CLI entry point
+  suite.py                — TestCase, BenchmarkSuite, 27 built-in test cases
+  runner.py               — BenchmarkRunner, Score, ScoreResult, CLI
+tests/
+  test_coordinator.py     — 37 tests (definitions, teams, subagent, health)
+  test_benchmarks.py      — 31 tests (suite, scoring, runner, agent tool)
 ```
