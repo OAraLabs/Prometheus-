@@ -148,11 +148,15 @@ async def run_daemon(args: argparse.Namespace) -> None:
             allowed_chat_ids=gateway_config.get("allowed_chat_ids", []),
             proxy_url=gateway_config.get("proxy_url"),
         )
+        from prometheus.context.prompt_assembler import build_runtime_system_prompt
+        system_prompt = build_runtime_system_prompt(
+            cwd=str(Path.cwd()), config=config,
+        )
         telegram = TelegramAdapter(
             config=tg_config,
             agent_loop=agent_loop,
             tool_registry=registry,
-            system_prompt=gateway_config.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
+            system_prompt=system_prompt,
         )
         await telegram.start()
         archive.archive_event("telegram_started")
