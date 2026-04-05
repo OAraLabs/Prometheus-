@@ -919,6 +919,58 @@ Output streamed to `~/.prometheus/data/tasks/<id>.log`. Agent tasks restart on b
 
 All extend `BaseTool` from `prometheus.tools.base`.
 
+### Wiki Maintenance
+
+`src/prometheus/memory/wiki_compiler.py` — novel code
+
+The wiki subsystem transforms extracted memory facts into a navigable,
+cross-linked Markdown wiki at `~/.prometheus/wiki/`.
+
+**Directory structure:**
+
+```
+~/.prometheus/wiki/
+├── index.md          # Auto-generated index organized by category
+├── log.md            # Chronological compilation log
+├── .last_compile_ts  # Watermark for incremental compilation
+├── people/           # Person entities
+├── clients/          # Organization entities
+├── projects/         # Task and tool entities
+├── topics/           # Concept, place, and preference entities
+└── queries/          # Auto-filed query results (compounding loop)
+```
+
+**WikiCompiler** (`wiki_compiler.py`):
+
+```python
+class WikiCompiler:
+    def __init__(self, store: MemoryStore, wiki_root: Path | None = None) -> None
+    def compile(self, new_facts: list[dict]) -> None
+    def get_watermark(self) -> float
+```
+
+- Wired as `post_extract_callback` on `MemoryExtractor` — runs automatically
+  after every 30-minute extraction pass
+- Groups facts by entity name, creates pages for entities with 2+ mentions
+- Entity pages use YAML frontmatter (`type`, `first_seen`, `last_updated`,
+  `source_count`) and `[[wiki-links]]` for cross-references
+- Regenerates `index.md` after each compilation
+- Appends entries to `log.md` for chronological tracking
+
+**Agent reads `index.md` first** when answering knowledge questions via
+`wiki_query`, then drills into specific entity pages.
+
+**Compounding loop:** When `WikiQueryTool` synthesises an answer spanning 2+
+pages (and > 200 chars), it writes the result to `wiki/queries/` and updates
+`index.md` — so future queries can find it directly.
+
+**New tools (Sprint 5 extension):**
+
+| File | Tool name | Input fields | Purpose |
+|------|-----------|-------------|---------|
+| `wiki_compile.py` | `wiki_compile` | `entity_name?` | On-demand wiki compilation |
+| `wiki_query.py` | `wiki_query` | `query` | Search wiki for knowledge answers |
+
 ---
 
 ## Sprint 6: Gateway (Telegram) + Cron + Daemon

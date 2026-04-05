@@ -21,6 +21,7 @@ from prometheus.memory.lcm_types import (
 )
 from prometheus.memory.pointer import MemoryPointer
 from prometheus.memory.store import MemoryStore
+from prometheus.memory.wiki_compiler import WikiCompiler
 
 __all__ = [
     "AssemblyResult",
@@ -38,6 +39,7 @@ __all__ = [
     "MessagePart",
     "ObsidianWriter",
     "SummaryNode",
+    "WikiCompiler",
     "format_memory_for_prompt",
     "get_memory_store",
     "get_user_store",

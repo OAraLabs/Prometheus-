@@ -235,7 +235,7 @@ class LCMEngine:
         if extractor is None:
             return
         try:
-            persisted = await extractor.run_once(session_id=session_id)
+            persisted, _extracted_facts = await extractor.run_once(session_id=session_id)
             if persisted:
                 logger.info(
                     "Pre-compaction flush: persisted %d memories for session %s",

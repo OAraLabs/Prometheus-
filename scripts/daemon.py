@@ -42,6 +42,8 @@ from prometheus.tools.builtin import (
 from prometheus.tools.builtin.cron_create import CronCreateTool
 from prometheus.tools.builtin.cron_delete import CronDeleteTool
 from prometheus.tools.builtin.cron_list import CronListTool
+from prometheus.tools.builtin.wiki_compile import WikiCompileTool
+from prometheus.tools.builtin.wiki_query import WikiQueryTool
 
 logger = logging.getLogger("prometheus.daemon")
 
@@ -81,6 +83,8 @@ def build_tool_registry(workspace: str | None = None) -> ToolRegistry:
         CronCreateTool(),
         CronDeleteTool(),
         CronListTool(),
+        WikiCompileTool(),
+        WikiQueryTool(),
     ]:
         registry.register(tool)
     return registry
@@ -171,12 +175,21 @@ async def run_daemon(args: argparse.Namespace) -> None:
     try:
         from prometheus.memory.extractor import MemoryExtractor
         from prometheus.memory.store import MemoryStore
+        from prometheus.memory.wiki_compiler import WikiCompiler
+        from prometheus.tools.builtin.wiki_compile import set_wiki_compiler
 
         memory_store = MemoryStore()
+
+        # Wiki compiler — auto-compiles after each extraction run
+        wiki_compiler = WikiCompiler(store=memory_store)
+        set_wiki_compiler(wiki_compiler, memory_store)
+        logger.info("Wiki compiler initialised at %s", wiki_compiler.wiki_root)
+
         extractor = MemoryExtractor(
             store=memory_store,
             provider=provider,
             model=model_config.get("model", "qwen3.5-32b"),
+            post_extract_callback=wiki_compiler.compile,
         )
 
         # Wire extractor into LCM for pre-compaction flush

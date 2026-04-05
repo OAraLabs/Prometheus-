@@ -14,6 +14,8 @@ from prometheus.tools.builtin.lcm_describe import LCMDescribeTool
 from prometheus.tools.builtin.lcm_expand import LCMExpandTool
 from prometheus.tools.builtin.lcm_expand_query import LCMExpandQueryTool
 from prometheus.tools.builtin.lcm_grep import LCMGrepTool
+from prometheus.tools.builtin.wiki_compile import WikiCompileTool
+from prometheus.tools.builtin.wiki_query import WikiQueryTool
 
 __all__ = [
     "AgentTool",
@@ -30,4 +32,6 @@ __all__ = [
     "LCMExpandTool",
     "LCMExpandQueryTool",
     "LCMGrepTool",
+    "WikiCompileTool",
+    "WikiQueryTool",
 ]

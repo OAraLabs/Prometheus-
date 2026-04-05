@@ -17,7 +17,7 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from prometheus.memory.store import MemoryStore
 
@@ -76,17 +76,23 @@ class MemoryExtractor:
         model: str = "default",
         obsidian_writer: ObsidianWriter | None = None,
         batch_size: int = _BATCH_SIZE,
+        post_extract_callback: Callable[[list[dict]], None] | None = None,
     ) -> None:
         self._store = store
         self._provider = provider
         self._model = model
         self._obsidian = obsidian_writer
         self._batch_size = batch_size
+        self._post_extract_callback = post_extract_callback
         self._last_run: float = 0.0
         self._last_processed_ts: float = 0.0
 
-    async def run_once(self, session_id: str | None = None) -> int:
-        """Run one extraction pass. Returns number of memories persisted."""
+    async def run_once(self, session_id: str | None = None) -> tuple[int, list[dict]]:
+        """Run one extraction pass.
+
+        Returns ``(count_persisted, list_of_fact_dicts)`` so callers
+        (e.g. WikiCompiler) can act on the freshly-extracted facts.
+        """
         since = self._last_processed_ts
         if session_id:
             messages = self._store.get_messages(
@@ -103,19 +109,21 @@ class MemoryExtractor:
 
         if not messages:
             log.debug("MemoryExtractor: no new messages to process")
-            return 0
+            return 0, []
 
         total_persisted = 0
+        all_facts: list[dict] = []
         for i in range(0, len(messages), self._batch_size):
             batch = messages[i : i + self._batch_size]
-            persisted = await self._process_batch(batch)
+            persisted, facts = await self._process_batch(batch)
             total_persisted += persisted
+            all_facts.extend(facts)
 
         if messages:
             self._last_processed_ts = max(float(m["timestamp"]) for m in messages)
         self._last_run = time.time()
         log.info("MemoryExtractor: persisted %d memories from %d messages", total_persisted, len(messages))
-        return total_persisted
+        return total_persisted, all_facts
 
     async def run_forever(
         self,
@@ -126,7 +134,12 @@ class MemoryExtractor:
         log.info("MemoryExtractor: starting background loop every %.0fs", interval)
         while True:
             try:
-                await self.run_once(session_id=session_id)
+                _count, facts = await self.run_once(session_id=session_id)
+                if facts and self._post_extract_callback:
+                    try:
+                        self._post_extract_callback(facts)
+                    except Exception:
+                        log.exception("MemoryExtractor: post-extract callback failed")
             except Exception:
                 log.exception("MemoryExtractor: extraction pass failed")
             await asyncio.sleep(interval)
@@ -135,8 +148,11 @@ class MemoryExtractor:
     # Internal
     # ------------------------------------------------------------------
 
-    async def _process_batch(self, messages: list[dict]) -> int:
-        """Send one batch to the LLM and persist extracted facts."""
+    async def _process_batch(self, messages: list[dict]) -> tuple[int, list[dict]]:
+        """Send one batch to the LLM and persist extracted facts.
+
+        Returns ``(count_persisted, list_of_persisted_fact_dicts)``.
+        """
         formatted = self._format_messages(messages)
         prompt = _EXTRACTION_PROMPT.format(messages=formatted)
 
@@ -144,11 +160,12 @@ class MemoryExtractor:
             raw = await self._call_model(prompt)
         except Exception:
             log.exception("MemoryExtractor: model call failed for batch of %d", len(messages))
-            return 0
+            return 0, []
 
         facts = self._parse_facts(raw)
         source_ids = [m["id"] for m in messages]
         persisted = 0
+        persisted_facts: list[dict] = []
         for fact in facts:
             try:
                 self._store.persist_memory(
@@ -163,9 +180,10 @@ class MemoryExtractor:
                 if self._obsidian:
                     self._obsidian.write_fact(fact)
                 persisted += 1
+                persisted_facts.append(fact)
             except Exception:
                 log.exception("MemoryExtractor: failed to persist fact: %s", fact)
-        return persisted
+        return persisted, persisted_facts
 
     async def _call_model(self, prompt: str) -> str:
         """Call the ModelProvider and return the full text response."""
