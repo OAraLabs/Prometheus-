@@ -1910,3 +1910,47 @@ tools/builtin/
 tests/
   test_sentinel.py            — 33 tests (signals, observer, autodream, linter, consolidator, digest, tools)
 ```
+
+---
+
+## Parallel Tool Dispatch
+
+When the model returns multiple tool calls in one response, the agent loop partitions them by `is_read_only()` and executes read-only tools in parallel via `asyncio.gather`, then mutating tools sequentially. Each tool still goes through the full pipeline individually (pre-hooks → validate → permission check → execute → telemetry → post-hooks).
+
+### Dispatch Flow
+
+```
+Model returns N tool calls
+    ↓
+Partition by tool.is_read_only(parsed_input)
+    ↓
+Read-only tools → asyncio.gather (parallel)
+Mutating tools  → sequential loop (order preserved)
+    ↓
+Results re-sorted to match original call order
+```
+
+Single tool calls skip partitioning entirely.
+
+### Key Functions (`engine/agent_loop.py`)
+
+```python
+async def _dispatch_tool_calls(context: LoopContext, tool_calls: list) -> list[ToolResultBlock]
+    # Partitions into read-only vs mutating, dispatches accordingly
+
+def _is_tool_read_only(tool: object, tool_input: dict) -> bool
+    # Calls tool.is_read_only(parsed_input); handles both method and attribute patterns
+```
+
+### Read-Only Tools
+
+Tools returning `True` from `is_read_only()` (safe for parallel execution):
+`file_read`, `grep`, `glob`, `lcm_grep`, `lcm_describe`, `lcm_expand`, `lcm_expand_query`, `wiki_query`, `sentinel_status`, `cron_list`, `task_list`, `task_get`, `task_output`
+
+### Error Isolation
+
+`asyncio.gather(return_exceptions=True)` ensures one failed read-only tool does not block others. Failed tools return an error `ToolResultBlock`.
+
+### Tests (`tests/test_parallel_dispatch.py`)
+
+12 tests covering: `_is_tool_read_only` helper, single call passthrough, parallel timing verification, original-order preservation, mixed dispatch (read-only first then mutating), sequential mutating order, error isolation, unknown tools, and pre-hook deny per-tool in parallel.

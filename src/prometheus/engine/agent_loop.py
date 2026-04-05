@@ -139,37 +139,89 @@ async def run_loop(
             return
 
         tool_calls = final_message.tool_uses
+        tool_results = await _dispatch_tool_calls(context, tool_calls)
 
-        if len(tool_calls) == 1:
-            tc = tool_calls[0]
+        for tc, result in zip(tool_calls, tool_results):
             yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
-            result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
             yield ToolExecutionCompleted(
                 tool_name=tc.name,
                 output=result.content,
                 is_error=result.is_error,
             ), None
-            tool_results = [result]
-        else:
-            for tc in tool_calls:
-                yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
-
-            async def _run(tc):
-                return await _execute_tool_call(context, tc.name, tc.id, tc.input)
-
-            results = await asyncio.gather(*[_run(tc) for tc in tool_calls])
-            tool_results = list(results)
-
-            for tc, result in zip(tool_calls, tool_results):
-                yield ToolExecutionCompleted(
-                    tool_name=tc.name,
-                    output=result.content,
-                    is_error=result.is_error,
-                ), None
 
         messages.append(ConversationMessage(role="user", content=tool_results))
 
     raise RuntimeError(f"Exceeded maximum turn limit ({context.max_turns})")
+
+
+async def _dispatch_tool_calls(
+    context: LoopContext,
+    tool_calls: list,
+) -> list[ToolResultBlock]:
+    """Dispatch tool calls with parallel execution for read-only tools.
+
+    Read-only tools are executed simultaneously via ``asyncio.gather``.
+    Mutating tools are executed sequentially afterwards to preserve order.
+    Single tool calls skip partitioning entirely.
+    """
+    if len(tool_calls) == 1:
+        tc = tool_calls[0]
+        return [await _execute_tool_call(context, tc.name, tc.id, tc.input)]
+
+    # Partition into read-only and mutating based on tool.is_read_only()
+    read_only: list[tuple[int, object]] = []   # (original_index, tool_call)
+    mutating: list[tuple[int, object]] = []
+
+    for i, tc in enumerate(tool_calls):
+        tool = context.tool_registry.get(tc.name) if context.tool_registry else None
+        if tool is not None and _is_tool_read_only(tool, tc.input):
+            read_only.append((i, tc))
+        else:
+            mutating.append((i, tc))
+
+    results: list[tuple[int, ToolResultBlock]] = []
+
+    # Run all read-only tools in parallel
+    if read_only:
+        async def _run_ro(idx, tc):
+            r = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+            return idx, r
+
+        parallel = await asyncio.gather(
+            *[_run_ro(idx, tc) for idx, tc in read_only],
+            return_exceptions=True,
+        )
+        for item in parallel:
+            if isinstance(item, Exception):
+                log.error("Parallel tool execution failed: %s", item)
+                # We lost the index — append a generic error
+                results.append((-1, ToolResultBlock(
+                    tool_use_id="error",
+                    content=f"Parallel execution error: {item}",
+                    is_error=True,
+                )))
+            else:
+                results.append(item)
+
+    # Run mutating tools sequentially (order matters)
+    for idx, tc in mutating:
+        result = await _execute_tool_call(context, tc.name, tc.id, tc.input)
+        results.append((idx, result))
+
+    # Restore original order
+    results.sort(key=lambda x: x[0])
+    return [r for _, r in results]
+
+
+def _is_tool_read_only(tool: object, tool_input: dict) -> bool:
+    """Check if a tool call is read-only, handling both method and attribute patterns."""
+    if callable(getattr(tool, "is_read_only", None)):
+        try:
+            parsed = tool.input_model.model_validate(tool_input)
+            return tool.is_read_only(parsed)
+        except Exception:
+            return False
+    return getattr(tool, "is_read_only", False)
 
 
 async def _execute_tool_call(
