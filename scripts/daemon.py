@@ -156,6 +156,17 @@ async def run_daemon(args: argparse.Namespace) -> None:
         tasks.append(cron_task)
         logger.info("Cron scheduler started")
 
+    # LCM engine (optional, from Sprint 7)
+    lcm_engine = None
+    try:
+        from prometheus.memory.lcm_engine import LCMEngine
+        from prometheus.tools.builtin.lcm_grep import set_lcm_engine
+        lcm_engine = LCMEngine(provider)
+        set_lcm_engine(lcm_engine)
+        logger.info("LCM engine initialised")
+    except Exception as exc:
+        logger.warning("LCM engine not available: %s", exc)
+
     # Memory extractor (optional, from Sprint 5)
     try:
         from prometheus.memory.extractor import MemoryExtractor
@@ -167,6 +178,12 @@ async def run_daemon(args: argparse.Namespace) -> None:
             provider=provider,
             model=model_config.get("model", "qwen3.5-32b"),
         )
+
+        # Wire extractor into LCM for pre-compaction flush
+        if lcm_engine is not None:
+            lcm_engine.set_memory_extractor(extractor)
+            logger.info("Memory extractor wired to LCM pre-compaction flush")
+
         extractor_task = asyncio.create_task(extractor.run_forever())
         tasks.append(extractor_task)
         logger.info("Memory extractor started")

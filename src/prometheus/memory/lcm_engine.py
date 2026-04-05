@@ -189,9 +189,13 @@ class LCMEngine:
     async def compact(self, session_id: str) -> CompactionResult:
         """Force a compaction pass regardless of thresholds.
 
+        Calls :meth:`pre_compaction_flush` before compaction to give the
+        memory extractor a chance to persist important facts.
+
         Returns:
             A :class:`CompactionResult` with statistics.
         """
+        await self.pre_compaction_flush(session_id)
         result = await self._compactor.compact(session_id)
         self._total_compactions += 1
         self._last_compaction_at = time.time()
@@ -207,15 +211,43 @@ class LCMEngine:
             return None
         return await self.compact(session_id)
 
-    async def pre_compaction_flush(self, session_id: str) -> None:
-        """Hook called before compaction begins.
+    def set_memory_extractor(self, extractor: object) -> None:
+        """Register a :class:`MemoryExtractor` for pre-compaction flush.
 
-        Subclasses or callers can override this to flush the memory extractor
-        or perform other pre-compaction work.  The default implementation is
-        a no-op.
+        When set, :meth:`pre_compaction_flush` will call
+        ``extractor.run_once(session_id)`` before compaction begins,
+        ensuring important facts are persisted to long-term memory
+        before messages are compressed.
         """
-        # Intentionally empty -- provided as an extension point for the
-        # memory extractor integration.
+        self._memory_extractor = extractor
+
+    async def pre_compaction_flush(self, session_id: str) -> None:
+        """Flush the memory extractor before compaction begins.
+
+        If a memory extractor has been registered via
+        :meth:`set_memory_extractor`, runs one extraction pass against the
+        current session so that important facts from about-to-be-compacted
+        messages are persisted to long-term memory.
+
+        Does nothing if no extractor is registered.
+        """
+        extractor = getattr(self, "_memory_extractor", None)
+        if extractor is None:
+            return
+        try:
+            persisted = await extractor.run_once(session_id=session_id)
+            if persisted:
+                logger.info(
+                    "Pre-compaction flush: persisted %d memories for session %s",
+                    persisted,
+                    session_id,
+                )
+        except Exception:
+            logger.warning(
+                "Pre-compaction memory flush failed for session %s",
+                session_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Stats
