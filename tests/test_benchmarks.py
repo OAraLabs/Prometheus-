@@ -46,13 +46,13 @@ class TestTestCase:
             name="Full test",
             tier=1,
             prompt="Do the thing",
-            expected_tools=["Bash"],
+            expected_tools=["bash"],
             expected_output_contains=["hello"],
             expected_file_exists=["/tmp/test.txt"],
             max_turns=5,
             tags=["bash"],
         )
-        assert tc.expected_tools == ["Bash"]
+        assert tc.expected_tools == ["bash"]
         assert tc.tier == 1
 
 
@@ -110,7 +110,7 @@ class TestBenchmarkSuite:
 
     def test_yaml_roundtrip(self):
         suite = BenchmarkSuite([
-            TestCase(id="a", name="A", tier=1, prompt="do A", expected_tools=["Bash"]),
+            TestCase(id="a", name="A", tier=1, prompt="do A", expected_tools=["bash"]),
             TestCase(id="b", name="B", tier=2, prompt="do B", tags=["multi_step"]),
         ])
         yaml_str = suite.to_yaml()
@@ -119,7 +119,7 @@ class TestBenchmarkSuite:
 
         loaded = BenchmarkSuite.from_yaml(yaml_str)
         assert len(loaded) == 2
-        assert loaded.get("a").expected_tools == ["Bash"]
+        assert loaded.get("a").expected_tools == ["bash"]
         assert loaded.get("b").tags == ["multi_step"]
 
     def test_from_yaml_empty(self):
@@ -155,10 +155,10 @@ class TestScoring:
             name="Test",
             tier=1,
             prompt="test",
-            expected_tools=["Bash"],
+            expected_tools=["bash"],
             expected_output_contains=["hello"],
         )
-        result = self._make_result("hello world", ["Bash"])
+        result = self._make_result("hello world", ["bash"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.SUCCESS
         assert "2/2" in sr.details
@@ -169,10 +169,10 @@ class TestScoring:
             name="Test",
             tier=1,
             prompt="test",
-            expected_tools=["Bash"],
+            expected_tools=["bash"],
             expected_output_contains=["missing_string"],
         )
-        result = self._make_result("hello world", ["Bash"])
+        result = self._make_result("hello world", ["bash"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.PARTIAL
         assert "1/2" in sr.details
@@ -183,17 +183,17 @@ class TestScoring:
             name="Test",
             tier=1,
             prompt="test",
-            expected_tools=["Grep"],
+            expected_tools=["grep"],
             expected_output_contains=["xyz_not_present"],
         )
-        result = self._make_result("hello world", ["Bash"])
+        result = self._make_result("hello world", ["bash"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.FAIL
 
     def test_score_no_expectations(self):
         """No expectations + tool called = SUCCESS."""
         case = TestCase(id="test", name="Test", tier=1, prompt="test")
-        result = self._make_result("done", ["Bash"])
+        result = self._make_result("done", ["bash"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.SUCCESS
 
@@ -214,7 +214,7 @@ class TestScoring:
             prompt="test",
             expected_file_exists=[str(f)],
         )
-        result = self._make_result("done", ["FileWrite"])
+        result = self._make_result("done", ["write_file"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.SUCCESS
 
@@ -228,7 +228,7 @@ class TestScoring:
             prompt="test",
             expected_file_contains={str(f): "hello"},
         )
-        result = self._make_result("done", ["FileWrite"])
+        result = self._make_result("done", ["write_file"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.SUCCESS
 
@@ -240,7 +240,7 @@ class TestScoring:
             prompt="test",
             expected_output_not_contains=["error"],
         )
-        result = self._make_result("all good", ["Bash"])
+        result = self._make_result("all good", ["bash"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.SUCCESS
 
@@ -252,7 +252,7 @@ class TestScoring:
             prompt="test",
             expected_output_not_contains=["error"],
         )
-        result = self._make_result("error occurred", ["Bash"])
+        result = self._make_result("error occurred", ["bash"])
         sr = _score_result(case, result, Path("/tmp"))
         assert sr.score == Score.FAIL
 

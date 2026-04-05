@@ -130,7 +130,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Bash echo",
             tier=1,
             prompt="Run: echo 'hello prometheus'",
-            expected_tools=["Bash"],
+            expected_tools=["bash"],
             expected_output_contains=["hello prometheus"],
             tags=["bash"],
         ),
@@ -139,7 +139,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Bash pwd",
             tier=1,
             prompt="Run pwd and tell me the current directory.",
-            expected_tools=["Bash"],
+            expected_tools=["bash"],
             tags=["bash"],
         ),
         TestCase(
@@ -147,7 +147,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Bash arithmetic",
             tier=1,
             prompt="Use bash to compute: echo $((42 * 17))",
-            expected_tools=["Bash"],
+            expected_tools=["bash"],
             expected_output_contains=["714"],
             tags=["bash"],
         ),
@@ -156,7 +156,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Bash environment variable",
             tier=1,
             prompt="Run: echo $HOME",
-            expected_tools=["Bash"],
+            expected_tools=["bash"],
             tags=["bash"],
         ),
         # --- FileWrite tests ---
@@ -165,7 +165,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Write a file",
             tier=1,
             prompt='Create a file called /tmp/prom_test_hello.txt with the content "Hello, Prometheus!"',
-            expected_tools=["FileWrite"],
+            expected_tools=["write_file"],
             expected_file_exists=["/tmp/prom_test_hello.txt"],
             expected_file_contains={"/tmp/prom_test_hello.txt": "Hello, Prometheus!"},
             teardown_commands=["rm -f /tmp/prom_test_hello.txt"],
@@ -176,7 +176,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Write Python file",
             tier=1,
             prompt='Create /tmp/prom_test_add.py with a function add(a, b) that returns a + b.',
-            expected_tools=["FileWrite"],
+            expected_tools=["write_file"],
             expected_file_exists=["/tmp/prom_test_add.py"],
             expected_file_contains={"/tmp/prom_test_add.py": "def add("},
             teardown_commands=["rm -f /tmp/prom_test_add.py"],
@@ -188,7 +188,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Read a file",
             tier=1,
             prompt="Read the file /tmp/prom_test_read.txt and tell me its contents.",
-            expected_tools=["FileRead"],
+            expected_tools=["read_file"],
             expected_output_contains=["benchmark read test"],
             setup_commands=["echo 'benchmark read test' > /tmp/prom_test_read.txt"],
             teardown_commands=["rm -f /tmp/prom_test_read.txt"],
@@ -199,7 +199,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Read file with offset",
             tier=1,
             prompt="Read lines 2-3 of /tmp/prom_test_lines.txt.",
-            expected_tools=["FileRead"],
+            expected_tools=["read_file"],
             setup_commands=[
                 "printf 'line1\\nline2\\nline3\\nline4\\n' > /tmp/prom_test_lines.txt",
             ],
@@ -212,7 +212,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Edit file — replace string",
             tier=1,
             prompt='In /tmp/prom_test_edit.txt, replace "foo" with "bar".',
-            expected_tools=["FileEdit"],
+            expected_tools=["edit_file"],
             expected_file_contains={"/tmp/prom_test_edit.txt": "bar"},
             setup_commands=["echo 'hello foo world' > /tmp/prom_test_edit.txt"],
             teardown_commands=["rm -f /tmp/prom_test_edit.txt"],
@@ -224,7 +224,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Glob for Python files",
             tier=1,
             prompt="Find all .py files under /tmp/prom_test_glob/ using glob.",
-            expected_tools=["Glob"],
+            expected_tools=["glob"],
             setup_commands=[
                 "mkdir -p /tmp/prom_test_glob/sub",
                 "touch /tmp/prom_test_glob/a.py /tmp/prom_test_glob/sub/b.py",
@@ -237,7 +237,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Glob for Markdown files",
             tier=1,
             prompt="Find all .md files in /tmp/prom_test_glob_md/.",
-            expected_tools=["Glob"],
+            expected_tools=["glob"],
             setup_commands=[
                 "mkdir -p /tmp/prom_test_glob_md",
                 "touch /tmp/prom_test_glob_md/README.md /tmp/prom_test_glob_md/notes.md",
@@ -251,7 +251,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Grep for pattern",
             tier=1,
             prompt='Search for the word "error" in /tmp/prom_test_grep/log.txt.',
-            expected_tools=["Grep"],
+            expected_tools=["grep"],
             expected_output_contains=["error"],
             setup_commands=[
                 "mkdir -p /tmp/prom_test_grep",
@@ -265,7 +265,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Grep with regex",
             tier=1,
             prompt='Search for lines matching "def \\w+" in /tmp/prom_test_grep_re/code.py.',
-            expected_tools=["Grep"],
+            expected_tools=["grep"],
             setup_commands=[
                 "mkdir -p /tmp/prom_test_grep_re",
                 "printf 'def hello():\\n    pass\\ndef world():\\n    pass\\n' > /tmp/prom_test_grep_re/code.py",
@@ -279,7 +279,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Create a cron job",
             tier=1,
             prompt='Create a cron job that runs every 5 minutes with prompt "health check".',
-            expected_tools=["CronCreate"],
+            expected_tools=["cron_create"],
             tags=["cron"],
         ),
         TestCase(
@@ -287,7 +287,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="List cron jobs",
             tier=1,
             prompt="List all currently scheduled cron jobs.",
-            expected_tools=["CronList"],
+            expected_tools=["cron_list"],
             tags=["cron"],
         ),
         # --- TodoWrite ---
@@ -296,7 +296,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Create a todo list",
             tier=1,
             prompt='Create a todo list with these items: "Write tests" (pending), "Fix bug" (in_progress).',
-            expected_tools=["TodoWrite"],
+            expected_tools=["todo_write"],
             tags=["todo"],
         ),
         # --- Skill tool ---
@@ -305,7 +305,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Skill tool — unknown skill",
             tier=1,
             prompt="Run the skill called /nonexistent-skill-xyz.",
-            expected_tools=["Skill"],
+            expected_tools=["skill"],
             tags=["skill"],
         ),
         # --- Agent tool ---
@@ -331,7 +331,7 @@ def _builtin_tier1() -> list[TestCase]:
             name="Read — handle missing file",
             tier=1,
             prompt="Read the file /tmp/absolutely_nonexistent_file_xyz.txt.",
-            expected_tools=["FileRead"],
+            expected_tools=["read_file"],
             tags=["file_read", "error"],
         ),
         # --- JSON / structured output ---
@@ -358,7 +358,7 @@ def _builtin_tier2() -> list[TestCase]:
                 "Create a file /tmp/prom_t2_roundtrip.txt with content 'round trip test', "
                 "then read it back and confirm the content."
             ),
-            expected_tools=["FileWrite", "FileRead"],
+            expected_tools=["write_file", "read_file"],
             expected_output_contains=["round trip test"],
             expected_file_exists=["/tmp/prom_t2_roundtrip.txt"],
             teardown_commands=["rm -f /tmp/prom_t2_roundtrip.txt"],
@@ -373,7 +373,7 @@ def _builtin_tier2() -> list[TestCase]:
                 "Create /tmp/prom_t2_script.py that prints 'hello from script', "
                 "then run it with python3 and show the output."
             ),
-            expected_tools=["FileWrite", "Bash"],
+            expected_tools=["write_file", "bash"],
             expected_output_contains=["hello from script"],
             expected_file_exists=["/tmp/prom_t2_script.py"],
             teardown_commands=["rm -f /tmp/prom_t2_script.py"],
@@ -388,7 +388,7 @@ def _builtin_tier2() -> list[TestCase]:
                 "Find all .txt files in /tmp/prom_t2_search/, then read the one "
                 "called 'target.txt' and tell me its contents."
             ),
-            expected_tools=["Glob", "FileRead"],
+            expected_tools=["glob", "read_file"],
             expected_output_contains=["found me"],
             setup_commands=[
                 "mkdir -p /tmp/prom_t2_search",
@@ -407,7 +407,7 @@ def _builtin_tier2() -> list[TestCase]:
                 'Edit /tmp/prom_t2_edit.txt: replace "old_value" with "new_value", '
                 'then grep the file to confirm "new_value" is present.'
             ),
-            expected_tools=["FileEdit", "Grep"],
+            expected_tools=["edit_file", "grep"],
             expected_output_contains=["new_value"],
             setup_commands=[
                 "echo 'config=old_value' > /tmp/prom_t2_edit.txt",
@@ -425,7 +425,7 @@ def _builtin_tier2() -> list[TestCase]:
                 "write two files inside it (a.py and b.py) each with a simple function, "
                 "then glob to list all .py files in that directory."
             ),
-            expected_tools=["Bash", "FileWrite", "Glob"],
+            expected_tools=["bash", "write_file", "glob"],
             expected_file_exists=["/tmp/prom_t2_multi/a.py", "/tmp/prom_t2_multi/b.py"],
             teardown_commands=["rm -rf /tmp/prom_t2_multi"],
             max_turns=20,

@@ -267,23 +267,35 @@ def main() -> None:
     # Import provider lazily — StubProvider uses httpx
     from prometheus.providers.stub import StubProvider
     from prometheus.tools.builtin import (
+        AgentTool,
         BashTool,
+        CronCreateTool,
+        CronDeleteTool,
+        CronListTool,
         FileEditTool,
         FileReadTool,
         FileWriteTool,
         GlobTool,
         GrepTool,
     )
+    from prometheus.tools.builtin.skill import SkillTool
+    from prometheus.tools.builtin.todo_write import TodoWriteTool
 
     provider = StubProvider(base_url=args.base_url)
 
     registry = ToolRegistry()
+    registry.register(AgentTool())
     registry.register(BashTool(workspace="/tmp"))
+    registry.register(CronCreateTool())
+    registry.register(CronDeleteTool())
+    registry.register(CronListTool())
+    registry.register(FileEditTool())
     registry.register(FileReadTool())
     registry.register(FileWriteTool())
-    registry.register(FileEditTool())
     registry.register(GlobTool())
     registry.register(GrepTool())
+    registry.register(SkillTool())
+    registry.register(TodoWriteTool())
 
     suite = load_suite(tier=args.tier)
 
