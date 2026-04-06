@@ -116,6 +116,7 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
     """Build the default tool registry with all builtin tools."""
     from prometheus.tools.base import ToolRegistry
     from prometheus.tools.builtin import (
+        AgentTool,
         AskUserTool,
         BashTool,
         DashboardTool,
@@ -126,42 +127,57 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
         GrepTool,
         LCMDescribeTool,
         LCMExpandTool,
+        LCMExpandQueryTool,
         LCMGrepTool,
         MessageTool,
         NotebookEditTool,
+        SentinelStatusTool,
         TTSTool,
         WebFetchTool,
         WebSearchTool,
+        WikiCompileTool,
+        WikiLintTool,
+        WikiQueryTool,
     )
     from prometheus.tools.builtin.cron_create import CronCreateTool
     from prometheus.tools.builtin.cron_delete import CronDeleteTool
     from prometheus.tools.builtin.cron_list import CronListTool
-    from prometheus.tools.builtin.lcm_expand_query import LCMExpandQueryTool
 
     workspace = security_cfg.get("workspace_root")
     registry = ToolRegistry()
     for tool in [
+        # Core file/shell tools
         BashTool(workspace=workspace),
         FileReadTool(),
         FileWriteTool(),
         FileEditTool(),
         GrepTool(),
         GlobTool(),
+        # Cron
         CronCreateTool(),
         CronDeleteTool(),
         CronListTool(),
+        # LCM (long-context memory)
         LCMDescribeTool(),
         LCMExpandTool(),
         LCMGrepTool(),
         LCMExpandQueryTool(),
-        # --- New tools (httpx/stdlib only) ---
+        # Web + messaging
         WebSearchTool(),
         WebFetchTool(),
         MessageTool(),
         TTSTool(),
+        # Visualization
         DashboardTool(),
         NotebookEditTool(),
+        # Agent delegation
+        AgentTool(),
         AskUserTool(),
+        # Wiki + SENTINEL
+        WikiCompileTool(),
+        WikiQueryTool(),
+        WikiLintTool(),
+        SentinelStatusTool(),
     ]:
         registry.register(tool)
 
@@ -192,6 +208,23 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
         registry.register(SessionsListTool())
         registry.register(SessionsSendTool())
         registry.register(SessionsSpawnTool())
+    except Exception:
+        pass
+
+    # Task tools — require task manager
+    try:
+        from prometheus.tools.builtin.task_create import TaskCreateTool
+        from prometheus.tools.builtin.task_get import TaskGetTool
+        from prometheus.tools.builtin.task_list import TaskListTool
+        from prometheus.tools.builtin.task_update import TaskUpdateTool
+        from prometheus.tools.builtin.task_stop import TaskStopTool
+        from prometheus.tools.builtin.task_output import TaskOutputTool
+        registry.register(TaskCreateTool())
+        registry.register(TaskGetTool())
+        registry.register(TaskListTool())
+        registry.register(TaskUpdateTool())
+        registry.register(TaskStopTool())
+        registry.register(TaskOutputTool())
     except Exception:
         pass
 
