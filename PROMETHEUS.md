@@ -778,6 +778,7 @@ messages = compressor.maybe_compress(messages)
 - [x] Sprint 11: Security Hardening — env overrides, audit logging, exfiltration detection
 - [x] Sprint 12: MCP Integration + Context7
 - [x] Sprint 13: DeepEval + Phoenix — G-Eval metrics, trend tracking, nightly cron
+- [x] Sprint 14: Constrained Decoding Judge — grammar-forced JSON, failure classifier, A/B tested
 
 ---
 
@@ -2536,30 +2537,30 @@ class JudgeVerdict:
 class PrometheusJudge:
     def __init__(self, base_url="http://GPU_HOST:8080", model=None, timeout=120.0)
 
-    # JSON-based scoring (original)
+    # Constrained JSON scoring (primary — used by metrics, Sprint 14)
     async def evaluate(task_input, agent_output, expected_behavior, tool_trace=None) -> JudgeVerdict
 
-    # G-Eval: chain-of-thought scoring (more reliable with local models)
+    # G-Eval: chain-of-thought scoring (kept for manual/debug use)
     async def evaluate_geval(criteria: list[str], context: str) -> JudgeVerdict
 ```
 
-G-Eval lets the model reason through numbered criteria before producing a `SCORE: X.X` line. More consistent than JSON-only prompting with Qwen/Gemma because the model thinks before scoring.
+`evaluate()` uses constrained decoding via `response_format` with `json_schema` — see Sprint 14 below.
 
 ### `prometheus.evals.metrics`
 `src/prometheus/evals/metrics.py` — three evaluation metrics (DeepEval-compatible stubs when deepeval not installed)
 
 ```python
-class TaskCompletionMetric(BaseMetric):     # G-Eval chain-of-thought, threshold=0.7
+class TaskCompletionMetric(BaseMetric):     # Constrained JSON, threshold=0.7
     def __init__(self, judge: PrometheusJudge, threshold=0.7)
 
 class ToolUsageMetric(BaseMetric):          # Deterministic, no LLM needed, threshold=0.5
     def __init__(self, threshold=0.5)
 
-class NoHallucinationMetric(BaseMetric):    # G-Eval chain-of-thought, threshold=0.8
+class NoHallucinationMetric(BaseMetric):    # Constrained JSON, threshold=0.8
     def __init__(self, judge: PrometheusJudge, threshold=0.8)
 ```
 
-`TaskCompletionMetric` and `NoHallucinationMetric` use `evaluate_geval()`. `ToolUsageMetric` is deterministic — compares tool trace against expected tools, no LLM call.
+`TaskCompletionMetric` and `NoHallucinationMetric` use `evaluate()` with constrained decoding (Sprint 14). `ToolUsageMetric` is deterministic — compares tool trace against expected tools, no LLM call.
 
 ### `prometheus.evals.runner`
 `src/prometheus/evals/runner.py` — orchestrates golden tasks through `AgentLoop`
@@ -2574,6 +2575,9 @@ class EvalResult:
     task_id: str; task_name: str; tier: int; agent_output: str
     turns: int; latency_ms: float; tool_trace: list[dict]
     metrics: list[MetricScore]; error: str | None
+    failure_source: str       # "pass", "model", "harness", "unclear"
+    failure_category: str     # e.g. "model:wrong_tool", "harness:tool_crash"
+    failure_detail: str
 
 class EvalRunner:
     def __init__(self, agent_loop: AgentLoop, judge: PrometheusJudge, system_prompt: str, *, config=None)
@@ -2650,9 +2654,10 @@ Imports factory functions from `__main__.py` (same pattern as `scripts/daemon.py
 evals/
   __init__.py                  — package exports
   golden_dataset.py            — GoldenTask, TaskTier, load_golden_dataset()
-  judge.py                     — PrometheusJudge (evaluate + evaluate_geval)
+  judge.py                     — PrometheusJudge (constrained decoding + G-Eval)
   metrics.py                   — TaskCompletionMetric, ToolUsageMetric, NoHallucinationMetric
   runner.py                    — EvalRunner, EvalResult, MetricScore
+  classifier.py                — FailureClassification, classify_failure()
   trends.py                    — TrendTracker, TrendRow (SQLite)
 tracing/
   __init__.py                  — package exports
@@ -2663,5 +2668,90 @@ scripts/
 config/prometheus.yaml         — evals + tracing sections added
 pyproject.toml                 — evals optional dependency group
 tests/
-  test_evals.py                — 40 tests (dataset, judge, G-Eval, metrics, runner, trends, tracing)
+  test_evals.py                — 66 tests (dataset, judge, constrained decoding, metrics, runner, classifier, trends, tracing)
 ```
+
+## Sprint 14: Constrained Decoding Judge ✓
+
+Fixes the #1 failure mode in nightly evals: judge returning empty or unparseable output. Forces valid JSON at the token level via llama.cpp grammar constraints.
+
+### Constrained Decoding (`evals/judge.py`)
+
+```python
+# Schema passed to llama.cpp response_format — converted to GBNF grammar
+JUDGE_SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number"},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["score", "reasoning"],
+    "additionalProperties": False,
+}
+```
+
+`evaluate()` now passes three things to `/v1/chat/completions`:
+
+```python
+response_format={"type": "json_schema", "json_schema": {"schema": JUDGE_SCORE_SCHEMA, "strict": True}}
+chat_template_kwargs={"enable_thinking": False}   # suppresses <think> blocks at template level
+```
+
+`_call_llm()` also checks `reasoning_content` if `content` is empty (Qwen 3.5 bug where thinking leaks despite suppression).
+
+### Fallback Parser (`_parse_verdict`)
+
+4-layer parsing for servers without constrained decoding (Ollama, etc.):
+1. Direct `json.loads(raw)` — constrained output
+2. Strip markdown fences (`` ```json ... ``` ``) — Ollama pattern
+3. Extract `{…}` JSON substring — preamble text
+4. Regex number fallback + safe 0.0 default on empty
+
+### Failure Classifier (`evals/classifier.py`)
+
+```python
+class FailureSource(str, Enum):
+    PASS = "pass"           # No failure
+    MODEL = "model"         # LLM model issue
+    HARNESS = "harness"     # Harness bug (tool crash, permission block)
+    UNCLEAR = "unclear"     # Can't determine
+
+class FailureCategory(str, Enum):
+    # Model failures
+    NO_TOOL_CALL = "model:no_tool_call"
+    WRONG_TOOL = "model:wrong_tool"
+    BAD_ARGS = "model:bad_args"
+    HALLUCINATED_OUTPUT = "model:hallucinated"
+    INCOMPLETE = "model:incomplete"
+    # Harness failures
+    TOOL_ERROR = "harness:tool_error"
+    TOOL_CRASH = "harness:tool_crash"
+    PERMISSION_DENIED = "harness:permission"
+    VALIDATION_FAIL = "harness:validation"
+
+def classify_failure(task_id, expected_tools, tool_trace, agent_output, error, metric_scores) -> FailureClassification
+```
+
+Pure logic on trace data — no LLM call. Analyzes tool traces and metric scores to determine whether a failure is the model's fault or a harness bug. Critical for A/B testing models.
+
+### Metrics Switch
+
+Both `TaskCompletionMetric` and `NoHallucinationMetric` switched from `evaluate_geval()` to `evaluate()`. G-Eval was a workaround for bad JSON output — grammar constraints fix it at the source.
+
+### Wiring Into Existing Modules
+
+| Existing Module | How Sprint 14 Connects |
+|--------|-------------|
+| `evals/judge.py` | `_call_llm()` gains `response_format` + `chat_template_kwargs` params; `evaluate()` passes schema |
+| `evals/metrics.py` | Both LLM metrics call `judge.evaluate()` instead of `judge.evaluate_geval()` |
+| `evals/runner.py` | `run_task()` calls `classify_failure()` after metrics; `EvalResult` gains `failure_source`, `failure_category`, `failure_detail` fields; `print_summary()` shows PASS/MDL/HRN/ERR status + breakdown |
+
+### Impact (Gemma4-26B, 24 tasks)
+
+| Metric | Before (Sprint 13) | After (Sprint 14) |
+|--------|--------------------|--------------------|
+| PASS count | 14 / 24 | 22 / 24 |
+| Task Completion | 0.867 | 1.000 |
+| No Hallucination | 0.667 | 0.867 |
+| Parse failures | ~30% | 0% |
+| Empty responses | ~4-10/run | 0 |
