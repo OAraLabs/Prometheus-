@@ -68,6 +68,23 @@ class LCMConversationStore:
                 content='lcm_messages',
                 content_rowid='rowid'
             );
+
+            -- Checkpoint table for divergence detection (Sprint 10)
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                step_number INTEGER NOT NULL,
+                goal_hash TEXT NOT NULL,
+                goal_description TEXT,
+                messages_json TEXT NOT NULL,
+                tool_calls_json TEXT NOT NULL,
+                divergence_score REAL DEFAULT 0.0,
+                created_at REAL NOT NULL,
+                UNIQUE(task_id, step_number)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_task
+                ON checkpoints(task_id, step_number DESC);
         """)
         self._conn.commit()
 

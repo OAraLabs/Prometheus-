@@ -24,10 +24,15 @@ from prometheus.adapter.formatter import (
     QwenFormatter,
 )
 from prometheus.adapter.retry import RetryAction, RetryEngine
+from prometheus.adapter.router import ModelRouter, TaskClassifier, TaskType, ProviderConfig
 from prometheus.adapter.validator import RepairResult, Strictness, ToolCallValidator, ValidationResult
 
 __all__ = [
     "ModelAdapter",
+    "ModelRouter",
+    "TaskClassifier",
+    "TaskType",
+    "ProviderConfig",
     "AnthropicFormatter",
     "GemmaFormatter",
     "ModelPromptFormatter",

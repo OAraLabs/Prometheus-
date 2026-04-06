@@ -21,6 +21,13 @@ from prometheus.coordinator.coordinator_mode import (
 )
 from prometheus.coordinator.subagent import SubagentSpawner, SubagentResult
 from prometheus.coordinator.health import HealthMonitor, HealthStatus
+from prometheus.coordinator.divergence import (
+    DivergenceDetector,
+    DivergenceResult,
+    GoalTracker,
+    Checkpoint,
+    CheckpointStore,
+)
 
 __all__ = [
     "AgentDefinition",
@@ -34,4 +41,9 @@ __all__ = [
     "SubagentResult",
     "HealthMonitor",
     "HealthStatus",
+    "DivergenceDetector",
+    "DivergenceResult",
+    "GoalTracker",
+    "Checkpoint",
+    "CheckpointStore",
 ]

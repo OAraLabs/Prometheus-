@@ -50,6 +50,57 @@ gateway:
   heartbeat_interval: 30            # seconds between health checks
   cron_enabled: true                # run cron scheduler alongside gateway
 
+# Model Router Configuration (Sprint 10)
+model_router:
+  enabled: true
+  rules:
+    # Route code tasks to primary Qwen (best at structured output)
+    - task_type: "code_generation"
+      provider: "llama_cpp"
+      model: "qwen3.5-32b"
+      min_confidence: 0.5
+
+    # Route quick answers to faster Gemma
+    - task_type: "quick_answer"
+      provider: "ollama"
+      model: "gemma4-26b"
+      min_confidence: 0.6
+
+    # Route reasoning to Qwen (best at complex tasks)
+    - task_type: "reasoning"
+      provider: "llama_cpp"
+      model: "qwen3.5-32b"
+
+    # Route creative to Qwen
+    - task_type: "creative"
+      provider: "llama_cpp"
+      model: "qwen3.5-32b"
+
+    # Route tool-heavy to Qwen (best tool calling)
+    - task_type: "tool_heavy"
+      provider: "llama_cpp"
+      model: "qwen3.5-32b"
+
+  fallback_chain:
+    - provider: "llama_cpp"
+      base_url: "http://GPU_HOST:8080"
+      model: "qwen3.5-32b"
+    - provider: "ollama"
+      base_url: "http://GPU_HOST:11434"
+      model: "gemma4-26b"
+    - provider: "anthropic"
+      model: "claude-3-haiku"
+
+# Divergence Detection Configuration (Sprint 10)
+divergence:
+  enabled: true
+  checkpoint_interval: 5       # Create checkpoint every N tool calls
+  threshold: 0.7               # Score that triggers rollback consideration
+  auto_rollback_trust_level: 3 # Only AUTONOMOUS (3) gets auto-rollback
+  max_rollbacks: 2             # Prevent infinite loops
+  use_llm_eval: false          # Enable LLM-based divergence eval (costs tokens)
+  llm_eval_budget: 500         # Max tokens for LLM eval if enabled
+
 learning:
   periodic_nudge_interval: 15  # turns
   auto_skill_creation: true

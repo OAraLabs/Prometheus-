@@ -246,6 +246,23 @@ def create_adapter(model_cfg: dict[str, Any]):
     return ModelAdapter(formatter=AnthropicFormatter(), strictness="NONE")
 
 
+def create_model_router(config: dict[str, Any]):
+    """Create the model router (Sprint 10)."""
+    from prometheus.adapter.router import ModelRouter
+    return ModelRouter(config)
+
+
+def create_divergence_detector(config: dict[str, Any]):
+    """Create the divergence detector (Sprint 10)."""
+    from prometheus.coordinator.divergence import DivergenceDetector, CheckpointStore
+    try:
+        store = CheckpointStore()
+        return DivergenceDetector(config, checkpoint_store=store)
+    except Exception as exc:
+        log.warning("Divergence detector not available: %s", exc)
+        return None
+
+
 def create_security_gate(security_cfg: dict[str, Any]):
     """Create the permission checker (Sprint 4)."""
     from prometheus.permissions.checker import SecurityGate
@@ -510,6 +527,10 @@ def main() -> None:
         except Exception:
             pass
 
+    # Sprint 10: Model Router + Divergence Detector
+    model_router = create_model_router(config)
+    divergence_detector = create_divergence_detector(config)
+
     context = LoopContext(
         provider=provider,
         model=model_name,
@@ -519,6 +540,8 @@ def main() -> None:
         permission_checker=security_gate,
         adapter=adapter,
         telemetry=telemetry,
+        model_router=model_router,
+        divergence_detector=divergence_detector,
     )
 
     # Generate session ID

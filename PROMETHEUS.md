@@ -8,7 +8,7 @@ via an abstract Model Adapter Layer — no Anthropic API dependency in the agent
 ```
 prometheus/
   engine/       AgentLoop — the main turn loop (Sprint 1) ✓
-  adapter/      Model Adapter Layer — provider abstraction (Sprint 3)
+  adapter/      Model Adapter Layer + Model Router (Sprint 3, 10)
   tools/        Tool registry + builtin tools (Sprint 2)
   hooks/        PreToolUse / PostToolUse hooks (Sprint 2)
   permissions/  Security gate (Sprint 4)
@@ -19,7 +19,7 @@ prometheus/
   tasks/        Task persistence (Sprint 5)
   memory/       LCM + persistent memory (Sprint 5)
   skills/       Skill loading from .md files (Sprint 5)
-  coordinator/  Multi-agent coordination (Sprint 8) ✓
+  coordinator/  Multi-agent coordination + divergence detection (Sprint 8, 10) ✓
   benchmarks/   Benchmark suite + runner (Sprint 8) ✓
   telemetry/    Tool call tracking (Sprint 3)
   config/       Settings + path management ✓
@@ -55,7 +55,7 @@ get_workspace_dir() -> Path       # ~/.prometheus/workspace/
 `src/prometheus/config/defaults.py` — constants: `DEFAULT_MODEL_PROVIDER`, `DEFAULT_CONTEXT_LIMIT`, etc.
 
 ### `config/prometheus.yaml`
-Root config file. Keys: `system`, `model`, `context`, `security`, `infrastructure`, `gateway`, `learning`.
+Root config file. Keys: `system`, `model`, `context`, `security`, `infrastructure`, `gateway`, `learning`, `model_router`, `divergence`, `sentinel`.
 
 ---
 
@@ -1983,4 +1983,186 @@ tests/
   test_parallel_dispatch.py — 12 tests (read-only helper, single call, parallel timing,
                                order preservation, mixed dispatch, sequential mutating,
                                error isolation, unknown tools, pre-hook deny)
+```
+
+---
+
+## Sprint 10: Model Router + Divergence Detector ✓
+
+### `prometheus.adapter.router`
+`src/prometheus/adapter/router.py` — adapted from leaky `runtime.py` (token scoring) + Hermes profiles (fallback chain)
+
+```python
+class TaskType(Enum):
+    CODE_GENERATION = "code_generation"
+    REASONING = "reasoning"
+    QUICK_ANSWER = "quick_answer"
+    CREATIVE = "creative"
+    TOOL_HEAVY = "tool_heavy"
+
+@dataclass
+class TaskClassification:
+    task_type: TaskType
+    confidence: float           # 0.0–1.0
+    matched_tokens: list[str]
+    reason: str
+
+class TaskClassifier:
+    TASK_TOKENS: dict[TaskType, set[str]]   # keyword sets per task type
+    def classify(message: str, tool_mentions: list[str] | None = None) -> TaskClassification
+
+@dataclass
+class ProviderConfig:
+    provider: str               # "llama_cpp", "ollama", "anthropic"
+    model: str
+    base_url: str | None
+    reason: str
+
+@dataclass
+class RoutingRule:
+    task_type: TaskType
+    provider: str
+    model: str
+    base_url: str | None
+    min_confidence: float
+
+class ModelRouter:
+    def __init__(config: dict)              # reads config["model_router"] + config["model"]
+    def route(message: str, tool_mentions: list[str] | None = None,
+              force_provider: str | None = None) -> ProviderConfig
+    def get_fallback(failed_provider: str) -> ProviderConfig | None
+```
+
+### `prometheus.coordinator.divergence`
+`src/prometheus/coordinator/divergence.py` — adapted from OpenClaw `memory_extractor` (fact extraction) + LCM DAG (checkpoint persistence)
+
+```python
+# Goal extraction (standalone functions)
+def extract_objectives(message: str) -> list[str]   # imperative verb detection, max 5
+def extract_entities(message: str) -> list[str]      # file paths, quoted strings, capitalized words
+
+@dataclass
+class TaskGoal:
+    original_message: str
+    goal_hash: str              # sha256[:16]
+    key_objectives: list[str]
+    key_entities: list[str]
+
+class GoalTracker:
+    current_goal: TaskGoal | None
+    def set_goal(message: str) -> TaskGoal
+    def check_alignment(recent_messages: list[dict], tool_results: list[dict]) -> float  # 0.0–1.0
+    def clear() -> None
+
+@dataclass
+class Checkpoint:
+    task_id: str
+    step_number: int
+    goal_description: str
+    goal_hash: str
+    messages_snapshot: list[dict]
+    tool_calls: list[dict]
+    timestamp: float
+    divergence_score: float
+    def to_db_row() -> tuple
+    @classmethod def from_db_row(row: tuple) -> Checkpoint
+
+class CheckpointStore:
+    """Persists checkpoints in lcm.db (shared with LCMConversationStore/LCMSummaryStore)."""
+    def __init__(db_path: Path | None = None)       # defaults to ~/.prometheus/lcm.db
+    def save(checkpoint: Checkpoint) -> None
+    def get_latest(task_id: str) -> Checkpoint | None
+    def delete_after(task_id: str, step_number: int) -> None
+
+@dataclass
+class DivergenceResult:
+    score: float                # 0.0 = on track, 1.0 = off track
+    should_rollback: bool
+    reason: str
+    checkpoint: Checkpoint | None
+
+class DivergenceDetector:
+    def __init__(config: dict, checkpoint_store: CheckpointStore | None = None,
+                 notify_callback: Callable[[str], None] | None = None)
+    def start_task(task_id: str, goal_message: str) -> None
+    def record_tool_call(tool_name: str, args: dict, result: object, success: bool) -> None
+    def maybe_checkpoint(messages: list[dict]) -> Checkpoint | None
+    def evaluate(messages: list[dict], tool_results: list[dict]) -> DivergenceResult
+    def rollback(checkpoint: Checkpoint, trust_level: int) -> tuple[bool, list[dict]]
+    def end_task() -> None
+```
+
+Divergence scoring heuristics (no LLM cost):
+1. Goal alignment — keyword overlap between objectives/entities and recent activity (inverted)
+2. Tool failure rate — proportion of failed tool calls in recent window
+3. Repetition detection — same tool called 3+ times consecutively
+4. Context growth anomaly — messages-per-step ratio > 5
+
+### LCM Schema Extension
+`src/prometheus/memory/lcm_conversation_store.py` — added to `_apply_schema()`
+
+```sql
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    step_number INTEGER NOT NULL,
+    goal_hash TEXT NOT NULL,
+    goal_description TEXT,
+    messages_json TEXT NOT NULL,
+    tool_calls_json TEXT NOT NULL,
+    divergence_score REAL DEFAULT 0.0,
+    created_at REAL NOT NULL,
+    UNIQUE(task_id, step_number)
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id, step_number DESC);
+```
+
+### Config Schema
+`config/prometheus.yaml` — new top-level keys
+
+```yaml
+model_router:
+  enabled: true
+  rules:                        # list of {task_type, provider, model, base_url?, min_confidence?}
+  fallback_chain:               # list of {provider, base_url?, model}
+
+divergence:
+  enabled: true
+  checkpoint_interval: 5        # checkpoint every N tool calls
+  threshold: 0.7                # score triggering rollback consideration
+  auto_rollback_trust_level: 3  # only AUTONOMOUS trust auto-rolls back
+  max_rollbacks: 2              # prevent infinite rollback loops
+  use_llm_eval: false           # optional LLM-based eval (budget-capped)
+  llm_eval_budget: 500
+```
+
+### Wiring into Existing Modules
+
+| Module | Integration |
+|--------|-------------|
+| `engine/agent_loop.py:LoopContext` | Added `model_router` and `divergence_detector` fields |
+| `engine/agent_loop.py:_execute_tool_call()` | Records each tool call via `divergence_detector.record_tool_call()` after telemetry |
+| `engine/agent_loop.py:run_loop()` | After tool dispatch: calls `maybe_checkpoint()` + `evaluate()` + `rollback()` |
+| `engine/agent_loop.py:AgentLoop.__init__()` | Accepts `model_router` and `divergence_detector` kwargs, passes to `LoopContext` |
+| `__main__.py` | `create_model_router(config)` + `create_divergence_detector(config)` factories wired into CLI |
+| `adapter/__init__.py` | Exports `ModelRouter`, `TaskClassifier`, `TaskType`, `ProviderConfig` |
+| `coordinator/__init__.py` | Exports `DivergenceDetector`, `DivergenceResult`, `GoalTracker`, `Checkpoint`, `CheckpointStore` |
+| `memory/lcm_conversation_store.py` | `checkpoints` table added to shared `lcm.db` schema (no separate database) |
+
+### File Tree
+
+```
+adapter/
+  router.py                 — TaskClassifier, ModelRouter, ProviderConfig, RoutingRule
+coordinator/
+  divergence.py             — GoalTracker, CheckpointStore, DivergenceDetector
+memory/
+  lcm_conversation_store.py — checkpoints table added to _apply_schema()
+engine/
+  agent_loop.py             — LoopContext + _execute_tool_call() + run_loop() wiring
+config/
+  prometheus.yaml            — model_router + divergence sections added
+tests/
+  test_router.py             — 16 tests (classifier accuracy, routing rules, fallback chain)
+  test_divergence.py         — 23 tests (goal extraction, alignment, checkpoint CRUD, rollback)
 ```

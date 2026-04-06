@@ -35,6 +35,15 @@ from prometheus.providers.base import (
     ModelProvider,
 )
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Sprint 10: Model Router + Divergence Detector
+    # Lazy-imported at runtime to avoid circular import
+    # (coordinator.__init__ → subagent → engine.agent_loop)
+    from prometheus.adapter.router import ModelRouter, ProviderConfig
+    from prometheus.coordinator.divergence import DivergenceDetector, CheckpointStore
+
 log = logging.getLogger(__name__)
 
 PermissionPrompt = Callable[[str, str], Awaitable[bool]]
@@ -69,6 +78,9 @@ class LoopContext:
     permission_prompt: PermissionPrompt | None = None
     ask_user_prompt: AskUserPrompt | None = None
     tool_metadata: dict[str, object] | None = None
+    # Sprint 10: Model Router + Divergence Detector
+    model_router: object | None = None
+    divergence_detector: object | None = None
 
 
 async def run_loop(
@@ -150,6 +162,33 @@ async def run_loop(
             ), None
 
         messages.append(ConversationMessage(role="user", content=tool_results))
+
+        # Sprint 10: checkpoint + divergence evaluation after tool dispatch
+        if context.divergence_detector is not None:
+            dd = context.divergence_detector
+            # Maybe create a checkpoint
+            msg_dicts = [
+                {"role": m.role, "content": m.text or ""}
+                for m in messages
+                if hasattr(m, "role")
+            ]
+            dd.maybe_checkpoint(msg_dicts)
+
+            # Evaluate divergence (only after 3+ steps to gather signal)
+            if dd.step_count > 3:
+                tool_result_dicts = [
+                    {"result": tr.content, "success": not tr.is_error}
+                    for tr in tool_results
+                ]
+                div_result = dd.evaluate(msg_dicts, tool_result_dicts)
+                if div_result.should_rollback and div_result.checkpoint:
+                    trust = 1  # default to non-autonomous
+                    rolled_back, restored = dd.rollback(div_result.checkpoint, trust)
+                    if rolled_back:
+                        log.warning(
+                            "Divergence rollback: restoring %d messages",
+                            len(restored),
+                        )
 
     raise RuntimeError(f"Exceeded maximum turn limit ({context.max_turns})")
 
@@ -356,6 +395,15 @@ async def _execute_tool_call(
             error_type="tool_error" if result.is_error else None,
         )
 
+    # Sprint 10: record tool call for divergence detection
+    if context.divergence_detector is not None:
+        context.divergence_detector.record_tool_call(
+            tool_name=tool_name,
+            args=tool_input,
+            result=tool_result.content,
+            success=not tool_result.is_error,
+        )
+
     # Post-tool hook (Sprint 2)
     if context.hook_executor is not None:
         from prometheus.hooks import HookEvent
@@ -398,6 +446,8 @@ class AgentLoop:
         adapter=None,
         telemetry=None,
         cwd: Path | None = None,
+        model_router: object | None = None,
+        divergence_detector: object | None = None,
     ) -> None:
         self._provider = provider
         self._model = model
@@ -411,6 +461,9 @@ class AgentLoop:
         self._cwd = cwd or Path.cwd()
         self._post_task_hook: Callable | None = None
         self._tool_trace: list[dict] = []
+        # Sprint 10
+        self._model_router = model_router
+        self._divergence_detector = divergence_detector
 
     def set_post_task_hook(self, hook: Callable) -> None:
         """Register a callback invoked after each completed task.
@@ -441,6 +494,8 @@ class AgentLoop:
             adapter=self._adapter,
             telemetry=self._telemetry,
             cwd=self._cwd,
+            model_router=self._model_router,
+            divergence_detector=self._divergence_detector,
         )
 
         last_text = ""
