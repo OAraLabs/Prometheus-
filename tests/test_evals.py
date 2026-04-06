@@ -24,6 +24,11 @@ from prometheus.evals.metrics import (
     TaskCompletionMetric,
     ToolUsageMetric,
 )
+from prometheus.evals.classifier import (
+    FailureCategory,
+    FailureSource,
+    classify_failure,
+)
 from prometheus.evals.runner import EvalResult, EvalRunner, MetricScore, _SimpleTestCase
 from prometheus.evals.trends import TrendTracker, TrendRow
 
@@ -433,6 +438,7 @@ class TestEvalRunner:
         assert result.latency_ms >= 0
         assert result.error is None
         assert len(result.tool_trace) == 1
+        assert result.failure_source == "pass"
         mock_loop.run_async.assert_called_once()
 
     @pytest.mark.asyncio
@@ -465,6 +471,7 @@ class TestEvalRunner:
         assert result.error == "boom"
         assert result.agent_output == ""
         assert result.latency_ms >= 0
+        assert result.failure_source in ("harness", "unclear")
 
     @pytest.mark.asyncio
     async def test_run_all(self):
@@ -579,6 +586,143 @@ class TestEvalRunner:
         captured = capsys.readouterr()
         assert "EVALUATION SUMMARY" in captured.out
         assert "t-1" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Failure Classification
+# ---------------------------------------------------------------------------
+
+
+class TestFailureClassifier:
+    def test_all_pass(self):
+        """Should return PASS when all metrics are good."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["bash"],
+            tool_trace=[{"tool_name": "bash", "result": "ok", "is_error": False}],
+            agent_output="done",
+            error=None,
+            metric_scores={"Task Completion": 0.9, "Tool Usage": 1.0, "No Hallucination": 0.95},
+        )
+        assert result.source == FailureSource.PASS
+
+    def test_crash_harness_keyword(self):
+        """Should classify crash with harness keywords as HARNESS."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["glob"],
+            tool_trace=[],
+            agent_output="",
+            error="Non-relative patterns are unsupported",
+            metric_scores={},
+        )
+        assert result.source == FailureSource.HARNESS
+        assert result.category == FailureCategory.TOOL_CRASH
+
+    def test_crash_unknown(self):
+        """Should classify ambiguous crash as UNCLEAR."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=[],
+            tool_trace=[],
+            agent_output="",
+            error="RuntimeError: something weird",
+            metric_scores={},
+        )
+        assert result.source == FailureSource.UNCLEAR
+
+    def test_no_tool_call(self):
+        """Should classify as MODEL when expected tools not called."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["bash"],
+            tool_trace=[],
+            agent_output="The directory is /home/will",
+            error=None,
+            metric_scores={"Task Completion": 0.9, "Tool Usage": 0.0, "No Hallucination": 0.8},
+        )
+        assert result.source == FailureSource.MODEL
+        assert result.category == FailureCategory.NO_TOOL_CALL
+
+    def test_wrong_tool(self):
+        """Should classify as MODEL when different tools used."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["read_file"],
+            tool_trace=[{"tool_name": "bash", "result": "ok", "is_error": False}],
+            agent_output="done",
+            error=None,
+            metric_scores={"Task Completion": 0.8, "Tool Usage": 0.0, "No Hallucination": 0.9},
+        )
+        assert result.source == FailureSource.MODEL
+        assert result.category == FailureCategory.WRONG_TOOL
+
+    def test_tool_error_harness(self):
+        """Should classify tool execution errors as HARNESS."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["glob"],
+            tool_trace=[{"tool_name": "glob", "result": "Error: path not found", "is_error": True}],
+            agent_output="",
+            error=None,
+            metric_scores={"Task Completion": 0.3},
+        )
+        assert result.source == FailureSource.HARNESS
+        assert result.category == FailureCategory.TOOL_ERROR
+
+    def test_permission_denied(self):
+        """Should classify permission blocks as HARNESS."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["bash"],
+            tool_trace=[{"tool_name": "bash", "result": "Permission denied for bash", "is_error": True}],
+            agent_output="",
+            error=None,
+            metric_scores={"Task Completion": 0.0},
+        )
+        assert result.source == FailureSource.HARNESS
+        assert result.category == FailureCategory.PERMISSION_DENIED
+
+    def test_bad_args_model(self):
+        """Should classify validation failures as MODEL (bad args)."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["write_file"],
+            tool_trace=[{"tool_name": "write_file", "result": "Invalid input for write_file: path required", "is_error": True}],
+            agent_output="",
+            error=None,
+            metric_scores={"Task Completion": 0.0},
+        )
+        assert result.source == FailureSource.MODEL
+        assert result.category == FailureCategory.BAD_ARGS
+
+    def test_hallucination(self):
+        """Should classify low hallucination score as MODEL."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["bash"],
+            tool_trace=[{"tool_name": "bash", "result": "ok", "is_error": False}],
+            agent_output="made up stuff",
+            error=None,
+            metric_scores={"Task Completion": 0.7, "Tool Usage": 1.0, "No Hallucination": 0.2},
+        )
+        assert result.source == FailureSource.MODEL
+        assert result.category == FailureCategory.HALLUCINATED_OUTPUT
+
+    def test_incomplete_model(self):
+        """Should classify tools OK but completion failed as MODEL incomplete."""
+        result = classify_failure(
+            task_id="t1",
+            expected_tools=["write_file", "bash"],
+            tool_trace=[
+                {"tool_name": "write_file", "result": "ok", "is_error": False},
+            ],
+            agent_output="wrote the file",
+            error=None,
+            metric_scores={"Task Completion": 0.3, "Tool Usage": 0.5, "No Hallucination": 0.9},
+        )
+        assert result.source == FailureSource.MODEL
+        assert result.category == FailureCategory.INCOMPLETE
 
 
 # ---------------------------------------------------------------------------

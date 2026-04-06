@@ -1,5 +1,11 @@
 """Prometheus evaluation suite — DeepEval + Phoenix integration (Sprint 13)."""
 
+from prometheus.evals.classifier import (
+    FailureClassification,
+    FailureCategory,
+    FailureSource,
+    classify_failure,
+)
 from prometheus.evals.golden_dataset import (
     GoldenTask,
     TaskTier,
@@ -15,6 +21,10 @@ from prometheus.evals.runner import EvalRunner, EvalResult, MetricScore
 from prometheus.evals.trends import TrendTracker, TrendRow
 
 __all__ = [
+    "FailureClassification",
+    "FailureCategory",
+    "FailureSource",
+    "classify_failure",
     "GoldenTask",
     "TaskTier",
     "load_golden_dataset",

@@ -14,6 +14,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from prometheus.evals.classifier import (
+    FailureClassification,
+    FailureSource,
+    classify_failure,
+)
 from prometheus.evals.golden_dataset import GoldenTask, load_golden_dataset
 from prometheus.evals.judge import PrometheusJudge
 from prometheus.evals.trends import TrendTracker
@@ -47,6 +52,9 @@ class EvalResult:
     tool_trace: list[dict[str, Any]] = field(default_factory=list)
     metrics: list[MetricScore] = field(default_factory=list)
     error: str | None = None
+    failure_source: str = "pass"       # "pass", "model", "harness", "unclear"
+    failure_category: str = "none"     # e.g. "model:wrong_tool", "harness:tool_crash"
+    failure_detail: str = ""
 
 
 class EvalRunner:
@@ -90,6 +98,17 @@ class EvalRunner:
                     task, result.text, tool_trace
                 )
 
+                # Classify failure source
+                score_map = {m.metric_name: m.score for m in metric_scores}
+                classification = classify_failure(
+                    task_id=task.id,
+                    expected_tools=task.expected_tools,
+                    tool_trace=tool_trace,
+                    agent_output=result.text,
+                    error=None,
+                    metric_scores=score_map,
+                )
+
                 return EvalResult(
                     task_id=task.id,
                     task_name=task.name,
@@ -99,11 +118,24 @@ class EvalRunner:
                     latency_ms=round(latency_ms, 1),
                     tool_trace=tool_trace,
                     metrics=metric_scores,
+                    failure_source=classification.source.value,
+                    failure_category=classification.category.value,
+                    failure_detail=classification.detail,
                 )
 
             except Exception as exc:
                 latency_ms = (time.monotonic() - t0) * 1000
                 log.error("Task %s crashed: %s", task.id, exc)
+
+                classification = classify_failure(
+                    task_id=task.id,
+                    expected_tools=task.expected_tools,
+                    tool_trace=[],
+                    agent_output="",
+                    error=str(exc),
+                    metric_scores={},
+                )
+
                 return EvalResult(
                     task_id=task.id,
                     task_name=task.name,
@@ -112,6 +144,9 @@ class EvalRunner:
                     turns=0,
                     latency_ms=round(latency_ms, 1),
                     error=str(exc),
+                    failure_source=classification.source.value,
+                    failure_category=classification.category.value,
+                    failure_detail=classification.detail,
                 )
 
     async def _evaluate_metrics(
@@ -267,6 +302,16 @@ class EvalRunner:
             for m in r.metrics:
                 metric_aggs.setdefault(m.metric_name, []).append(m.score)
 
+        # Failure source breakdown
+        source_counts: dict[str, int] = {}
+        category_counts: dict[str, int] = {}
+        for r in results:
+            src = r.failure_source
+            source_counts[src] = source_counts.get(src, 0) + 1
+            if src != "pass":
+                cat = r.failure_category
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+
         return {
             "total_tasks": total,
             "errored": errored,
@@ -279,6 +324,8 @@ class EvalRunner:
                 name: round(sum(scores) / len(scores), 3)
                 for name, scores in metric_aggs.items()
             },
+            "failure_sources": source_counts,
+            "failure_categories": category_counts,
         }
 
     def print_summary(
@@ -287,20 +334,31 @@ class EvalRunner:
         """Print a summary report to stdout, with trend comparison."""
         summary = self._compute_summary(results)
 
-        print("\n" + "=" * 65)
+        print("\n" + "=" * 72)
         print("EVALUATION SUMMARY")
-        print("=" * 65)
+        print("=" * 72)
 
         for r in results:
-            status = "ERR " if r.error else "OK  "
+            if r.error:
+                status = "ERR "
+            elif r.failure_source == "pass":
+                status = "PASS"
+            elif r.failure_source == "model":
+                status = "MDL "
+            elif r.failure_source == "harness":
+                status = "HRN "
+            else:
+                status = "??? "
+
             metric_str = "  ".join(
                 f"{m.metric_name}={m.score:.2f}" for m in r.metrics
             )
-            print(
-                f"  [{status}] {r.task_id:25s} {r.latency_ms:8.0f}ms  {metric_str}"
-            )
+            line = f"  [{status}] {r.task_id:25s} {r.latency_ms:8.0f}ms  {metric_str}"
+            if r.failure_source not in ("pass",):
+                line += f"  <- {r.failure_category}"
+            print(line)
 
-        print("-" * 65)
+        print("-" * 72)
         print(
             f"  Tasks: {summary.get('total_tasks', 0)}  |  "
             f"OK: {summary.get('completed', 0)}  |  "
@@ -310,6 +368,23 @@ class EvalRunner:
             f"  Avg latency: {summary.get('avg_latency_ms', 0):.0f}ms  |  "
             f"Total: {summary.get('total_latency_ms', 0):.0f}ms"
         )
+
+        # Failure source breakdown
+        sources = summary.get("failure_sources", {})
+        pass_count = sources.get("pass", 0)
+        model_count = sources.get("model", 0)
+        harness_count = sources.get("harness", 0)
+        unclear_count = sources.get("unclear", 0)
+        print(
+            f"  Classification:  PASS={pass_count}  "
+            f"MODEL={model_count}  HARNESS={harness_count}  UNCLEAR={unclear_count}"
+        )
+
+        categories = summary.get("failure_categories", {})
+        if categories:
+            print("  Failure breakdown:")
+            for cat, count in sorted(categories.items()):
+                print(f"    {cat}: {count}")
 
         # Trend comparison
         avg = summary.get("metric_averages", {})
@@ -324,12 +399,11 @@ class EvalRunner:
                 print(tracker.format_trend_comparison(avg, previous))
                 tracker.close()
             except Exception:
-                # Fallback: print without trend
                 print("  Metric averages:")
                 for name, score in avg.items():
                     print(f"    {name}: {score:.3f}")
 
-        print("=" * 65 + "\n")
+        print("=" * 72 + "\n")
 
 
 class _SimpleTestCase:
