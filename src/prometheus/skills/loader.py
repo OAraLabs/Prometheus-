@@ -39,17 +39,28 @@ def get_builtin_skills() -> list[SkillDefinition]:
 
 
 def load_user_skills() -> list[SkillDefinition]:
-    """Load markdown skills from the user config directory."""
+    """Load markdown skills from the user config directory.
+
+    Scans both ``~/.prometheus/skills/*.md`` and
+    ``~/.prometheus/skills/auto/*.md`` (auto-generated skills).
+    """
     skills: list[SkillDefinition] = []
-    for path in sorted(get_user_skills_dir().glob("*.md")):
+    user_dir = get_user_skills_dir()
+    # Collect from top-level and auto/ subdirectory
+    paths = sorted(user_dir.glob("*.md"))
+    auto_dir = user_dir / "auto"
+    if auto_dir.is_dir():
+        paths.extend(sorted(auto_dir.glob("*.md")))
+    for path in paths:
         content = path.read_text(encoding="utf-8")
         name, description = _parse_skill_markdown(path.stem, content)
+        source = "auto" if "auto" in path.parts else "user"
         skills.append(
             SkillDefinition(
                 name=name,
                 description=description,
                 content=content,
-                source="user",
+                source=source,
                 path=str(path),
             )
         )

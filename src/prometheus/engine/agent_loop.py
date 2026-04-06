@@ -409,6 +409,16 @@ class AgentLoop:
         self._adapter = adapter
         self._telemetry = telemetry
         self._cwd = cwd or Path.cwd()
+        self._post_task_hook: Callable | None = None
+        self._tool_trace: list[dict] = []
+
+    def set_post_task_hook(self, hook: Callable) -> None:
+        """Register a callback invoked after each completed task.
+
+        The hook is called with ``(task_description, tool_trace)`` and
+        should return a coroutine (e.g. ``SkillCreator.maybe_create``).
+        """
+        self._post_task_hook = hook
 
     async def run_async(
         self,
@@ -436,21 +446,38 @@ class AgentLoop:
         last_text = ""
         last_usage = UsageSnapshot()
         turns = 0
+        self._tool_trace = []
 
         async for event, usage in run_loop(context, messages):
             if isinstance(event, AssistantTurnComplete):
                 last_text = event.message.text
                 last_usage = event.usage
                 turns += 1
+            elif isinstance(event, ToolExecutionCompleted):
+                self._tool_trace.append({
+                    "tool_name": event.tool_name,
+                    "result": (event.output or "")[:200],
+                    "is_error": event.is_error,
+                })
             elif isinstance(event, AssistantTextDelta):
                 pass  # streaming deltas — consumed silently here
 
-        return RunResult(
+        result = RunResult(
             text=last_text,
             messages=messages,
             usage=last_usage,
             turns=turns,
         )
+
+        # Post-task learning hook — auto-generate skills from traces
+        if self._post_task_hook and self._tool_trace:
+            try:
+                await self._post_task_hook(user_message, self._tool_trace)
+            except Exception:
+                log.debug("Post-task hook failed", exc_info=True)
+            self._tool_trace = []
+
+        return result
 
     def run(
         self,

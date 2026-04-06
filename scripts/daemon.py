@@ -245,6 +245,15 @@ async def run_daemon(args: argparse.Namespace) -> None:
     except Exception as exc:
         logger.warning("Memory extractor not available: %s", exc)
 
+    # Learning loop — SkillCreator (auto-generate skills from successful tasks)
+    try:
+        from prometheus.learning.skill_creator import SkillCreator
+        skill_creator = SkillCreator(provider, model=model_name)
+        agent_loop.set_post_task_hook(skill_creator.maybe_create)
+        logger.info("SkillCreator wired to agent loop post-task hook")
+    except Exception as exc:
+        logger.warning("SkillCreator not available: %s", exc)
+
     # SENTINEL proactive subsystem (Sprint 9)
     sentinel_config = config.get("sentinel", {})
     if sentinel_config.get("enabled", True):

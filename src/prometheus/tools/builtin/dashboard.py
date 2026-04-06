@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-import asyncio
+import socket
+import subprocess
 import threading
 from functools import partial
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -15,6 +16,38 @@ import tempfile
 from pydantic import BaseModel, Field
 
 from prometheus.tools.base import BaseTool, ToolExecutionContext, ToolResult
+
+
+def _get_host_address() -> str:
+    """Detect the best reachable address for the dashboard.
+
+    Priority: Tailscale IP > LAN IP > localhost.
+    """
+    # Try Tailscale first
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            ip = result.stdout.strip().splitlines()[0]
+            if ip:
+                return ip
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Fall back to the default outbound interface IP
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and ip != "0.0.0.0":
+            return ip
+    except OSError:
+        pass
+
+    return "localhost"
 
 
 class DashboardInput(BaseModel):
@@ -31,8 +64,8 @@ class DashboardTool(BaseTool):
     name = "dashboard"
     description = (
         "Start a lightweight HTTP server that serves the provided HTML content. "
-        "Returns the URL to view the dashboard. Useful for visualizations, "
-        "reports, and interactive HTML pages."
+        "Returns the URL to view the dashboard. The URL uses the Tailscale IP "
+        "if available, otherwise the LAN IP or localhost."
     )
     input_model = DashboardInput
 
@@ -60,7 +93,7 @@ class DashboardTool(BaseTool):
             self._servers[port].shutdown()
             del self._servers[port]
 
-        # Start HTTP server in a background thread
+        # Start HTTP server bound to all interfaces
         handler = partial(SimpleHTTPRequestHandler, directory=str(tmpdir))
         try:
             server = HTTPServer(("0.0.0.0", port), handler)
@@ -73,7 +106,8 @@ class DashboardTool(BaseTool):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
 
-        url = f"http://localhost:{port}/"
+        host = _get_host_address()
+        url = f"http://{host}:{port}/"
         return ToolResult(
             output=f"Dashboard serving at {url}\nHTML file: {index}",
             metadata={"url": url, "port": port, "html_path": str(index)},
