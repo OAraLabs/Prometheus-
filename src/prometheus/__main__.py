@@ -116,7 +116,9 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
     """Build the default tool registry with all builtin tools."""
     from prometheus.tools.base import ToolRegistry
     from prometheus.tools.builtin import (
+        AskUserTool,
         BashTool,
+        DashboardTool,
         FileEditTool,
         FileReadTool,
         FileWriteTool,
@@ -125,6 +127,11 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
         LCMDescribeTool,
         LCMExpandTool,
         LCMGrepTool,
+        MessageTool,
+        NotebookEditTool,
+        TTSTool,
+        WebFetchTool,
+        WebSearchTool,
     )
     from prometheus.tools.builtin.cron_create import CronCreateTool
     from prometheus.tools.builtin.cron_delete import CronDeleteTool
@@ -147,6 +154,14 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
         LCMExpandTool(),
         LCMGrepTool(),
         LCMExpandQueryTool(),
+        # --- New tools (httpx/stdlib only) ---
+        WebSearchTool(),
+        WebFetchTool(),
+        MessageTool(),
+        TTSTool(),
+        DashboardTool(),
+        NotebookEditTool(),
+        AskUserTool(),
     ]:
         registry.register(tool)
 
@@ -159,6 +174,24 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
     try:
         from prometheus.tools.builtin.todo_write import TodoWriteTool
         registry.register(TodoWriteTool())
+    except Exception:
+        pass
+
+    # Browser — requires optional playwright dependency
+    try:
+        from prometheus.tools.builtin.browser import BrowserTool
+        registry.register(BrowserTool())
+    except Exception:
+        pass
+
+    # Session tools — require task manager
+    try:
+        from prometheus.tools.builtin.sessions_list import SessionsListTool
+        from prometheus.tools.builtin.sessions_send import SessionsSendTool
+        from prometheus.tools.builtin.sessions_spawn import SessionsSpawnTool
+        registry.register(SessionsListTool())
+        registry.register(SessionsSendTool())
+        registry.register(SessionsSpawnTool())
     except Exception:
         pass
 

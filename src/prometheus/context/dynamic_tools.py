@@ -23,7 +23,7 @@ CORE_TOOLS: frozenset[str] = frozenset({"bash", "read_file", "write_file"})
 # Keyword → additional tool names to include
 _KEYWORD_TOOL_MAP: dict[str, list[str]] = {
     "grep": ["grep"],
-    "search": ["grep"],
+    "search": ["grep", "web_search"],
     "find": ["grep", "glob"],
     "glob": ["glob"],
     "pattern": ["glob"],
@@ -33,6 +33,40 @@ _KEYWORD_TOOL_MAP: dict[str, list[str]] = {
     "patch": ["edit_file"],
     "list": ["glob"],
     "files": ["glob"],
+    # Web tools
+    "web": ["web_search", "web_fetch"],
+    "url": ["web_fetch"],
+    "fetch": ["web_fetch"],
+    "browse": ["browser"],
+    "navigate": ["browser"],
+    "website": ["web_fetch", "browser"],
+    # Messaging
+    "message": ["message"],
+    "send": ["message"],
+    "discord": ["message"],
+    "slack": ["message"],
+    "telegram": ["message"],
+    # Audio / TTS
+    "speak": ["tts"],
+    "voice": ["tts"],
+    "audio": ["tts"],
+    "speech": ["tts"],
+    # Dashboard / visualization
+    "dashboard": ["dashboard"],
+    "html": ["dashboard"],
+    "visuali": ["dashboard"],
+    "serve": ["dashboard"],
+    # Notebooks
+    "notebook": ["notebook_edit"],
+    "jupyter": ["notebook_edit"],
+    "ipynb": ["notebook_edit"],
+    # Sessions
+    "session": ["sessions_list", "sessions_send", "sessions_spawn"],
+    "agent": ["sessions_list", "sessions_spawn"],
+    # User interaction
+    "ask": ["ask_user"],
+    "clarify": ["ask_user"],
+    "question": ["ask_user"],
 }
 
 
