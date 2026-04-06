@@ -389,6 +389,14 @@ def main() -> None:
         "--debug", action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--setup", action="store_true",
+        help="Run first-time setup wizard",
+    )
+    parser.add_argument(
+        "--setup-gateway-only", action="store_true",
+        help="Add or change gateway only (skip model provider setup)",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
     daemon_parser = subparsers.add_parser("daemon", help="Start always-on daemon")
@@ -407,6 +415,13 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stderr)],
     )
 
+    # Setup wizard — runs before anything else
+    if args.setup or args.setup_gateway_only:
+        from prometheus.setup_wizard import SetupWizard
+        wizard = SetupWizard(gateway_only=args.setup_gateway_only)
+        success = wizard.run()
+        sys.exit(0 if success else 1)
+
     # Daemon subcommand — delegate to scripts/daemon.py
     if args.command == "daemon":
         from scripts.daemon import main as daemon_main
@@ -421,8 +436,13 @@ def main() -> None:
         daemon_main()
         return
 
-    # Load config
+    # Load config — hint about setup wizard if no config exists
     config = load_config(args.config)
+    if not config and not _PROMETHEUS_YAML.exists() and not (get_config_dir() / "prometheus.yaml").exists():
+        print("No configuration found. Run the setup wizard:\n")
+        print("  python3 -m prometheus --setup\n")
+        print("Or create config/prometheus.yaml manually.")
+        sys.exit(1)
     model_cfg = config.get("model", {})
     security_cfg = config.get("security", {})
 
