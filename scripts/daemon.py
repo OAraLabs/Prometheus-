@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -140,7 +141,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
 
     # Telegram adapter
     telegram: TelegramAdapter | None = None
-    telegram_token = gateway_config.get("telegram_token", "")
+    telegram_token = gateway_config.get("telegram_token", "") or os.environ.get("PROMETHEUS_TELEGRAM_TOKEN", "")
     if telegram_token and gateway_config.get("telegram_enabled", True):
         tg_config = PlatformConfig(
             platform=Platform.TELEGRAM,
