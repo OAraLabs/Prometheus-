@@ -31,7 +31,14 @@ from prometheus.gateway.cron_scheduler import run_scheduler_loop
 from prometheus.gateway.heartbeat import Heartbeat
 from prometheus.gateway.telegram import TelegramAdapter
 from prometheus.providers.llama_cpp import LlamaCppProvider
-from prometheus.__main__ import create_tool_registry
+from prometheus.__main__ import (
+    create_adapter,
+    create_divergence_detector,
+    create_model_router,
+    create_security_gate,
+    create_tool_registry,
+)
+from prometheus.telemetry.tracker import ToolCallTelemetry
 from prometheus.tools.base import ToolRegistry
 
 logger = logging.getLogger("prometheus.daemon")
@@ -109,11 +116,43 @@ async def run_daemon(args: argparse.Namespace) -> None:
     # Tool registry — same tools as CLI mode
     registry = build_tool_registry(security_cfg=security_config)
 
+    # Sprint 15 wiring fix: daemon was missing adapter, security_gate,
+    # model_router, and divergence_detector — all were built but not connected.
+    adapter = create_adapter(model_config)
+    security_gate = create_security_gate(security_config)
+    model_router = create_model_router(config)
+    divergence_detector = create_divergence_detector(config)
+
+    # Telemetry — shared instance for AgentLoop and SENTINEL digest
+    telemetry = ToolCallTelemetry()
+
+    # Sprint 15 wiring fix: HookExecutor was built but never created in daemon
+    hook_executor = None
+    try:
+        from prometheus.hooks.executor import HookExecutor, HookExecutionContext
+        from prometheus.hooks.registry import HookRegistry
+        hook_executor = HookExecutor(
+            registry=HookRegistry(),
+            context=HookExecutionContext(
+                cwd=Path.cwd(),
+                provider=provider,
+                default_model=model_name,
+            ),
+        )
+    except Exception:
+        pass
+
     # Agent loop
     agent_loop = AgentLoop(
         provider=provider,
         model=model_name,
         tool_registry=registry,
+        adapter=adapter,
+        permission_checker=security_gate,
+        hook_executor=hook_executor,
+        telemetry=telemetry,
+        model_router=model_router,
+        divergence_detector=divergence_detector,
     )
 
     # Collect async tasks to run
@@ -288,8 +327,6 @@ async def run_daemon(args: argparse.Namespace) -> None:
 
             tel_digest = None
             try:
-                from prometheus.telemetry.tracker import ToolCallTelemetry
-                telemetry = ToolCallTelemetry()
                 tel_digest = TelemetryDigest(
                     telemetry,
                     period_hours=sentinel_config.get("digest_lookback_hours", 24),

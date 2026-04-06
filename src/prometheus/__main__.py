@@ -460,6 +460,82 @@ async def run_once(context: LoopContext, query: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Data reset helpers
+# ---------------------------------------------------------------------------
+
+def _reset_telemetry() -> None:
+    """Delete telemetry.db after user confirmation."""
+    from prometheus.config.paths import get_config_dir
+
+    db_path = get_config_dir() / "telemetry.db"
+    if not db_path.exists():
+        print(f"No telemetry database found at {db_path}")
+        return
+    print(f"Will delete: {db_path}")
+    confirm = input("Proceed? [y/N] ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        return
+    db_path.unlink()
+    for suffix in ("-wal", "-shm"):
+        p = db_path.parent / (db_path.name + suffix)
+        if p.exists():
+            p.unlink()
+    print(f"Deleted {db_path}")
+
+
+def _reset_data() -> None:
+    """Delete all user data after confirmation.  Preserves config files."""
+    import shutil
+    from prometheus.config.paths import get_config_dir, get_data_dir
+
+    config_dir = get_config_dir()
+    data_dir = get_data_dir()
+
+    file_targets = [
+        ("telemetry.db", config_dir / "telemetry.db"),
+        ("memory.db", config_dir / "memory.db"),
+        ("data/lcm.db", data_dir / "lcm.db"),
+        ("data/security/audit.db", data_dir / "security" / "audit.db"),
+    ]
+    dir_targets = [
+        ("eval_results/", config_dir / "eval_results"),
+        ("wiki/", config_dir / "wiki"),
+        ("sentinel/", config_dir / "sentinel"),
+        ("skills/auto/", config_dir / "skills" / "auto"),
+    ]
+
+    print("The following will be deleted:")
+    for label, path in file_targets:
+        status = "(exists)" if path.exists() else "(not found)"
+        print(f"  {label}: {path} {status}")
+    for label, path in dir_targets:
+        status = "(exists)" if path.exists() else "(not found)"
+        print(f"  {label}: {path} {status}")
+
+    confirm = input("\nDelete all listed data? [y/N] ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        return
+
+    for label, path in file_targets:
+        if path.exists():
+            path.unlink()
+            for suffix in ("-wal", "-shm"):
+                p = path.parent / (path.name + suffix)
+                if p.exists():
+                    p.unlink()
+            print(f"  Deleted {label}")
+
+    for label, path in dir_targets:
+        if path.exists():
+            shutil.rmtree(path)
+            print(f"  Deleted {label}")
+
+    print("Done. Config files preserved.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -500,6 +576,14 @@ def main() -> None:
         "--setup-gateway-only", action="store_true",
         help="Add or change gateway only (skip model provider setup)",
     )
+    parser.add_argument(
+        "--reset-telemetry", action="store_true",
+        help="Delete telemetry.db and exit",
+    )
+    parser.add_argument(
+        "--reset-data", action="store_true",
+        help="Delete all user data (telemetry, memory, LCM, audit, evals, wiki, sentinel, skills/auto) and exit",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
     daemon_parser = subparsers.add_parser("daemon", help="Start always-on daemon")
@@ -524,6 +608,15 @@ def main() -> None:
         wizard = SetupWizard(gateway_only=args.setup_gateway_only)
         success = wizard.run()
         sys.exit(0 if success else 1)
+
+    # Data reset commands
+    if args.reset_telemetry:
+        _reset_telemetry()
+        sys.exit(0)
+
+    if args.reset_data:
+        _reset_data()
+        sys.exit(0)
 
     # Daemon subcommand — delegate to scripts/daemon.py
     if args.command == "daemon":
@@ -584,6 +677,23 @@ def main() -> None:
     model_router = create_model_router(config)
     divergence_detector = create_divergence_detector(config)
 
+    # Sprint 15 wiring fix: HookExecutor was built (Sprint 2) but never created
+    hook_executor = None
+    try:
+        from prometheus.hooks.executor import HookExecutor, HookExecutionContext
+        from prometheus.hooks.registry import HookRegistry
+        hook_registry = HookRegistry()
+        hook_executor = HookExecutor(
+            registry=hook_registry,
+            context=HookExecutionContext(
+                cwd=Path.cwd(),
+                provider=provider,
+                default_model=model_name,
+            ),
+        )
+    except Exception:
+        pass
+
     context = LoopContext(
         provider=provider,
         model=model_name,
@@ -591,6 +701,7 @@ def main() -> None:
         max_tokens=4096,
         tool_registry=registry,
         permission_checker=security_gate,
+        hook_executor=hook_executor,
         adapter=adapter,
         telemetry=telemetry,
         model_router=model_router,

@@ -96,6 +96,21 @@ async def run_loop(
     if context.tool_registry is not None and hasattr(context.tool_registry, "to_api_schema"):
         tool_schema = context.tool_registry.to_api_schema()
 
+    # Sprint 10/15: route the first user message through ModelRouter
+    if context.model_router is not None and messages:
+        first_user = next(
+            (m.text for m in messages if m.role == "user" and m.text), None
+        )
+        if first_user:
+            try:
+                route = context.model_router.route(first_user)
+                log.debug(
+                    "ModelRouter: %s → %s/%s (%s)",
+                    first_user[:60], route.provider, route.model, route.reason,
+                )
+            except Exception:
+                log.debug("ModelRouter: classification failed", exc_info=True)
+
     # Sprint 3: format tools + system prompt for the target model
     active_system_prompt = context.system_prompt
     active_tools = tool_schema
@@ -233,6 +248,14 @@ async def _dispatch_tool_calls(
         for item in parallel:
             if isinstance(item, Exception):
                 log.error("Parallel tool execution failed: %s", item)
+                if context.telemetry is not None:
+                    context.telemetry.record(
+                        model=context.model,
+                        tool_name="unknown_parallel",
+                        success=False,
+                        error_type="parallel_exception",
+                        error_detail=str(item),
+                    )
                 # We lost the index — append a generic error
                 results.append((-1, ToolResultBlock(
                     tool_use_id="error",
@@ -278,6 +301,14 @@ async def _execute_tool_call(
             {"tool_name": tool_name, "tool_input": tool_input, "event": HookEvent.PRE_TOOL_USE.value},
         )
         if pre.blocked:
+            if context.telemetry is not None:
+                context.telemetry.record(
+                    model=context.model,
+                    tool_name=tool_name,
+                    success=False,
+                    error_type="hook_blocked",
+                    error_detail=pre.reason or f"pre_tool_use hook blocked {tool_name}",
+                )
             return ToolResultBlock(
                 tool_use_id=tool_use_id,
                 content=pre.reason or f"pre_tool_use hook blocked {tool_name}",
@@ -285,6 +316,14 @@ async def _execute_tool_call(
             )
 
     if context.tool_registry is None:
+        if context.telemetry is not None:
+            context.telemetry.record(
+                model=context.model,
+                tool_name=tool_name,
+                success=False,
+                error_type="no_registry",
+                error_detail="No tool registry configured",
+            )
         return ToolResultBlock(
             tool_use_id=tool_use_id,
             content=f"No tool registry configured — cannot execute {tool_name}",
@@ -323,6 +362,14 @@ async def _execute_tool_call(
 
     tool = context.tool_registry.get(tool_name)
     if tool is None:
+        if context.telemetry is not None:
+            context.telemetry.record(
+                model=context.model,
+                tool_name=tool_name,
+                success=False,
+                error_type="unknown_tool",
+                error_detail=f"Unknown tool: {tool_name}",
+            )
         return ToolResultBlock(
             tool_use_id=tool_use_id,
             content=f"Unknown tool: {tool_name}",
@@ -332,6 +379,14 @@ async def _execute_tool_call(
     try:
         parsed_input = tool.input_model.model_validate(tool_input)
     except Exception as exc:
+        if context.telemetry is not None:
+            context.telemetry.record(
+                model=context.model,
+                tool_name=tool_name,
+                success=False,
+                error_type="input_validation",
+                error_detail=str(exc),
+            )
         return ToolResultBlock(
             tool_use_id=tool_use_id,
             content=f"Invalid input for {tool_name}: {exc}",
@@ -352,12 +407,28 @@ async def _execute_tool_call(
             if decision.requires_confirmation and context.permission_prompt is not None:
                 confirmed = await context.permission_prompt(tool_name, decision.reason)
                 if not confirmed:
+                    if context.telemetry is not None:
+                        context.telemetry.record(
+                            model=context.model,
+                            tool_name=tool_name,
+                            success=False,
+                            error_type="permission_denied",
+                            error_detail=f"User denied permission for {tool_name}",
+                        )
                     return ToolResultBlock(
                         tool_use_id=tool_use_id,
                         content=f"Permission denied for {tool_name}",
                         is_error=True,
                     )
             else:
+                if context.telemetry is not None:
+                    context.telemetry.record(
+                        model=context.model,
+                        tool_name=tool_name,
+                        success=False,
+                        error_type="permission_denied",
+                        error_detail=decision.reason or f"Permission denied for {tool_name}",
+                    )
                 return ToolResultBlock(
                     tool_use_id=tool_use_id,
                     content=decision.reason or f"Permission denied for {tool_name}",

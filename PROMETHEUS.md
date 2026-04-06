@@ -21,7 +21,7 @@ prometheus/
   skills/       Skill loading from .md files (Sprint 5)
   coordinator/  Multi-agent coordination + divergence detection (Sprint 8, 10) ✓
   benchmarks/   Benchmark suite + runner (Sprint 8) ✓
-  telemetry/    Tool call tracking (Sprint 3)
+  telemetry/    Tool call tracking (Sprint 3, 15)
   config/       Settings + path management + env var overrides (Sprint 11) ✓
   mcp/          MCP integration — tool servers + Context7 (Sprint 12) ✓
   evals/        DeepEval evaluation suite + G-Eval metrics (Sprint 13) ✓
@@ -59,6 +59,23 @@ get_workspace_dir() -> Path       # ~/.prometheus/workspace/
 
 ### `config/prometheus.yaml`
 Root config file. Keys: `system`, `model`, `context`, `security`, `infrastructure`, `gateway`, `learning`, `model_router`, `divergence`, `sentinel`.
+
+### CLI data management
+
+```
+python -m prometheus --reset-telemetry   # Delete telemetry.db (with y/N confirmation)
+python -m prometheus --reset-data        # Delete all user data (with y/N confirmation)
+```
+
+`--reset-data` deletes: `telemetry.db`, `memory.db`, `data/lcm.db`, `data/security/audit.db`,
+`eval_results/`, `wiki/`, `sentinel/`, `skills/auto/`. Preserves config files.
+
+### Querying telemetry
+
+```bash
+sqlite3 ~/.prometheus/telemetry.db "SELECT tool_name, success, latency_ms, error_type FROM tool_calls ORDER BY timestamp DESC LIMIT 20;"
+sqlite3 ~/.prometheus/telemetry.db "SELECT tool_name, COUNT(*), AVG(latency_ms), SUM(success)*1.0/COUNT(*) AS rate FROM tool_calls GROUP BY tool_name;"
+```
 
 ---
 
@@ -546,6 +563,14 @@ Before tool execution:
 
 After tool execution:
   telemetry.record(model, tool_name, success, retries, latency_ms, error_type)
+
+Error paths (all record telemetry before returning):
+  hook_blocked      — pre-tool hook denies execution
+  no_registry       — tool registry not configured
+  unknown_tool      — tool name not found in registry
+  input_validation  — Pydantic model_validate() failure
+  permission_denied — SecurityGate or user denial
+  parallel_exception — uncaught exception in asyncio.gather read-only dispatch
 ```
 
 ### Sprint 3 full wiring example
@@ -779,6 +804,7 @@ messages = compressor.maybe_compress(messages)
 - [x] Sprint 12: MCP Integration + Context7
 - [x] Sprint 13: DeepEval + Phoenix — G-Eval metrics, trend tracking, nightly cron
 - [x] Sprint 14: Constrained Decoding Judge — grammar-forced JSON, failure classifier, A/B tested
+- [x] Sprint 15: Telemetry Wiring Fix — daemon pipeline, error-path coverage, data reset CLI
 
 ---
 
@@ -1204,7 +1230,8 @@ from prometheus.gateway.cron_scheduler import run_scheduler_loop
 provider = LlamaCppProvider(base_url="http://localhost:8080")
 registry = ToolRegistry()
 # register all builtin + cron tools ...
-agent_loop = AgentLoop(provider=provider, tool_registry=registry)
+telemetry = ToolCallTelemetry()  # shared with SENTINEL digest
+agent_loop = AgentLoop(provider=provider, tool_registry=registry, telemetry=telemetry)
 
 tg_config = PlatformConfig(platform=Platform.TELEGRAM, token="BOT_TOKEN")
 telegram = TelegramAdapter(config=tg_config, agent_loop=agent_loop,
@@ -2755,3 +2782,135 @@ Both `TaskCompletionMetric` and `NoHallucinationMetric` switched from `evaluate_
 | No Hallucination | 0.667 | 0.867 |
 | Parse failures | ~30% | 0% |
 | Empty responses | ~4-10/run | 0 |
+
+---
+
+## Sprint 15: Wiring Audit + Data Reset CLI ✓
+
+Full wiring audit of Sprints 0-14.  Six components were built and unit-tested but never connected at runtime.  All six fixed; 36 integration tests added.
+
+### Daemon wiring fix (`scripts/daemon.py`)
+
+The daemon constructed `AgentLoop` with only `provider`, `model`, and `tool_registry`. Every other Sprint 2-10 component was skipped. Now matches the CLI path:
+
+```python
+from prometheus.__main__ import (
+    create_adapter, create_divergence_detector,
+    create_model_router, create_security_gate, create_tool_registry,
+)
+from prometheus.hooks.executor import HookExecutor, HookExecutionContext
+from prometheus.hooks.registry import HookRegistry
+
+adapter        = create_adapter(model_config)
+security_gate  = create_security_gate(security_config)
+model_router   = create_model_router(config)
+divergence_det = create_divergence_detector(config)
+telemetry      = ToolCallTelemetry()
+hook_executor  = HookExecutor(
+    registry=HookRegistry(),
+    context=HookExecutionContext(cwd=Path.cwd(), provider=provider, default_model=model_name),
+)
+
+agent_loop = AgentLoop(
+    provider=provider, model=model_name, tool_registry=registry,
+    adapter=adapter, permission_checker=security_gate,
+    hook_executor=hook_executor, telemetry=telemetry,
+    model_router=model_router, divergence_detector=divergence_det,
+)
+```
+
+### HookExecutor wired (`src/prometheus/__main__.py`)
+
+Sprint 2 built `HookExecutor` + `HookRegistry` but never instantiated either. Now created with an empty registry (ready for user-configured hooks) and passed to `LoopContext`:
+
+```python
+hook_executor = HookExecutor(
+    registry: HookRegistry,                              # empty — no hooks registered yet
+    context: HookExecutionContext(cwd, provider, model),  # needed for prompt/agent hooks
+)
+# → LoopContext(hook_executor=hook_executor)
+```
+
+### ModelRouter invoked (`src/prometheus/engine/agent_loop.py`)
+
+Sprint 10 created and passed `ModelRouter` to `LoopContext` but `run_loop()` never called it. Now invoked at the top of the loop:
+
+```python
+# run_loop(), before the turn loop:
+if context.model_router is not None and messages:
+    route = context.model_router.route(first_user_message)
+    log.debug("ModelRouter: %s → %s/%s (%s)", msg[:60], route.provider, route.model, route.reason)
+```
+
+### Telemetry error-path coverage (`src/prometheus/engine/agent_loop.py`)
+
+Sprint 3 recorded telemetry at two points; six error paths returned before reaching them. All now record:
+
+| `error_type` | Trigger |
+|---|---|
+| `hook_blocked` | Pre-tool hook returns `blocked=True` |
+| `no_registry` | `tool_registry` is `None` |
+| `unknown_tool` | `registry.get(name)` returns `None` |
+| `input_validation` | `input_model.model_validate()` raises |
+| `permission_denied` | `SecurityGate` denies or user rejects confirmation |
+| `parallel_exception` | `asyncio.gather` catches exception in read-only dispatch |
+
+### Data reset helpers (`src/prometheus/__main__.py`)
+
+```python
+def _reset_telemetry() -> None
+    # Deletes ~/.prometheus/telemetry.db (+ WAL/SHM) after y/N confirmation.
+
+def _reset_data() -> None
+    # Deletes all user data after y/N confirmation. Preserves config files.
+    # Files: telemetry.db, memory.db, data/lcm.db, data/security/audit.db
+    # Dirs:  eval_results/, wiki/, sentinel/, skills/auto/
+```
+
+```
+python -m prometheus --reset-telemetry
+python -m prometheus --reset-data
+```
+
+### Querying telemetry
+
+```bash
+sqlite3 ~/.prometheus/telemetry.db "SELECT tool_name, success, latency_ms, error_type FROM tool_calls ORDER BY timestamp DESC LIMIT 20;"
+sqlite3 ~/.prometheus/telemetry.db "SELECT tool_name, COUNT(*), AVG(latency_ms), SUM(success)*1.0/COUNT(*) AS rate FROM tool_calls GROUP BY tool_name;"
+```
+
+### Wiring audit results
+
+| Sprint | Component | Pre-fix status | Fix |
+|---|---|---|---|
+| 2 | HookExecutor | Built, never instantiated | Created in `__main__.py` + `daemon.py`, passed to `LoopContext` |
+| 3 | ModelAdapter | CLI only | Wired into daemon via `create_adapter()` |
+| 3 | ToolCallTelemetry | Instantiated, never passed to daemon `AgentLoop` | Passed as `telemetry=`; SENTINEL reuses same instance |
+| 4 | SecurityGate | CLI only | Wired into daemon via `create_security_gate()` |
+| 10 | ModelRouter | Passed to `LoopContext`, never invoked | `run_loop()` now calls `router.route()` |
+| 10 | DivergenceDetector | CLI only | Wired into daemon via `create_divergence_detector()` |
+
+Components confirmed wired (no fix needed): ToolRegistry, AuditLogger, ExfiltrationDetector, MemoryStore, MemoryExtractor, LCMEngine, TelegramAdapter, Heartbeat, CronScheduler, ArchiveWriter, SignalBus, ActivityObserver, AutoDreamEngine, WikiLinter, MemoryConsolidator, TelemetryDigest, KnowledgeSynthesizer, McpRuntime, PrometheusJudge.
+
+Deferred (by design): ContextCompressor, ToolResultTruncator, TokenBudget, DynamicToolLoader.
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 15 connects |
+|---|---|
+| `scripts/daemon.py` (Sprint 6) | `AgentLoop()` gains 6 kwargs: `adapter`, `security_gate`, `hook_executor`, `telemetry`, `model_router`, `divergence_detector` |
+| `engine/agent_loop.py` (Sprint 1) | `run_loop()` calls `model_router.route()`; `_execute_tool_call()` gains 7 telemetry recording sites |
+| `__main__.py` (Sprint 0) | Creates `HookExecutor` + `LoopContext`; adds `--reset-telemetry` / `--reset-data` argparse flags |
+| `pyproject.toml` | Registers `integration` pytest marker |
+
+### Integration wiring tests
+
+`tests/test_wiring.py` — 25 tests verifying runtime invocation across all sprints.
+`tests/test_telemetry_wiring.py` — 11 tests for telemetry recording + reset commands.
+
+```bash
+pytest -m integration tests/test_wiring.py -v   # wiring tests only
+pytest tests/test_telemetry_wiring.py -v          # telemetry + reset tests
+```
+
+**Policy: every future sprint must add wiring tests to `test_wiring.py`.**
