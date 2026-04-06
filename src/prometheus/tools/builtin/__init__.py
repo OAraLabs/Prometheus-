@@ -2,6 +2,7 @@
 
 from prometheus.tools.builtin.agent import AgentTool
 from prometheus.tools.builtin.ask_user import AskUserTool
+from prometheus.tools.builtin.audit_query import AuditQueryTool
 from prometheus.tools.builtin.bash import BashTool
 from prometheus.tools.builtin.cron_create import CronCreateTool
 from prometheus.tools.builtin.cron_delete import CronDeleteTool
@@ -32,6 +33,7 @@ from prometheus.tools.builtin.wiki_query import WikiQueryTool
 __all__ = [
     "AgentTool",
     "AskUserTool",
+    "AuditQueryTool",
     "BashTool",
     "CronCreateTool",
     "CronDeleteTool",

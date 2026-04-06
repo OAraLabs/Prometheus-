@@ -47,7 +47,12 @@ _PROMETHEUS_YAML = Path(__file__).resolve().parents[2] / "config" / "prometheus.
 
 
 def load_config(config_path: str | None = None) -> dict[str, Any]:
-    """Load prometheus.yaml and return the parsed dict."""
+    """Load prometheus.yaml with env var overrides applied.
+
+    Precedence: env vars > secret files > YAML > defaults.
+    """
+    from prometheus.config.env_override import apply_env_overrides
+
     path = Path(config_path) if config_path else _PROMETHEUS_YAML
     if not path.exists():
         alt = get_config_dir() / "prometheus.yaml"
@@ -55,9 +60,10 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
             path = alt
         else:
             log.debug("No config file found — using defaults")
-            return {}
+            return apply_env_overrides({})
     with path.open(encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+        config = yaml.safe_load(fh) or {}
+    return apply_env_overrides(config)
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +118,13 @@ def create_provider(model_cfg: dict[str, Any]) -> tuple[ModelProvider, str]:
 # Tool registry factory
 # ---------------------------------------------------------------------------
 
-def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
+def create_tool_registry(security_cfg: dict[str, Any], security_gate=None) -> Any:
     """Build the default tool registry with all builtin tools."""
     from prometheus.tools.base import ToolRegistry
     from prometheus.tools.builtin import (
         AgentTool,
         AskUserTool,
+        AuditQueryTool,
         BashTool,
         DashboardTool,
         FileEditTool,
@@ -180,6 +187,10 @@ def create_tool_registry(security_cfg: dict[str, Any]) -> Any:
         SentinelStatusTool(),
     ]:
         registry.register(tool)
+
+    # Sprint 11: Audit query tool (requires audit logger from security gate)
+    if security_gate and hasattr(security_gate, '_audit') and security_gate._audit:
+        registry.register(AuditQueryTool(security_gate._audit))
 
     # Optional tools — don't fail if deps missing
     try:
@@ -264,13 +275,30 @@ def create_divergence_detector(config: dict[str, Any]):
 
 
 def create_security_gate(security_cfg: dict[str, Any]):
-    """Create the permission checker (Sprint 4)."""
+    """Create the permission checker (Sprint 4 + Sprint 11 audit/exfil)."""
+    from prometheus.permissions.audit import AuditLogger
     from prometheus.permissions.checker import SecurityGate
+    from prometheus.permissions.exfiltration import ExfiltrationDetector
+
+    # Sprint 11: audit logger
+    audit_logger = None
+    audit_cfg = security_cfg.get("audit", {})
+    if audit_cfg.get("enabled", True):
+        audit_logger = AuditLogger(get_data_dir() / "security")
+
+    # Sprint 11: exfiltration detector
+    exfil_detector = None
+    exfil_cfg = security_cfg.get("exfiltration", {})
+    if exfil_cfg.get("enabled", True):
+        exfil_detector = ExfiltrationDetector()
+
     return SecurityGate(
         mode=security_cfg.get("permission_mode", "default"),
         workspace_root=security_cfg.get("workspace_root"),
         denied_commands=security_cfg.get("denied_commands"),
         denied_paths=security_cfg.get("denied_paths"),
+        audit_logger=audit_logger,
+        exfiltration_detector=exfil_detector,
     )
 
 
@@ -512,9 +540,9 @@ def main() -> None:
         )
         model_cfg["model"] = model_name
 
-    registry = create_tool_registry(security_cfg)
-    adapter = create_adapter(model_cfg)
     security_gate = create_security_gate(security_cfg)
+    registry = create_tool_registry(security_cfg, security_gate=security_gate)
+    adapter = create_adapter(model_cfg)
     lcm_engine = create_lcm_engine(provider)
     system_prompt = build_system_prompt(config)
 

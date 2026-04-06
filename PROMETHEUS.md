@@ -11,7 +11,7 @@ prometheus/
   adapter/      Model Adapter Layer + Model Router (Sprint 3, 10)
   tools/        Tool registry + builtin tools (Sprint 2)
   hooks/        PreToolUse / PostToolUse hooks (Sprint 2)
-  permissions/  Security gate (Sprint 4)
+  permissions/  Security gate + audit + exfiltration detection (Sprint 4, 11)
   context/      Context management + compression (Sprint 4)
   providers/    ModelProvider ABC + StubProvider (Sprint 1) ✓
   gateway/      Telegram / messaging interface (Sprint 6)
@@ -22,7 +22,7 @@ prometheus/
   coordinator/  Multi-agent coordination + divergence detection (Sprint 8, 10) ✓
   benchmarks/   Benchmark suite + runner (Sprint 8) ✓
   telemetry/    Tool call tracking (Sprint 3)
-  config/       Settings + path management ✓
+  config/       Settings + path management + env var overrides (Sprint 11) ✓
 ```
 
 ## Key Conventions
@@ -770,6 +770,9 @@ messages = compressor.maybe_compress(messages)
 - [x] Sprint 6: Gateway (Telegram) + Cron + Daemon
 - [ ] Sprint 7: Learning loop + LCM
 - [ ] Sprint 8: Multi-agent + benchmarks
+- [x] Sprint 9: SENTINEL — Proactive Daemon + AutoDream
+- [x] Sprint 10: Model Router + Divergence Detector
+- [x] Sprint 11: Security Hardening — env overrides, audit logging, exfiltration detection
 
 ---
 
@@ -2165,4 +2168,147 @@ config/
 tests/
   test_router.py             — 16 tests (classifier accuracy, routing rules, fallback chain)
   test_divergence.py         — 23 tests (goal extraction, alignment, checkpoint CRUD, rollback)
+```
+
+---
+
+## Sprint 11: Security Hardening ✓
+
+### `prometheus.config.env_override`
+`src/prometheus/config/env_override.py` — env var overrides + secret file loading (OpenClaw `secret-file.ts` pattern)
+
+```python
+# Env var → config path mapping (17 supported vars)
+ENV_OVERRIDES: dict[str, tuple[str, ...]]     # e.g. "PROMETHEUS_TELEGRAM_TOKEN" → ("gateway", "telegram_token")
+SECRET_FILE_VARS: dict[str, tuple[str, ...]]  # e.g. "PROMETHEUS_TELEGRAM_TOKEN_FILE" → ("gateway", "telegram_token")
+
+def read_secret_file(file_path: str, label: str, max_bytes: int = 16384) -> str | None
+    # Rejects symlinks (checked before resolve()), enforces size limit, strips whitespace
+
+def apply_env_overrides(config: dict) -> dict
+    # Applies secret files first, then direct env vars (higher priority). Mutates + returns config.
+```
+
+### `prometheus.permissions.audit`
+`src/prometheus/permissions/audit.py` — dual-write audit logger (SQLite + JSONL)
+
+```python
+class AuditDecision(Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    CONFIRM_PENDING = "confirm_pending"
+    CONFIRM_APPROVED = "confirm_approved"
+    CONFIRM_REJECTED = "confirm_rejected"
+
+@dataclass
+class AuditEntry:
+    timestamp: float
+    tool_name: str
+    decision: AuditDecision
+    trust_level: int
+    reason: str
+    tool_input_summary: str             # redacted + truncated
+    user_id: str | None
+    session_id: str | None
+    def to_dict() -> dict
+    def to_json() -> str
+
+class AuditLogger:
+    def __init__(data_dir: Path, max_input_chars: int = 200)
+        # Creates data_dir/audit.db (SQLite) + data_dir/permission_audit.jsonl
+
+    def log(tool_name: str, decision: AuditDecision, trust_level: int, reason: str,
+            tool_input: dict | str | None = None, user_id: str | None = None,
+            session_id: str | None = None) -> AuditEntry
+        # Writes to JSONL + SQLite + standard logger. Redacts tokens/keys in tool_input.
+
+    def query_recent(limit: int = 50, decision: AuditDecision | None = None,
+                     tool_name: str | None = None) -> list[AuditEntry]
+
+    def stats(hours: int = 24) -> dict[str, int]    # {"allow": 42, "deny": 3}
+```
+
+### `prometheus.permissions.exfiltration`
+`src/prometheus/permissions/exfiltration.py` — secret exfiltration pattern matcher
+
+```python
+@dataclass
+class ExfiltrationMatch:
+    pattern_name: str               # "network_sensitive_file", "subshell_exfil", etc.
+    matched_text: str
+    severity: str                   # "critical", "high", "medium"
+    reason: str
+
+class ExfiltrationDetector:
+    SENSITIVE_PATHS: list[str]      # ~/.ssh/, ~/.aws/, .env, id_rsa, prometheus.yaml, etc.
+    NETWORK_COMMANDS: list[str]     # curl, wget, nc, scp, rsync, etc.
+    SECRET_ENV_PATTERNS: list[str]  # $*KEY, $*TOKEN, $*SECRET, $ANTHROPIC*, etc.
+
+    def check_command(command: str) -> ExfiltrationMatch | None
+        # Detects: network+sensitive_path, network+secret_env, subshell exfil,
+        #          pipe exfil, base64 exfil, redirect exfil
+
+    def check_url(url: str) -> ExfiltrationMatch | None
+        # Detects secret env var patterns embedded in URLs
+```
+
+### `prometheus.tools.builtin.audit_query`
+`src/prometheus/tools/builtin/audit_query.py` — in-agent audit inspection
+
+```python
+class AuditQueryTool(BaseTool):
+    name = "audit_query"
+    input_model = AuditQueryInput    # limit: int, decision: str, tool: str | None
+
+    def __init__(audit_logger: AuditLogger)
+    async def execute(arguments, context) -> ToolResult
+    def is_read_only(arguments) -> True
+```
+
+### Wiring into Existing Modules
+
+| Module | Integration |
+|--------|-------------|
+| `permissions/checker.py:SecurityGate.__init__()` | Added optional `audit_logger: AuditLogger` and `exfiltration_detector: ExfiltrationDetector` params |
+| `permissions/checker.py:SecurityGate.evaluate()` | Exfiltration check runs first (before all other checks, including AUTONOMOUS bypass). Every decision logged via `_audit_log()` helper. |
+| `permissions/checker.py:SecurityGate.from_config()` | Reads `security.audit.enabled` and `security.exfiltration.enabled` from YAML to optionally create logger + detector |
+| `__main__.py:load_config()` | Now calls `apply_env_overrides(config)` after YAML load |
+| `__main__.py:create_security_gate()` | Creates `AuditLogger` + `ExfiltrationDetector` and passes to `SecurityGate` |
+| `__main__.py:create_tool_registry()` | Accepts optional `security_gate` kwarg; registers `AuditQueryTool` if audit logger is available |
+| `__main__.py:main()` | Build order changed: `security_gate` created before `registry` so audit tool can be wired |
+| `permissions/__init__.py` | Exports `AuditDecision`, `AuditEntry`, `AuditLogger`, `ExfiltrationDetector`, `ExfiltrationMatch` |
+| `tools/builtin/__init__.py` | Exports `AuditQueryTool` |
+| `config/prometheus.yaml` | Telegram token blanked (use env var). Added `security.audit` and `security.exfiltration` sections. |
+
+### Config Schema
+`config/prometheus.yaml` — new keys under `security:`
+
+```yaml
+security:
+  audit:
+    enabled: true               # write to ~/.prometheus/data/security/audit.db + .jsonl
+    retention_days: 30
+  exfiltration:
+    enabled: true               # block network commands touching sensitive paths/env vars
+```
+
+### File Tree
+
+```
+config/
+  env_override.py              — apply_env_overrides(), read_secret_file()
+permissions/
+  audit.py                     — AuditLogger, AuditDecision, AuditEntry
+  exfiltration.py              — ExfiltrationDetector, ExfiltrationMatch
+  checker.py                   — SecurityGate updated (audit + exfil params)
+  __init__.py                  — exports updated
+tools/builtin/
+  audit_query.py               — AuditQueryTool
+  __init__.py                  — exports updated
+__main__.py                    — load_config env overrides, create_security_gate audit/exfil, registry wiring
+config/prometheus.yaml         — token blanked, audit + exfiltration sections added
+tests/
+  test_config_env.py           — 13 tests (env overrides, secret file loading, symlink rejection)
+  test_exfiltration.py         — 18 tests (block patterns + allow patterns + URL check)
+  test_audit.py                — 16 tests (JSONL/SQLite write, query, redaction, gate integration)
 ```

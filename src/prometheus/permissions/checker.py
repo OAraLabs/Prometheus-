@@ -1,6 +1,7 @@
 """SecurityGate — permission checker wired into AgentLoop as permission_checker.
 
 Sprint 4: implements the 4-level trust model from prometheus.yaml security config.
+Sprint 11: adds audit logging + exfiltration detection.
 Integrates with the permission_checker slot in LoopContext (agent_loop.py:63).
 """
 
@@ -13,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from prometheus.permissions.audit import AuditDecision, AuditLogger
+from prometheus.permissions.exfiltration import ExfiltrationDetector
 from prometheus.permissions.modes import PermissionMode, TrustLevel
 
 log = logging.getLogger(__name__)
@@ -123,6 +126,8 @@ class SecurityGate:
         denied_paths: list[str] | None = None,
         workspace_root: str | Path | None = None,
         mode: PermissionMode | str = PermissionMode.DEFAULT,
+        audit_logger: AuditLogger | None = None,
+        exfiltration_detector: ExfiltrationDetector | None = None,
     ) -> None:
         self._denied_commands: list[str] = denied_commands or []
         self._denied_paths: list[str] = [
@@ -130,6 +135,10 @@ class SecurityGate:
         ]
         self._workspace = Path(workspace_root).expanduser().resolve() if workspace_root else None
         self._mode = PermissionMode(mode) if isinstance(mode, str) else mode
+
+        # Sprint 11: optional audit + exfiltration
+        self._audit = audit_logger
+        self._exfil = exfiltration_detector
 
         # Compile blocked patterns once
         self._blocked_re = [re.compile(p) for p in _ALWAYS_BLOCKED_PATTERNS]
@@ -155,12 +164,56 @@ class SecurityGate:
         except (OSError, Exception):
             sec = {}
 
+        # Sprint 11: optionally create audit logger + exfiltration detector
+        audit_logger = None
+        exfil_detector = None
+        audit_cfg = sec.get("audit", {})
+        if audit_cfg.get("enabled", True):
+            from prometheus.config.paths import get_data_dir
+            audit_logger = AuditLogger(get_data_dir() / "security")
+
+        exfil_cfg = sec.get("exfiltration", {})
+        if exfil_cfg.get("enabled", True):
+            exfil_detector = ExfiltrationDetector()
+
         return cls(
             denied_commands=sec.get("denied_commands") or [],
             denied_paths=sec.get("denied_paths") or [],
             workspace_root=sec.get("workspace_root"),
             mode=sec.get("permission_mode", "default"),
+            audit_logger=audit_logger,
+            exfiltration_detector=exfil_detector,
         )
+
+    # ------------------------------------------------------------------
+    # Audit helper
+    # ------------------------------------------------------------------
+
+    def _audit_log(
+        self,
+        tool_name: str,
+        decision: AuditDecision,
+        reason: str,
+        tool_input: dict | str | None = None,
+    ) -> None:
+        """Write to audit log if an AuditLogger is attached."""
+        if self._audit is None:
+            return
+        trust_val = self._mode_trust_level()
+        self._audit.log(
+            tool_name=tool_name,
+            decision=decision,
+            trust_level=trust_val,
+            reason=reason,
+            tool_input=tool_input,
+        )
+
+    def _mode_trust_level(self) -> int:
+        if self._mode == PermissionMode.AUTONOMOUS:
+            return TrustLevel.AUTONOMOUS
+        if self._mode == PermissionMode.STRICT:
+            return TrustLevel.APPROVE
+        return TrustLevel.AUTO
 
     # ------------------------------------------------------------------
     # Public interface — used by agent_loop.py permission_checker slot
@@ -178,47 +231,59 @@ class SecurityGate:
 
         Called by agent_loop._execute_tool_call() with keyword args.
         """
+        # Sprint 11: exfiltration check (runs in every mode, even AUTONOMOUS)
+        if self._exfil and tool_name == "bash" and command:
+            exfil_match = self._exfil.check_command(command)
+            if exfil_match:
+                reason = f"Exfiltration blocked: {exfil_match.reason}"
+                self._audit_log(tool_name, AuditDecision.DENY, reason, command)
+                return PermissionDecision.deny(reason)
+
         # AUTONOMOUS mode: allow everything except always-blocked patterns
         if self._mode == PermissionMode.AUTONOMOUS:
             if command and self._is_always_blocked(command):
-                return PermissionDecision.deny(
-                    f"Blocked command pattern: {command!r}"
-                )
+                reason = f"Blocked command pattern: {command!r}"
+                self._audit_log(tool_name, AuditDecision.DENY, reason, command)
+                return PermissionDecision.deny(reason)
+            self._audit_log(tool_name, AuditDecision.ALLOW, "Auto-allowed (autonomous)")
             return PermissionDecision.allow(level=TrustLevel.AUTONOMOUS)
 
         # --- LEVEL 0: check always-blocked patterns ---
         if command:
             reason = self._check_blocked_command(command)
             if reason:
+                self._audit_log(tool_name, AuditDecision.DENY, reason, command)
                 return PermissionDecision.deny(reason)
 
         # --- Check denied_paths ---
         if file_path:
             reason = self._check_denied_path(file_path)
             if reason:
+                self._audit_log(tool_name, AuditDecision.DENY, reason, file_path)
                 return PermissionDecision.deny(reason)
 
         # --- LEVEL 1: write_file / edit_file outside workspace → APPROVE ---
         if tool_name in _APPROVE_TOOLS:
             if self._mode == PermissionMode.STRICT:
-                return PermissionDecision.approve(
-                    f"{tool_name} requires confirmation in strict mode"
-                )
+                reason = f"{tool_name} requires confirmation in strict mode"
+                self._audit_log(tool_name, AuditDecision.CONFIRM_PENDING, reason)
+                return PermissionDecision.approve(reason)
             if file_path and not self._within_workspace(file_path):
-                return PermissionDecision.approve(
-                    f"{tool_name} targets path outside workspace: {file_path}"
-                )
+                reason = f"{tool_name} targets path outside workspace: {file_path}"
+                self._audit_log(tool_name, AuditDecision.CONFIRM_PENDING, reason)
+                return PermissionDecision.approve(reason)
 
         # --- LEVEL 1: bash with network/push commands → APPROVE ---
         if tool_name == "bash" and command:
             if self._is_approve_pattern(command):
                 if self._mode != PermissionMode.AUTONOMOUS:
-                    return PermissionDecision.approve(
-                        f"Command requires approval: {command!r}"
-                    )
+                    reason = f"Command requires approval: {command!r}"
+                    self._audit_log(tool_name, AuditDecision.CONFIRM_PENDING, reason, command)
+                    return PermissionDecision.approve(reason)
 
         # --- LEVEL 2 / 3: allow ---
         level = TrustLevel.AUTO if not is_read_only else TrustLevel.AUTO
+        self._audit_log(tool_name, AuditDecision.ALLOW, "Auto-allowed")
         return PermissionDecision.allow(level=level)
 
     # ------------------------------------------------------------------
