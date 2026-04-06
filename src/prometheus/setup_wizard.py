@@ -62,6 +62,10 @@ class SetupWizard:
         self._telegram_token: str = ""
         self._telegram_chat_ids: list[int] = []
         self._telegram_bot_name: str = ""
+        self._slack_bot_token: str = ""
+        self._slack_app_token: str = ""
+        self._slack_channels: list[str] = []
+        self._slack_workspace: str = ""
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -263,32 +267,45 @@ Run this wizard again after your model is running:
             "How do you want to talk to Prometheus?",
             [
                 "Telegram",
-                "Slack (coming soon)",
+                "Slack",
+                "Both (Telegram + Slack)",
                 "CLI only (no messaging gateway)",
             ],
-            default=3,
+            default=4,
         )
 
-        if choice == 2:
-            print(
-                "\nSlack support is coming soon. Choose Telegram or CLI for now."
-            )
-            return self._step_gateway()
-
-        if choice == 3:
+        if choice == 4:
             self._gateway = "cli"
             print(
-                "\n  Got it — CLI mode. Add Telegram later with:"
+                "\n  Got it — CLI mode. Add a gateway later with:"
                 "\n    python3 -m prometheus --setup --gateway-only"
             )
             return
 
-        # Telegram flow
-        self._gateway = "telegram"
+        if choice in (1, 3):
+            self._setup_telegram()
+
+        if choice in (2, 3):
+            self._setup_slack()
+
+        # Determine gateway value
+        has_tg = bool(self._telegram_token)
+        has_slack = bool(self._slack_bot_token and self._slack_app_token)
+        if has_tg and has_slack:
+            self._gateway = "both"
+        elif has_tg:
+            self._gateway = "telegram"
+        elif has_slack:
+            self._gateway = "slack"
+        else:
+            self._gateway = "cli"
+            print("\n  No gateway configured. Running in CLI mode.")
+
+    def _setup_telegram(self) -> None:
+        """Collect and validate Telegram bot token."""
         token = _input("\nEnter your Telegram bot token (from @BotFather)")
         if not token:
-            print("  No token provided. Falling back to CLI mode.")
-            self._gateway = "cli"
+            print("  No token provided. Skipping Telegram.")
             return
 
         print("  Testing token...")
@@ -303,8 +320,7 @@ Run this wizard again after your model is running:
             if keep.lower() == "y":
                 self._telegram_token = token
             else:
-                print("  Falling back to CLI mode.")
-                self._gateway = "cli"
+                print("  Skipping Telegram.")
                 return
 
         # Optional: restrict to chat ID
@@ -319,6 +335,72 @@ Run this wizard again after your model is running:
                 self._telegram_chat_ids = [int(chat_id_str)]
             except ValueError:
                 print("  Invalid chat ID, skipping restriction.")
+
+    def _setup_slack(self) -> None:
+        """Collect and validate Slack bot + app tokens."""
+        print(
+            "\n  Slack setup requires two tokens from https://api.slack.com/apps"
+            "\n"
+            "\n  1. Create a new Slack App (From Scratch)"
+            "\n  2. Add Bot Token Scopes: chat:write, app_mentions:read,"
+            "\n     im:history, im:read, im:write, channels:history, commands"
+            "\n  3. Enable Socket Mode (Settings > Socket Mode > Enable)"
+            "\n  4. Install App to your workspace"
+            "\n  5. Copy both tokens:"
+        )
+        bot_token = _input("\nBot Token (xoxb-...)")
+        if not bot_token:
+            print("  No bot token provided. Skipping Slack.")
+            return
+
+        app_token = _input("App Token (xapp-...)")
+        if not app_token:
+            print("  No app token provided. Skipping Slack.")
+            return
+
+        print("  Testing connection...")
+        workspace = self._test_slack_token(bot_token)
+        if workspace:
+            print(f"  + Connected to workspace: {workspace}")
+            self._slack_bot_token = bot_token
+            self._slack_app_token = app_token
+            self._slack_workspace = workspace
+        else:
+            print("  x Invalid token or could not reach Slack API.")
+            keep = _input("Save these tokens anyway? [y/N]", "N")
+            if keep.lower() == "y":
+                self._slack_bot_token = bot_token
+                self._slack_app_token = app_token
+            else:
+                print("  Skipping Slack.")
+                return
+
+        # Optional: restrict to channels
+        print(
+            "\n  Optional: Restrict to specific channels?"
+            "\n  Enter channel IDs separated by commas, or leave blank for all."
+        )
+        channels_str = _input("Channels", "")
+        if channels_str:
+            self._slack_channels = [
+                c.strip() for c in channels_str.split(",") if c.strip()
+            ]
+
+    def _test_slack_token(self, bot_token: str) -> str | None:
+        """Test a Slack bot token via auth.test. Returns workspace name or None."""
+        try:
+            resp = httpx.post(
+                "https://slack.com/api/auth.test",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("ok"):
+                return data.get("team", "")
+        except Exception:
+            pass
+        return None
 
     def _test_telegram_token(self, token: str) -> str | None:
         """Test a Telegram bot token via getMe. Returns bot username or None."""
@@ -387,12 +469,23 @@ Run this wizard again after your model is running:
                 model["model"] = self._model_name
 
         gateway = cfg.setdefault("gateway", {})
-        if self._gateway == "telegram":
+
+        # Telegram
+        if self._gateway in ("telegram", "both"):
             gateway["telegram_enabled"] = True
             gateway["telegram_token"] = self._telegram_token
             gateway["allowed_chat_ids"] = self._telegram_chat_ids
         elif self._gateway == "cli":
             gateway["telegram_enabled"] = False
+
+        # Slack
+        if self._gateway in ("slack", "both"):
+            gateway["slack_enabled"] = True
+            gateway["slack_bot_token"] = self._slack_bot_token
+            gateway["slack_app_token"] = self._slack_app_token
+            gateway["slack_channels"] = self._slack_channels
+        elif self._gateway == "cli":
+            gateway["slack_enabled"] = False
 
     def _save_config(self, cfg: dict[str, Any]) -> None:
         """Write config dict to YAML file and update .gitignore."""
@@ -406,11 +499,18 @@ Run this wizard again after your model is running:
         print(f"  + Model provider: {model.get('provider', '?')} @ {model.get('base_url', '?')}")
         if model.get("model"):
             print(f"  + Detected model: {model['model']}")
+        gateways_active: list[str] = []
         if gw.get("telegram_enabled"):
             token = gw.get("telegram_token", "")
             masked = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
-            print(f"  + Gateway: telegram (token: {masked})")
-        else:
+            print(f"  + Gateway: Telegram (token: {masked})")
+            gateways_active.append("telegram")
+        if gw.get("slack_enabled"):
+            token = gw.get("slack_bot_token", "")
+            masked = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "****"
+            print(f"  + Gateway: Slack (bot token: {masked})")
+            gateways_active.append("slack")
+        if not gateways_active:
             print("  + Gateway: CLI only")
         print("  + Config saved")
 
@@ -497,12 +597,23 @@ Run this wizard again after your model is running:
         print("=" * 55)
         print()
         print(f"  Model:    {model_display} via {provider_display}")
-        if self._gateway == "telegram" and self._telegram_bot_name:
-            print(f"  Gateway:  Telegram (@{self._telegram_bot_name})")
-        elif self._gateway == "telegram":
-            print("  Gateway:  Telegram")
-        else:
-            print("  Gateway:  CLI only")
+
+        # Gateway summary
+        gw_parts: list[str] = []
+        if self._gateway in ("telegram", "both"):
+            if self._telegram_bot_name:
+                gw_parts.append(f"Telegram (@{self._telegram_bot_name})")
+            else:
+                gw_parts.append("Telegram")
+        if self._gateway in ("slack", "both"):
+            if self._slack_workspace:
+                gw_parts.append(f"Slack ({self._slack_workspace})")
+            else:
+                gw_parts.append("Slack")
+        if not gw_parts:
+            gw_parts.append("CLI only")
+        print(f"  Gateway:  {' + '.join(gw_parts)}")
+
         print(f"  Config:   {_REPO_CONFIG}")
         print(f"  Data:     {get_config_dir()}")
         print()
@@ -511,9 +622,12 @@ Run this wizard again after your model is running:
         print("  Interactive:  python3 -m prometheus")
         print('  One-shot:     python3 -m prometheus --once "your question"')
         print(f"  Daemon:       python3 scripts/daemon.py --config {_REPO_CONFIG}")
-        if self._gateway == "telegram" and self._telegram_bot_name:
+        if self._gateway in ("telegram", "both") and self._telegram_bot_name:
             print()
             print(f"Send /start to @{self._telegram_bot_name} to begin.")
+        if self._gateway in ("slack", "both"):
+            print()
+            print("Mention @prometheus in a Slack channel to chat.")
         print()
         print("=" * 55)
 
@@ -556,9 +670,20 @@ Run this wizard again after your model is running:
         self._model_name = model.get("model", "")
 
         gw = cfg.get("gateway", {})
-        if gw.get("telegram_enabled"):
+        has_tg = gw.get("telegram_enabled", False)
+        has_slack = gw.get("slack_enabled", False)
+
+        if has_tg and has_slack:
+            self._gateway = "both"
+        elif has_tg:
             self._gateway = "telegram"
-            self._telegram_token = gw.get("telegram_token", "")
-            self._telegram_chat_ids = gw.get("allowed_chat_ids", [])
+        elif has_slack:
+            self._gateway = "slack"
         else:
             self._gateway = "cli"
+
+        self._telegram_token = gw.get("telegram_token", "")
+        self._telegram_chat_ids = gw.get("allowed_chat_ids", [])
+        self._slack_bot_token = gw.get("slack_bot_token", "")
+        self._slack_app_token = gw.get("slack_app_token", "")
+        self._slack_channels = gw.get("slack_channels", [])

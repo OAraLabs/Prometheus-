@@ -1,4 +1,4 @@
-"""Gateway package — Telegram adapter, cron, heartbeat, archive (Sprint 6)."""
+"""Gateway package — Telegram, Slack adapters, cron, heartbeat, archive."""
 
 from prometheus.gateway.archive_writer import ArchiveWriter
 from prometheus.gateway.config import Platform, PlatformConfig
@@ -18,6 +18,12 @@ from prometheus.gateway.platform_base import (
 )
 from prometheus.gateway.telegram import TelegramAdapter
 
+# Slack adapter is optional — requires slack-bolt
+try:
+    from prometheus.gateway.slack import SlackAdapter
+except ImportError:
+    SlackAdapter = None  # type: ignore[assignment,misc]
+
 __all__ = [
     "ArchiveWriter",
     "BasePlatformAdapter",
@@ -27,6 +33,7 @@ __all__ = [
     "Platform",
     "PlatformConfig",
     "SendResult",
+    "SlackAdapter",
     "TelegramAdapter",
     "delete_cron_job",
     "load_cron_jobs",

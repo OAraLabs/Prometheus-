@@ -14,6 +14,7 @@ class Platform(str, Enum):
     """Supported messaging platforms."""
 
     TELEGRAM = "telegram"
+    SLACK = "slack"
     CLI = "cli"
     API = "api"
 
@@ -24,8 +25,10 @@ class PlatformConfig:
 
     platform: Platform
     token: str = ""
+    app_token: str = ""  # Slack Socket Mode app token (xapp-...)
     webhook_url: str | None = None
     allowed_chat_ids: list[int] = field(default_factory=list)
+    allowed_channels: list[str] = field(default_factory=list)  # Slack channel whitelist
     proxy_url: str | None = None
     max_message_length: int = 4096
     parse_mode: str = "MarkdownV2"
@@ -44,3 +47,9 @@ class PlatformConfig:
         if not self.allowed_chat_ids:
             return True
         return chat_id in self.allowed_chat_ids
+
+    def channel_allowed(self, channel_id: str) -> bool:
+        """Return True if the Slack channel is permitted (or no restrictions set)."""
+        if not self.allowed_channels:
+            return True
+        return channel_id in self.allowed_channels

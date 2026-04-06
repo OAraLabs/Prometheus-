@@ -165,6 +165,43 @@ async def run_daemon(args: argparse.Namespace) -> None:
         archive.archive_event("telegram_started")
         logger.info("Telegram adapter started")
 
+    # Slack adapter
+    slack_adapter = None
+    slack_bot_token = gateway_config.get("slack_bot_token", "") or os.environ.get("PROMETHEUS_SLACK_BOT_TOKEN", "")
+    slack_app_token = gateway_config.get("slack_app_token", "") or os.environ.get("PROMETHEUS_SLACK_APP_TOKEN", "")
+    if slack_bot_token and slack_app_token and gateway_config.get("slack_enabled", False):
+        try:
+            from prometheus.gateway.slack import SlackAdapter
+            slack_config = PlatformConfig(
+                platform=Platform.SLACK,
+                token=slack_bot_token,
+                app_token=slack_app_token,
+                allowed_channels=gateway_config.get("slack_channels", []),
+            )
+            if "system_prompt" not in dir():
+                from prometheus.context.prompt_assembler import build_runtime_system_prompt
+                system_prompt = build_runtime_system_prompt(
+                    cwd=str(Path.cwd()), config=config,
+                )
+            slack_adapter = SlackAdapter(
+                config=slack_config,
+                agent_loop=agent_loop,
+                tool_registry=registry,
+                system_prompt=system_prompt,
+                model_name=model_name,
+                model_provider=model_config.get("provider", "llama_cpp"),
+            )
+            await slack_adapter.start()
+            archive.archive_event("slack_started")
+            logger.info("Slack adapter started (Socket Mode)")
+        except ImportError:
+            logger.warning(
+                "Slack is enabled but slack-bolt is not installed. "
+                "Install with: pip install 'prometheus[slack]'"
+            )
+        except Exception as exc:
+            logger.error("Failed to start Slack adapter: %s", exc)
+
     # Heartbeat
     heartbeat = Heartbeat(gateway=telegram)
     heartbeat_task = asyncio.create_task(heartbeat.run_forever())
@@ -315,6 +352,9 @@ async def run_daemon(args: argparse.Namespace) -> None:
 
     if telegram:
         await telegram.stop()
+
+    if slack_adapter:
+        await slack_adapter.stop()
 
     heartbeat.stop()
 
