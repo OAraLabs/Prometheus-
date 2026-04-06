@@ -43,7 +43,7 @@ infrastructure:
 
 gateway:
   telegram_enabled: true
-  telegram_token: ""                # set via PROMETHEUS_TELEGRAM_TOKEN env var
+  telegram_token: "8685394349:AAGOa7iDEPx8Su6y0CRS6ahKPXM7fpva5QE"
   allowed_chat_ids: []              # empty = allow all; set to restrict
   proxy_url: null                   # optional SOCKS5/HTTP proxy for Telegram
   system_prompt: "You are Prometheus, a sovereign AI agent. You have access to tools for file operations, shell commands, and cron job management. Be concise and helpful."
