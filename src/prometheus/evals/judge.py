@@ -280,38 +280,51 @@ Example ending: SCORE: 0.85"""
     def _parse_verdict(self, raw: str) -> JudgeVerdict:
         """Parse the judge's JSON response into a JudgeVerdict.
 
-        With constrained decoding, the response is guaranteed valid JSON
-        matching JUDGE_SCORE_SCHEMA. Direct json.loads() is the primary
-        path. Substring extraction is kept as fallback for unconstrained calls.
+        Layered parsing for maximum compatibility:
+        1. Direct json.loads — works when grammar-constrained (llama.cpp)
+        2. Strip markdown fences — handles ```json ... ``` wrapping (Ollama)
+        3. Extract {…} substring — handles preamble/postamble text
+        4. Regex fallback — last resort score extraction
         """
         if not raw or not raw.strip():
             log.warning("Empty judge response")
             return JudgeVerdict(score=0.0, reasoning="Empty response", raw_response=raw)
 
+        # 1. Direct parse (constrained decoding gives clean JSON)
         try:
-            # Primary: direct parse (works when grammar-constrained)
             parsed = json.loads(raw)
-            return JudgeVerdict(
-                score=max(0.0, min(1.0, float(parsed.get("score", 0.0)))),
-                reasoning=str(parsed.get("reasoning", "")),
-                raw_response=raw,
-            )
+            return self._verdict_from_dict(parsed, raw)
         except json.JSONDecodeError:
             pass
 
+        # 2. Strip markdown fences (Ollama, other servers)
+        stripped = re.sub(r"```(?:json)?\s*\n?", "", raw).strip()
+        if stripped != raw.strip():
+            try:
+                parsed = json.loads(stripped)
+                return self._verdict_from_dict(parsed, raw)
+            except json.JSONDecodeError:
+                pass
+
+        # 3. Extract {…} JSON substring (preamble text before JSON)
         try:
-            # Fallback: extract JSON substring (for unconstrained calls)
             start = raw.index("{")
             end = raw.rindex("}") + 1
             parsed = json.loads(raw[start:end])
-            return JudgeVerdict(
-                score=max(0.0, min(1.0, float(parsed.get("score", 0.0)))),
-                reasoning=str(parsed.get("reasoning", "")),
-                raw_response=raw,
-            )
+            return self._verdict_from_dict(parsed, raw)
         except (json.JSONDecodeError, ValueError, KeyError):
-            log.warning("Could not parse judge response as JSON: %s", raw[:200])
-            return self._fallback_parse(raw)
+            pass
+
+        log.warning("Could not parse judge response as JSON: %s", raw[:200])
+        return self._fallback_parse(raw)
+
+    def _verdict_from_dict(self, parsed: dict, raw: str) -> JudgeVerdict:
+        """Build a JudgeVerdict from a parsed dict, clamping score."""
+        return JudgeVerdict(
+            score=max(0.0, min(1.0, float(parsed.get("score", 0.0)))),
+            reasoning=str(parsed.get("reasoning", "")),
+            raw_response=raw,
+        )
 
     def _parse_geval_verdict(self, raw: str) -> JudgeVerdict:
         """Parse G-Eval chain-of-thought response.

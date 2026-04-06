@@ -424,6 +424,31 @@ class TestConstrainedDecoding:
         verdict = judge._parse_verdict("")
         assert verdict.score == 0.0
 
+    def test_parse_verdict_markdown_fences(self):
+        """Should strip markdown fences wrapping JSON (Ollama pattern)."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict(
+            '```json\n{"score": 0.75, "reasoning": "mostly done"}\n```'
+        )
+        assert verdict.score == 0.75
+        assert verdict.reasoning == "mostly done"
+
+    def test_parse_verdict_markdown_fences_no_lang(self):
+        """Should strip bare ``` fences too."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict(
+            '```\n{"score": 0.6, "reasoning": "partial"}\n```'
+        )
+        assert verdict.score == 0.6
+
+    def test_parse_verdict_preamble_text(self):
+        """Should extract JSON from text with preamble."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict(
+            'Here is my evaluation:\n{"score": 0.9, "reasoning": "great work"}'
+        )
+        assert verdict.score == 0.9
+
 
 # ---------------------------------------------------------------------------
 # ToolUsageMetric
