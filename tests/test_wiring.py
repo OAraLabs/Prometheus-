@@ -1124,3 +1124,282 @@ class TestSprint15cCredentialPool:
         assert pool.get_next() == "key-c"
         assert pool.get_next() == "key-a"  # key-b skipped
         assert pool.active_count == 2
+
+
+# ===========================================================================
+# Sprint 16 GRAFT-THREAD: Gateway-Agnostic Conversation Memory
+# ===========================================================================
+
+
+class TestSprint16SessionManager:
+    """Verify SessionManager stores per-chat state and isolates sessions."""
+
+    def test_session_persists_messages(self):
+        from prometheus.engine.session import SessionManager
+
+        sm = SessionManager()
+        session = sm.get_or_create("telegram:100")
+        session.add_user_message("hello")
+        session.add_user_message("world")
+
+        # Same key returns the same populated session
+        same = sm.get_or_create("telegram:100")
+        assert len(same.get_messages()) == 2
+        assert same.get_messages()[0].text == "hello"
+
+    def test_cross_platform_isolation(self):
+        from prometheus.engine.session import SessionManager
+
+        sm = SessionManager()
+        tg = sm.get_or_create("telegram:42")
+        sl = sm.get_or_create("slack:42")
+        tg.add_user_message("from telegram")
+
+        assert len(sl.get_messages()) == 0
+        assert len(tg.get_messages()) == 1
+
+    def test_clear_preserves_object_resets_history(self):
+        from prometheus.engine.session import SessionManager
+
+        sm = SessionManager()
+        session = sm.get_or_create("test:1")
+        session.add_user_message("data")
+        sm.clear("test:1")
+
+        assert len(session.get_messages()) == 0
+        # Same object after clear
+        assert sm.get_or_create("test:1") is session
+
+    def test_trim_enforces_limit(self):
+        from prometheus.engine.session import ChatSession
+
+        s = ChatSession("trim:1")
+        for i in range(60):
+            s.add_user_message(f"msg-{i}")
+        s.trim(50)
+        assert len(s.get_messages()) == 50
+        assert s.get_messages()[0].text == "msg-10"
+
+
+class TestSprint16AgentLoopMessages:
+    """Verify AgentLoop.run_async() accepts and uses a pre-built messages list."""
+
+    def test_run_async_with_messages_parameter(self, tmp_path):
+        """Pre-built messages list flows through run_loop to the provider."""
+        tel = _tel(tmp_path)
+        registry = _make_registry()
+
+        # Provider sees the full messages list — we verify via call count
+        provider = ScriptedProvider([_text_response("I remember!")])
+
+        loop = AgentLoop(
+            provider=provider,
+            model="test-model",
+            tool_registry=registry,
+            telemetry=tel,
+        )
+
+        # Build a 3-message history
+        history = [
+            ConversationMessage.from_user_text("my name is Will"),
+            ConversationMessage(role="assistant", content=[TextBlock(text="Nice to meet you, Will!")]),
+            ConversationMessage.from_user_text("what is my name?"),
+        ]
+
+        result = loop.run(
+            system_prompt="You are helpful.",
+            messages=history,
+        )
+
+        assert result.text == "I remember!"
+        # The messages list passed to the provider should have all 3 history
+        # messages plus the assistant response appended by run_loop
+        assert len(result.messages) >= 3
+        assert result.messages[0].text == "my name is Will"
+
+    def test_run_async_backward_compat(self, tmp_path):
+        """Existing user_message= string path still works."""
+        tel = _tel(tmp_path)
+        provider = ScriptedProvider([_text_response("hi")])
+        loop = AgentLoop(
+            provider=provider,
+            model="test-model",
+            tool_registry=_make_registry(),
+            telemetry=tel,
+        )
+        result = loop.run(
+            system_prompt="test",
+            user_message="hello",
+        )
+        assert result.text == "hi"
+        assert result.messages[0].text == "hello"
+
+
+class TestSprint16TelegramDispatchWiring:
+    """Verify Telegram adapter dispatches through SessionManager at runtime."""
+
+    def test_dispatch_wires_session_to_agent_loop(self):
+        """Real SessionManager + real AgentLoop — session history flows through."""
+        from prometheus.engine.session import SessionManager
+        from prometheus.gateway.telegram import TelegramAdapter
+        from prometheus.gateway.config import PlatformConfig, Platform
+        from prometheus.gateway.platform_base import MessageEvent, SendResult
+
+        # Two-turn conversation: provider gives different answers each turn
+        provider = ScriptedProvider([
+            _text_response("Nice to meet you!"),
+            _text_response("Your name is Will."),
+        ])
+
+        sm = SessionManager()
+        registry = _make_registry()
+
+        loop = AgentLoop(
+            provider=provider,
+            model="test-model",
+            tool_registry=registry,
+        )
+
+        config = PlatformConfig(platform=Platform.TELEGRAM, token="test")
+        adapter = TelegramAdapter(
+            config=config,
+            agent_loop=loop,
+            tool_registry=registry,
+            session_manager=sm,
+        )
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id=1))
+
+        async def _test():
+            event1 = MessageEvent(
+                chat_id=99, user_id=1, text="my name is Will",
+                message_id=1, platform=Platform.TELEGRAM,
+            )
+            await adapter.on_message(event1)
+
+            event2 = MessageEvent(
+                chat_id=99, user_id=1, text="what is my name?",
+                message_id=2, platform=Platform.TELEGRAM,
+            )
+            await adapter.on_message(event2)
+
+        asyncio.run(_test())
+
+        # Session must have both turns
+        session = sm.get_or_create("telegram:99")
+        texts = [m.text for m in session.get_messages() if m.text]
+        assert "my name is Will" in texts
+        assert "Nice to meet you!" in texts
+        assert "what is my name?" in texts
+        assert "Your name is Will." in texts
+
+        # Provider was called twice
+        assert provider._call_count == 2
+
+    def test_reset_clears_session_via_manager(self):
+        """Real SessionManager — /reset command clears conversation history."""
+        from prometheus.engine.session import SessionManager
+        from prometheus.gateway.telegram import TelegramAdapter
+        from prometheus.gateway.config import PlatformConfig, Platform
+        from prometheus.gateway.platform_base import SendResult
+
+        sm = SessionManager()
+        session = sm.get_or_create("telegram:77")
+        session.add_user_message("remember this")
+
+        config = PlatformConfig(platform=Platform.TELEGRAM, token="test")
+        adapter = TelegramAdapter(
+            config=config,
+            agent_loop=AsyncMock(),
+            tool_registry=_make_registry(),
+            session_manager=sm,
+        )
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id=1))
+
+        update = MagicMock()
+        update.effective_chat = MagicMock()
+        update.effective_chat.id = 77
+
+        asyncio.run(adapter._cmd_reset(update, MagicMock()))
+
+        assert len(session.get_messages()) == 0
+
+
+class TestSprint16SlackDispatchWiring:
+    """Verify Slack adapter dispatches through SessionManager at runtime."""
+
+    def test_dispatch_wires_session_to_agent_loop(self):
+        """Real SessionManager + real AgentLoop — session history flows through Slack."""
+        from prometheus.engine.session import SessionManager
+        from prometheus.gateway.slack import SlackAdapter
+        from prometheus.gateway.config import PlatformConfig, Platform
+
+        provider = ScriptedProvider([
+            _text_response("Got it!"),
+            _text_response("You said hello."),
+        ])
+
+        sm = SessionManager()
+        registry = _make_registry()
+
+        loop = AgentLoop(
+            provider=provider,
+            model="test-model",
+            tool_registry=registry,
+        )
+
+        config = PlatformConfig(
+            platform=Platform.SLACK, token="xoxb-test", app_token="xapp-test",
+        )
+        adapter = SlackAdapter(
+            config=config,
+            agent_loop=loop,
+            tool_registry=registry,
+            session_manager=sm,
+        )
+        adapter._add_reaction = AsyncMock()
+        adapter._remove_reaction = AsyncMock()
+
+        async def _test():
+            say = AsyncMock()
+            await adapter._dispatch_to_agent("C55", "U1", "hello", "ts1", None, say)
+            await adapter._dispatch_to_agent("C55", "U1", "what did I say?", "ts2", None, say)
+
+        asyncio.run(_test())
+
+        session = sm.get_or_create("slack:C55")
+        texts = [m.text for m in session.get_messages() if m.text]
+        assert "hello" in texts
+        assert "Got it!" in texts
+        assert "what did I say?" in texts
+        assert "You said hello." in texts
+        assert provider._call_count == 2
+
+
+class TestSprint16DaemonWiring:
+    """Verify daemon creates one SessionManager shared across adapters."""
+
+    def test_shared_session_manager_in_daemon(self):
+        """Both adapters should receive the same SessionManager instance."""
+        from prometheus.engine.session import SessionManager
+        from prometheus.gateway.telegram import TelegramAdapter
+        from prometheus.gateway.slack import SlackAdapter
+        from prometheus.gateway.config import PlatformConfig, Platform
+
+        sm = SessionManager()
+
+        tg = TelegramAdapter(
+            config=PlatformConfig(platform=Platform.TELEGRAM, token="test"),
+            agent_loop=AsyncMock(),
+            tool_registry=_make_registry(),
+            session_manager=sm,
+        )
+        sl = SlackAdapter(
+            config=PlatformConfig(platform=Platform.SLACK, token="xoxb", app_token="xapp"),
+            agent_loop=AsyncMock(),
+            tool_registry=_make_registry(),
+            session_manager=sm,
+        )
+
+        assert tg.session_manager is sm
+        assert sl.session_manager is sm
+        assert tg.session_manager is sl.session_manager

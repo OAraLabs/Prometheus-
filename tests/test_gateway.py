@@ -239,11 +239,18 @@ class TestTelegramAdapter:
     @pytest.mark.asyncio
     async def test_dispatch_to_agent(self):
         """Test that on_message dispatches to agent_loop.run_async."""
+        from prometheus.engine.messages import ConversationMessage, TextBlock
+
         config = PlatformConfig(platform=Platform.TELEGRAM, token="test")
 
-        # Mock agent loop
+        # Mock agent loop — result must include messages for session tracking
+        user_msg = ConversationMessage.from_user_text("test message")
+        assistant_msg = ConversationMessage(
+            role="assistant", content=[TextBlock(text="Agent response")]
+        )
         mock_result = MagicMock()
         mock_result.text = "Agent response"
+        mock_result.messages = [user_msg, assistant_msg]
         agent_loop = AsyncMock()
         agent_loop.run_async = AsyncMock(return_value=mock_result)
 
@@ -266,7 +273,8 @@ class TestTelegramAdapter:
 
         agent_loop.run_async.assert_called_once()
         call_kwargs = agent_loop.run_async.call_args
-        assert call_kwargs.kwargs.get("user_message") or call_kwargs[1].get("user_message") or "test message" in str(call_kwargs)
+        assert "messages" in call_kwargs.kwargs
+        assert "test message" in str(call_kwargs)
 
         adapter.send.assert_called_once_with(
             123, "Agent response", reply_to=1
@@ -328,9 +336,10 @@ class TestTelegramCommands:
     async def test_cmd_reset(self):
         adapter = _make_adapter()
         key = "telegram:123"
-        adapter._sessions[key] = [{"role": "user", "content": "hi"}]
+        session = adapter.session_manager.get_or_create(key)
+        session.add_user_message("hi")
         await adapter._cmd_reset(_make_update(chat_id=123), MagicMock())
-        assert key not in adapter._sessions
+        assert len(session.get_messages()) == 0
         text = adapter.send.call_args[0][1]
         assert "reset" in text.lower()
 

@@ -26,6 +26,7 @@ from prometheus.gateway.platform_base import (
 
 if TYPE_CHECKING:
     from prometheus.engine.agent_loop import AgentLoop
+    from prometheus.engine.session import SessionManager
     from prometheus.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,7 @@ class SlackAdapter(BasePlatformAdapter):
         system_prompt: str = "You are Prometheus, a helpful AI assistant.",
         model_name: str = "",
         model_provider: str = "",
+        session_manager: SessionManager | None = None,
     ) -> None:
         super().__init__(config)
         self.agent_loop = agent_loop
@@ -161,8 +163,12 @@ class SlackAdapter(BasePlatformAdapter):
         self.model_provider = model_provider
         self._app: Any = None
         self._handler: Any = None
-        self._sessions: dict[str, list[dict[str, Any]]] = {}
         self._start_time: float = 0.0
+
+        if session_manager is None:
+            from prometheus.engine.session import SessionManager as _SM
+            session_manager = _SM()
+        self.session_manager: SessionManager = session_manager
         # Dedup cache: event_ts -> timestamp. Prevents duplicate bot
         # responses when Socket Mode reconnects and redelivers events.
         # Pattern from NousResearch/hermes-agent.
@@ -385,15 +391,23 @@ class SlackAdapter(BasePlatformAdapter):
         # Add eyes reaction to acknowledge receipt
         await self._add_reaction(channel, ts, "eyes")
 
+        session_id = f"slack:{channel}"
+        session = self.session_manager.get_or_create(session_id)
+        session.add_user_message(text)
+        pre_len = len(session.get_messages())
+
         try:
             result = await self.agent_loop.run_async(
                 system_prompt=self.system_prompt,
-                user_message=text,
+                messages=session.get_messages(),
                 tools=self.tool_registry.list_schemas(),
             )
+            session.add_result_messages(result.messages, pre_len)
+            session.trim(self.session_manager.MAX_SESSION_MESSAGES)
             response_text = result.text or "(no response)"
         except Exception as exc:
             logger.error("Agent error for channel %s: %s", channel, exc)
+            session.rollback_last()
             response_text = f"Error: {exc}"
 
         # Convert markdown to Slack mrkdwn format
@@ -443,9 +457,12 @@ class SlackAdapter(BasePlatformAdapter):
         text = text.replace("/help", "/prometheus-help")
         await respond(text=text)
 
-    async def _slash_reset(self, ack: Any, respond: Any) -> None:
+    async def _slash_reset(self, ack: Any, respond: Any, body: dict | None = None) -> None:
         await ack()
-        # Clear session for this channel (if we tracked it)
+        if body:
+            channel = body.get("channel_id", "")
+            if channel:
+                self.session_manager.clear(f"slack:{channel}")
         await respond(text="Conversation context reset.")
 
     async def _slash_model(self, ack: Any, respond: Any) -> None:

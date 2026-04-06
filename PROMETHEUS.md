@@ -3143,3 +3143,62 @@ security:
 | `permissions/checker.py` (Sprint 4) | `SecurityGate.__init__` gains optional `approval_queue` parameter |
 | `gateway/telegram.py` (Sprint 6) | 3 new commands: `/approve`, `/deny`, `/pending` |
 | `scripts/daemon.py` (Sprint 6) | `ApprovalQueue` wired to `SecurityGate` + `TelegramAdapter` when enabled |
+
+## Sprint 16: GRAFT-THREAD — Gateway-Agnostic Conversation Memory ✓
+
+Every Telegram and Slack message was dispatched as a brand-new conversation — no
+history survived between turns. The LCM system existed but was never wired to any
+gateway. This sprint adds a shared session layer so all gateways get multi-turn
+memory for free.
+
+### `prometheus.engine.session`
+`src/prometheus/engine/session.py` — novel code
+
+```python
+MAX_SESSION_MESSAGES = 50
+
+class ChatSession:
+    def __init__(self, session_id: str) -> None
+    def add_user_message(self, text: str) -> None
+    def add_result_messages(self, result_messages: list[ConversationMessage], original_len: int) -> None
+    def rollback_last(self) -> None             # undo last append (error recovery)
+    def get_messages(self) -> list[ConversationMessage]
+    def clear(self) -> None
+    def trim(self, max_messages: int = MAX_SESSION_MESSAGES) -> None
+
+class SessionManager:
+    MAX_SESSION_MESSAGES = 50
+    def __init__(self) -> None
+    def get_or_create(self, session_id: str) -> ChatSession
+    def clear(self, session_id: str) -> None    # empties history, keeps object
+    def remove(self, session_id: str) -> None   # deletes session entirely
+```
+
+### `prometheus.engine.agent_loop` — updated signature
+`src/prometheus/engine/agent_loop.py`
+
+```python
+class AgentLoop:
+    async def run_async(
+        self,
+        system_prompt: str,
+        user_message: str = "",
+        *,
+        messages: list[ConversationMessage] | None = None,  # NEW — pre-built history
+        tools: list | None = None,
+    ) -> RunResult
+    # When messages= is provided, uses it (shallow-copied) instead of
+    # creating a fresh single-message list. Backward compatible — all
+    # existing callers pass user_message= only.
+    def run(self, ...) -> RunResult   # same signature change, wraps run_async
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 16 connects |
+|---|---|
+| `engine/agent_loop.py` (Sprint 1) | `run_async()` gains optional `messages=` parameter for pre-built history |
+| `gateway/telegram.py` (Sprint 6) | `_dispatch_to_agent()` uses `SessionManager` to accumulate per-chat history; `/reset` and `/clear` call `session_manager.clear()` |
+| `gateway/slack.py` (Sprint 6) | `_dispatch_to_agent()` uses same `SessionManager`; `/prometheus-reset` clears via `session_manager.clear()` |
+| `scripts/daemon.py` (Sprint 6) | Creates one `SessionManager` and passes it to both `TelegramAdapter` and `SlackAdapter` |
+| `engine/__init__.py` (Sprint 1) | Exports `ChatSession` and `SessionManager` |

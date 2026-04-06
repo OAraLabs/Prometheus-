@@ -162,6 +162,10 @@ async def run_daemon(args: argparse.Namespace) -> None:
         divergence_detector=divergence_detector,
     )
 
+    # Shared session manager for all gateways
+    from prometheus.engine.session import SessionManager
+    session_manager = SessionManager()
+
     # Collect async tasks to run
     tasks: list[asyncio.Task] = []
     shutdown_event = asyncio.Event()
@@ -196,6 +200,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
             system_prompt=system_prompt,
             model_name=model_name,
             model_provider=model_config.get("provider", "llama_cpp"),
+            session_manager=session_manager,
         )
         await telegram.start()
         archive.archive_event("telegram_started")
@@ -240,6 +245,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 system_prompt=system_prompt,
                 model_name=model_name,
                 model_provider=model_config.get("provider", "llama_cpp"),
+                session_manager=session_manager,
             )
             await slack_adapter.start()
             archive.archive_event("slack_started")

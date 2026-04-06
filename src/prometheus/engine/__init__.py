@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from prometheus.engine.agent_loop import AgentLoop, RunResult
+from prometheus.engine.session import ChatSession, SessionManager
 from prometheus.engine.messages import (
     ConversationMessage,
     TextBlock,
@@ -24,7 +25,9 @@ from prometheus.engine.usage import UsageSnapshot
 
 __all__ = [
     "AgentLoop",
+    "ChatSession",
     "RunResult",
+    "SessionManager",
     "AssistantTextDelta",
     "AssistantTurnComplete",
     "ConversationMessage",

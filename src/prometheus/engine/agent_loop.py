@@ -547,11 +547,21 @@ class AgentLoop:
     async def run_async(
         self,
         system_prompt: str,
-        user_message: str,
+        user_message: str = "",
+        *,
+        messages: list[ConversationMessage] | None = None,
         tools: list | None = None,
     ) -> RunResult:
         """Run the agent loop asynchronously, return a RunResult."""
-        messages = [ConversationMessage.from_user_text(user_message)]
+        if messages is not None:
+            messages = list(messages)  # shallow copy — run_loop mutates in place
+            if not user_message:
+                for msg in reversed(messages):
+                    if msg.role == "user":
+                        user_message = msg.text
+                        break
+        else:
+            messages = [ConversationMessage.from_user_text(user_message)]
 
         context = LoopContext(
             provider=self._provider,
@@ -608,8 +618,12 @@ class AgentLoop:
     def run(
         self,
         system_prompt: str,
-        user_message: str,
+        user_message: str = "",
+        *,
+        messages: list[ConversationMessage] | None = None,
         tools: list | None = None,
     ) -> RunResult:
         """Synchronous entry point — wraps run_async() via asyncio.run()."""
-        return asyncio.run(self.run_async(system_prompt, user_message, tools))
+        return asyncio.run(
+            self.run_async(system_prompt, user_message, messages=messages, tools=tools)
+        )

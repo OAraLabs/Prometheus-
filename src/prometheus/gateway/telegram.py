@@ -35,6 +35,7 @@ from prometheus.gateway.platform_base import (
 
 if TYPE_CHECKING:
     from prometheus.engine.agent_loop import AgentLoop
+    from prometheus.engine.session import SessionManager
     from prometheus.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ class TelegramAdapter(BasePlatformAdapter):
         system_prompt: str = "You are Prometheus, a helpful AI assistant.",
         model_name: str = "",
         model_provider: str = "",
+        session_manager: SessionManager | None = None,
     ) -> None:
         super().__init__(config)
         self.agent_loop = agent_loop
@@ -99,8 +101,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self.model_name = model_name
         self.model_provider = model_provider
         self._app: Application | None = None
-        self._sessions: dict[str, list[dict[str, Any]]] = {}
         self._start_time: float = 0.0
+
+        if session_manager is None:
+            from prometheus.engine.session import SessionManager as _SM
+            session_manager = _SM()
+        self.session_manager: SessionManager = session_manager
 
     async def start(self) -> None:
         """Build the telegram Application and start long-polling."""
@@ -250,7 +256,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if update.effective_chat is None:
             return
         session_key = f"{Platform.TELEGRAM.value}:{update.effective_chat.id}"
-        self._sessions.pop(session_key, None)
+        self.session_manager.clear(session_key)
         await self.send(
             update.effective_chat.id,
             "Conversation cleared.",
@@ -288,7 +294,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if update.effective_chat is None:
             return
         session_key = f"{Platform.TELEGRAM.value}:{update.effective_chat.id}"
-        self._sessions.pop(session_key, None)
+        self.session_manager.clear(session_key)
         await self.send(
             update.effective_chat.id,
             "Conversation context reset.",
@@ -641,15 +647,23 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass  # typing indicator is best-effort
 
+        session = self.session_manager.get_or_create(event.session_key())
+        session.add_user_message(event.text)
+        pre_len = len(session.get_messages())
+
         try:
             result = await self.agent_loop.run_async(
                 system_prompt=self.system_prompt,
-                user_message=event.text,
+                messages=session.get_messages(),
                 tools=self.tool_registry.list_schemas(),
             )
+            # Append assistant response (and any tool call/result pairs) to session
+            session.add_result_messages(result.messages, pre_len)
+            session.trim(self.session_manager.MAX_SESSION_MESSAGES)
             response_text = result.text or "(no response)"
         except Exception as exc:
             logger.error("Agent error for chat %d: %s", event.chat_id, exc)
+            session.rollback_last()
             response_text = f"Error: {exc}"
 
         await self.send(
