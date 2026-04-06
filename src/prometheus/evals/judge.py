@@ -21,13 +21,10 @@ import httpx
 log = logging.getLogger(__name__)
 
 _JUDGE_SYSTEM_PROMPT = """\
-You are an evaluation judge for an AI agent. You will be given:
-1. The task the agent was asked to perform
-2. A description of the expected behavior
-3. The agent's actual output
-4. Optionally, the tools the agent called
+/no_think
+You are a strict evaluation judge. Do NOT use internal reasoning. Respond directly.
 
-Rate how well the agent completed the task on a scale from 0.0 to 1.0:
+Rate the agent's task completion from 0.0 to 1.0:
 - 1.0 = Task fully completed as expected
 - 0.7 = Task mostly completed with minor issues
 - 0.5 = Task partially completed
@@ -38,7 +35,10 @@ Respond with ONLY a JSON object: {"score": <float>, "reasoning": "<brief explana
 """
 
 _GEVAL_SYSTEM_PROMPT = """\
-You are an evaluation judge. Evaluate an AI agent's output by reasoning through criteria step by step.
+/no_think
+You are a strict evaluation judge. Do NOT use internal reasoning. Respond directly.
+
+Evaluate an AI agent's output by assessing each criterion in one sentence, then give a final score.
 
 Rules:
 1. For each criterion, write one brief sentence of assessment.
@@ -103,10 +103,12 @@ class PrometheusJudge:
 
         Retries up to `retries` times if the model returns an empty response,
         bumping temperature slightly each attempt to nudge different output.
+        Starts at temp=0.0 for maximum determinism (helps thinking models
+        like Qwen3.5 produce structured output instead of reasoning).
         """
         model = await self._detect_model()
         for attempt in range(retries + 1):
-            temp = 0.1 + (attempt * 0.15)  # 0.1 → 0.25 → 0.4
+            temp = attempt * 0.2  # 0.0 → 0.2 → 0.4
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.post(
                     f"{self._base_url}/v1/chat/completions",
