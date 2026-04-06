@@ -43,6 +43,11 @@ security:
   exfiltration:
     enabled: true
 
+  # Sprint 15b GRAFT: Telegram approval queue for LEVEL 1 actions
+  approval_queue:
+    enabled: true
+    timeout_seconds: 300
+
 infrastructure:
   mini_host: "MINI_HOST"
   mini_port: 8005
@@ -58,6 +63,24 @@ gateway:
   system_prompt: "You are Prometheus, a sovereign AI agent. You have access to tools for file operations, shell commands, and cron job management. Be concise and helpful."
   heartbeat_interval: 30            # seconds between health checks
   cron_enabled: true                # run cron scheduler alongside gateway
+  # Sprint 15 GRAFT: media handling
+  media:
+    max_file_size_mb: 20
+    cache_dir: "~/.prometheus/cache/media"
+    allowed_image_types: ["image/jpeg", "image/png", "image/gif", "image/webp"]
+    allowed_audio_types: ["audio/ogg", "audio/mp3", "audio/wav"]
+    allowed_document_types: ["application/pdf", "text/plain", "text/markdown"]
+    sticker_cache_dir: "~/.prometheus/cache/stickers"
+  rate_limits:
+    messages_per_minute: 30
+    media_downloads_per_minute: 10
+
+# Whisper Speech-to-Text (Sprint 15 GRAFT)
+whisper:
+  enabled: true
+  model: "base"                     # tiny, base, small, medium, large
+  device: "auto"                    # cpu, cuda, auto
+  language: "en"
 
 # Model Router Configuration (Sprint 10)
 model_router:

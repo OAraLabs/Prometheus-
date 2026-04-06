@@ -24,6 +24,9 @@ class MessageType(str, Enum):
     PHOTO = "photo"
     DOCUMENT = "document"
     VOICE = "voice"
+    STICKER = "sticker"
+    AUDIO = "audio"
+    VIDEO = "video"
 
 
 @dataclass
@@ -39,6 +42,10 @@ class MessageEvent:
     username: str | None = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     raw: dict[str, Any] = field(default_factory=dict)
+    # Sprint 15 GRAFT: media fields (additive — Hermes parity)
+    media_urls: list[str] = field(default_factory=list)
+    media_types: list[str] = field(default_factory=list)
+    caption: str | None = None
 
     def session_key(self) -> str:
         """Return a unique key for this chat's session."""

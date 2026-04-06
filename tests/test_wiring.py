@@ -799,3 +799,328 @@ class TestEndToEndWiring:
         assert len(rows) >= 1
         denied = [r for r in rows if r["error_type"] == "permission_denied"]
         assert len(denied) >= 1
+
+
+# ===========================================================================
+# Sprint 15b GRAFT: Media cache, sticker cache, scoped lock, vision, whisper
+# ===========================================================================
+
+
+class TestSprint15bMediaCache:
+    """Verify media cache writes files to disk and retrieves them."""
+
+    def test_image_cache_round_trip(self, tmp_path, monkeypatch):
+        from prometheus.gateway.media_cache import cache_image_from_bytes
+        monkeypatch.setattr("prometheus.gateway.media_cache.get_config_dir", lambda: tmp_path)
+
+        data = b"\xff\xd8\xff\xe0" + b"\x00" * 50
+        path = cache_image_from_bytes(data, ext=".jpg")
+        assert Path(path).exists()
+        assert Path(path).read_bytes() == data
+
+    def test_audio_cache_round_trip(self, tmp_path, monkeypatch):
+        from prometheus.gateway.media_cache import cache_audio_from_bytes
+        monkeypatch.setattr("prometheus.gateway.media_cache.get_config_dir", lambda: tmp_path)
+
+        data = b"OggS" + b"\x00" * 50
+        path = cache_audio_from_bytes(data, ext=".ogg")
+        assert Path(path).exists()
+        assert Path(path).read_bytes() == data
+
+    def test_document_cache_and_text_extraction(self, tmp_path, monkeypatch):
+        from prometheus.gateway.media_cache import (
+            cache_document_from_bytes,
+            extract_text_from_document,
+        )
+        monkeypatch.setattr("prometheus.gateway.media_cache.get_config_dir", lambda: tmp_path)
+
+        content = b"# Hello World\nThis is a test."
+        path = cache_document_from_bytes(content, "readme.md")
+        extracted = extract_text_from_document(path)
+        assert extracted is not None
+        assert "Hello World" in extracted
+
+
+class TestSprint15bStickerCache:
+    """Verify sticker cache stores and retrieves descriptions."""
+
+    def test_cache_miss_then_hit(self, tmp_path, monkeypatch):
+        from prometheus.gateway.sticker_cache import (
+            cache_sticker_description,
+            get_cached_description,
+        )
+        monkeypatch.setattr("prometheus.gateway.sticker_cache.get_config_dir", lambda: tmp_path)
+
+        assert get_cached_description("stk_001") is None
+        cache_sticker_description("stk_001", "A waving cat", emoji="😺", set_name="CatPack")
+        result = get_cached_description("stk_001")
+        assert result is not None
+        assert result["description"] == "A waving cat"
+
+    def test_injection_text(self):
+        from prometheus.gateway.sticker_cache import build_sticker_injection
+        text = build_sticker_injection("A sad dog", emoji="🐶", set_name="DogSet")
+        assert "sad dog" in text
+        assert "🐶" in text
+
+
+class TestSprint15bScopedLock:
+    """Verify daemon lock prevents duplicate instances."""
+
+    def test_acquire_release_cycle(self, tmp_path, monkeypatch):
+        from prometheus.gateway.status import acquire_daemon_lock, release_daemon_lock
+        monkeypatch.setattr("prometheus.gateway.status.get_config_dir", lambda: tmp_path)
+
+        ok, reason = acquire_daemon_lock()
+        assert ok
+        lock_file = tmp_path / "daemon.lock"
+        assert lock_file.exists()
+
+        release_daemon_lock()
+        assert not lock_file.exists()
+
+    def test_double_acquire_blocked(self, tmp_path, monkeypatch):
+        from prometheus.gateway.status import acquire_daemon_lock, release_daemon_lock
+        monkeypatch.setattr("prometheus.gateway.status.get_config_dir", lambda: tmp_path)
+
+        ok1, _ = acquire_daemon_lock()
+        assert ok1
+        ok2, reason = acquire_daemon_lock()
+        assert not ok2
+        release_daemon_lock()
+
+
+class TestSprint15bVisionTool:
+    """Verify VisionTool reads images and routes through provider."""
+
+    def test_file_not_found_returns_error(self):
+        from prometheus.tools.builtin.vision import VisionTool, VisionInput
+
+        tool = VisionTool()
+        result = asyncio.run(
+            tool.execute(
+                VisionInput(image_path="/nonexistent.jpg"),
+                ToolExecutionContext(cwd=Path.cwd()),
+            )
+        )
+        assert result.is_error
+
+    def test_no_provider_returns_error(self, tmp_path):
+        from prometheus.tools.builtin.vision import VisionTool, VisionInput
+
+        img = tmp_path / "test.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 50)
+
+        tool = VisionTool()
+        result = asyncio.run(
+            tool.execute(
+                VisionInput(image_path=str(img)),
+                ToolExecutionContext(cwd=Path.cwd(), metadata={}),
+            )
+        )
+        assert result.is_error
+        assert "provider" in result.output.lower()
+
+
+class TestSprint15bWhisperSTT:
+    """Verify WhisperSTT tool interface and engine detection."""
+
+    def test_file_not_found_returns_error(self):
+        from prometheus.tools.builtin.whisper_stt import WhisperSTTTool, WhisperSTTInput
+
+        tool = WhisperSTTTool()
+        result = asyncio.run(
+            tool.execute(
+                WhisperSTTInput(audio_path="/nonexistent.ogg"),
+                ToolExecutionContext(cwd=Path.cwd()),
+            )
+        )
+        assert result.is_error
+
+    def test_no_engine_returns_error(self, tmp_path):
+        from prometheus.tools.builtin.whisper_stt import WhisperSTTTool, WhisperSTTInput
+        from unittest.mock import patch
+
+        audio = tmp_path / "test.wav"
+        audio.write_bytes(b"RIFF" + b"\x00" * 50)
+
+        tool = WhisperSTTTool()
+        with patch("prometheus.tools.builtin.whisper_stt._detect_whisper_engine", return_value=None):
+            result = asyncio.run(
+                tool.execute(
+                    WhisperSTTInput(audio_path=str(audio)),
+                    ToolExecutionContext(cwd=Path.cwd()),
+                )
+            )
+        assert result.is_error
+        assert "whisper" in result.output.lower()
+
+
+class TestSprint15bPlatformBase:
+    """Verify MessageEvent media fields are functional."""
+
+    def test_message_event_media_fields(self):
+        from prometheus.gateway.platform_base import MessageEvent, MessageType, Platform
+
+        event = MessageEvent(
+            chat_id=1, user_id=1, text="photo caption", message_id=1,
+            platform=Platform.TELEGRAM,
+            message_type=MessageType.PHOTO,
+            media_urls=["/cache/img_abc.jpg"],
+            media_types=["image/jpeg"],
+            caption="photo caption",
+        )
+        assert event.media_urls == ["/cache/img_abc.jpg"]
+        assert event.media_types == ["image/jpeg"]
+        assert event.caption == "photo caption"
+        assert event.message_type == MessageType.PHOTO
+
+    def test_new_message_types_exist(self):
+        from prometheus.gateway.platform_base import MessageType
+
+        assert MessageType.STICKER == "sticker"
+        assert MessageType.AUDIO == "audio"
+        assert MessageType.VIDEO == "video"
+
+
+# ===========================================================================
+# Sprint 15c GRAFT Phase 2: Hook reload, compression, approval, credentials
+# ===========================================================================
+
+
+class TestSprint15cHookReload:
+    """Verify hook loader and hot reloader are functional."""
+
+    def test_loader_builds_registry_from_config(self):
+        from prometheus.hooks.loader import load_hook_registry
+        from prometheus.hooks.events import HookEvent
+
+        config = {
+            "pre_tool_use": [
+                {"type": "command", "command": "echo pre", "block_on_failure": True}
+            ],
+            "post_tool_use": [
+                {"type": "http", "url": "http://localhost:9090/hook"}
+            ],
+        }
+        registry = load_hook_registry(config)
+        assert len(registry.get(HookEvent.PRE_TOOL_USE)) == 1
+        assert len(registry.get(HookEvent.POST_TOOL_USE)) == 1
+
+    def test_reloader_detects_config_change(self, tmp_path):
+        import time
+        import yaml
+        from prometheus.hooks.hot_reload import HookReloader
+        from prometheus.hooks.events import HookEvent
+
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(yaml.dump({"hooks": {
+            "pre_tool_use": [{"type": "command", "command": "echo v1"}]
+        }}))
+
+        reloader = HookReloader(config_file)
+        reg1 = reloader.current_registry()
+        assert len(reg1.get(HookEvent.PRE_TOOL_USE)) == 1
+
+        time.sleep(0.01)
+        config_file.write_text(yaml.dump({"hooks": {
+            "pre_tool_use": [
+                {"type": "command", "command": "echo v2"},
+                {"type": "command", "command": "echo v3"},
+            ]
+        }}))
+
+        reg2 = reloader.current_registry()
+        assert len(reg2.get(HookEvent.PRE_TOOL_USE)) == 2
+
+    def test_reloader_wires_to_executor(self, tmp_path):
+        """HookReloader.current_registry() can be passed to executor.update_registry()."""
+        import yaml
+        from prometheus.hooks.hot_reload import HookReloader
+        from prometheus.hooks.executor import HookExecutor, HookExecutionContext
+        from prometheus.hooks.events import HookEvent
+        from unittest.mock import AsyncMock
+
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text(yaml.dump({"hooks": {}}))
+
+        reloader = HookReloader(config_file)
+        executor = HookExecutor(
+            registry=reloader.current_registry(),
+            context=HookExecutionContext(
+                cwd=Path.cwd(),
+                provider=AsyncMock(),
+                default_model="test",
+            ),
+        )
+        # Verify update_registry works with reloader output
+        new_reg = reloader.current_registry()
+        executor.update_registry(new_reg)
+        assert executor._registry is new_reg
+
+
+class TestSprint15cCompression:
+    """Verify Tier 2 summarization is invoked when provider is available."""
+
+    def test_tier2_reduces_message_count(self):
+        from prometheus.context.budget import TokenBudget
+        from prometheus.context.compression import ContextCompressor
+
+        budget = TokenBudget(effective_limit=100, reserved_output=5)
+        budget.add("test", "x" * 400)  # force over threshold
+        compressor = ContextCompressor(budget, fresh_tail_count=4)
+
+        msgs = []
+        for i in range(20):
+            msgs.append(ConversationMessage.from_user_text(f"User message {i}"))
+            msgs.append(ConversationMessage(
+                role="assistant",
+                content=[TextBlock(text=f"Response {i}")],
+            ))
+
+        provider = ScriptedProvider([_text_response("Summary of conversation.")])
+        result = asyncio.run(compressor.maybe_compress_async(msgs, provider=provider))
+        assert len(result) < len(msgs)
+
+
+class TestSprint15cApprovalQueue:
+    """Verify approval queue stores, approves, and denies."""
+
+    def test_approve_flow(self):
+        from prometheus.permissions.approval_queue import ApprovalQueue, ApprovalResult
+
+        queue = ApprovalQueue(timeout_seconds=5)
+
+        async def _test():
+            task = asyncio.create_task(queue.request_approval("bash", "git push"))
+            await asyncio.sleep(0.05)
+            pending = queue.list_pending()
+            assert len(pending) == 1
+            await queue.approve(pending[0].request_id)
+            return await task
+
+        result = asyncio.run(_test())
+        assert result == ApprovalResult.APPROVED
+
+    def test_security_gate_accepts_queue(self):
+        from prometheus.permissions.checker import SecurityGate
+        from prometheus.permissions.approval_queue import ApprovalQueue
+
+        queue = ApprovalQueue()
+        gate = SecurityGate(approval_queue=queue)
+        assert gate._approval_queue is queue
+
+
+class TestSprint15cCredentialPool:
+    """Verify credential pool rotation and dead key handling."""
+
+    def test_round_robin_and_dead_key(self):
+        from prometheus.providers.credential_pool import CredentialPool
+
+        pool = CredentialPool(["key-a", "key-b", "key-c"])
+        assert pool.get_next() == "key-a"
+        assert pool.get_next() == "key-b"
+        pool.report_error("key-b", 401)
+        assert pool.get_next() == "key-c"
+        assert pool.get_next() == "key-a"  # key-b skipped
+        assert pool.active_count == 2

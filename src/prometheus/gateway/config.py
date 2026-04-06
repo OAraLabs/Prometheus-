@@ -36,6 +36,11 @@ class PlatformConfig:
     read_timeout: float = 30.0
     write_timeout: float = 30.0
     extra: dict[str, Any] = field(default_factory=dict)
+    # Sprint 15 GRAFT: media handling config
+    max_file_size_mb: int = 20
+    media_cache_dir: str | None = None  # default: ~/.prometheus/cache/media
+    messages_per_minute: int = 30
+    media_downloads_per_minute: int = 10
 
     @property
     def is_restricted(self) -> bool:

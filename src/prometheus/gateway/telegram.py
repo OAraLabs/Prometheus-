@@ -127,9 +127,18 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("benchmark", self._cmd_benchmark))
         self._app.add_handler(CommandHandler("context", self._cmd_context))
         self._app.add_handler(CommandHandler("skills", self._cmd_skills))
+        # Sprint 15b GRAFT: approval queue commands
+        self._app.add_handler(CommandHandler("approve", self._cmd_approve))
+        self._app.add_handler(CommandHandler("deny", self._cmd_deny))
+        self._app.add_handler(CommandHandler("pending", self._cmd_pending))
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text)
         )
+        # Sprint 15 GRAFT: media handlers (additive — Hermes parity)
+        self._app.add_handler(MessageHandler(filters.PHOTO, self._handle_photo))
+        self._app.add_handler(MessageHandler(filters.VOICE, self._handle_voice))
+        self._app.add_handler(MessageHandler(filters.Document.ALL, self._handle_document))
+        self._app.add_handler(MessageHandler(filters.Sticker.ALL, self._handle_sticker))
 
         await self._app.initialize()
         await self._app.start()
@@ -648,3 +657,332 @@ class TelegramAdapter(BasePlatformAdapter):
             response_text,
             reply_to=event.message_id,
         )
+
+    # ------------------------------------------------------------------
+    # Sprint 15b GRAFT: approval queue commands
+    # ------------------------------------------------------------------
+
+    async def _cmd_approve(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /approve {request_id} command."""
+        if not update.message or not update.effective_chat:
+            return
+        args = (update.message.text or "").split()
+        if len(args) < 2:
+            await self.send(update.effective_chat.id, "Usage: /approve {request_id}", parse_mode=None)
+            return
+
+        request_id = args[1]
+        queue = getattr(self, "_approval_queue", None)
+        if queue is None:
+            await self.send(update.effective_chat.id, "Approval queue not active.", parse_mode=None)
+            return
+
+        ok = await queue.approve(request_id)
+        if ok:
+            await self.send(update.effective_chat.id, f"Approved: {request_id}", parse_mode=None)
+        else:
+            await self.send(update.effective_chat.id, f"No pending request: {request_id}", parse_mode=None)
+
+    async def _cmd_deny(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /deny {request_id} command."""
+        if not update.message or not update.effective_chat:
+            return
+        args = (update.message.text or "").split()
+        if len(args) < 2:
+            await self.send(update.effective_chat.id, "Usage: /deny {request_id}", parse_mode=None)
+            return
+
+        request_id = args[1]
+        queue = getattr(self, "_approval_queue", None)
+        if queue is None:
+            await self.send(update.effective_chat.id, "Approval queue not active.", parse_mode=None)
+            return
+
+        ok = await queue.deny(request_id)
+        if ok:
+            await self.send(update.effective_chat.id, f"Denied: {request_id}", parse_mode=None)
+        else:
+            await self.send(update.effective_chat.id, f"No pending request: {request_id}", parse_mode=None)
+
+    async def _cmd_pending(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /pending command — list pending approval requests."""
+        if not update.message or not update.effective_chat:
+            return
+
+        queue = getattr(self, "_approval_queue", None)
+        if queue is None:
+            await self.send(update.effective_chat.id, "Approval queue not active.", parse_mode=None)
+            return
+
+        pending = queue.list_pending()
+        if not pending:
+            await self.send(update.effective_chat.id, "No pending requests.", parse_mode=None)
+            return
+
+        lines = ["Pending approval requests:"]
+        for action in pending:
+            lines.append(f"  {action.request_id}: {action.tool_name} — {action.description}")
+        await self.send(update.effective_chat.id, "\n".join(lines), parse_mode=None)
+
+    # ------------------------------------------------------------------
+    # Sprint 15 GRAFT: media handlers (additive — Hermes parity)
+    # ------------------------------------------------------------------
+
+    async def _handle_photo(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle incoming photo messages."""
+        if not update.message or not update.message.photo or not update.effective_chat:
+            return
+
+        from prometheus.gateway.media_cache import (
+            cache_image_from_bytes,
+            sniff_image_extension,
+        )
+
+        # Largest resolution is the last element
+        photo = update.message.photo[-1]
+        try:
+            file_obj = await photo.get_file()
+            image_bytes = await file_obj.download_as_bytearray()
+            ext = sniff_image_extension(file_obj.file_path)
+            cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+        except Exception as exc:
+            logger.error("Failed to download photo: %s", exc)
+            await self.send(update.effective_chat.id, "Failed to download the photo.")
+            return
+
+        caption = update.message.caption or ""
+        user_text = caption or "[The user sent a photo]"
+
+        # Try vision analysis to describe the image
+        description = await self._describe_image(cached_path)
+        if description:
+            user_text = f"[Image: {description}]\n{caption}".strip()
+
+        event = MessageEvent(
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id if update.effective_user else 0,
+            text=user_text,
+            message_id=update.message.message_id,
+            platform=Platform.TELEGRAM,
+            message_type=MessageType.PHOTO,
+            username=update.effective_user.username if update.effective_user else None,
+            media_urls=[cached_path],
+            media_types=[f"image/{ext.lstrip('.')}"],
+            caption=caption or None,
+        )
+        await self.on_message(event)
+
+    async def _handle_voice(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle incoming voice messages — transcribe via Whisper."""
+        if not update.message or not update.message.voice or not update.effective_chat:
+            return
+
+        from prometheus.gateway.media_cache import cache_audio_from_bytes
+
+        try:
+            file_obj = await update.message.voice.get_file()
+            audio_bytes = await file_obj.download_as_bytearray()
+            cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
+        except Exception as exc:
+            logger.error("Failed to download voice memo: %s", exc)
+            await self.send(update.effective_chat.id, "Failed to download voice memo.")
+            return
+
+        # Transcribe via Whisper
+        transcription = await self._transcribe_audio(cached_path)
+        if not transcription:
+            transcription = "[Voice memo received but transcription unavailable]"
+
+        event = MessageEvent(
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id if update.effective_user else 0,
+            text=transcription,
+            message_id=update.message.message_id,
+            platform=Platform.TELEGRAM,
+            message_type=MessageType.VOICE,
+            username=update.effective_user.username if update.effective_user else None,
+            media_urls=[cached_path],
+            media_types=["audio/ogg"],
+        )
+        await self.on_message(event)
+
+    async def _handle_document(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle incoming document messages."""
+        if not update.message or not update.message.document or not update.effective_chat:
+            return
+
+        from prometheus.gateway.media_cache import (
+            SUPPORTED_DOCUMENT_TYPES,
+            cache_document_from_bytes,
+            extract_text_from_document,
+        )
+
+        doc = update.message.document
+        original_name = doc.file_name or "unknown"
+        ext = Path(original_name).suffix.lower()
+
+        # Validate document type
+        if ext not in SUPPORTED_DOCUMENT_TYPES:
+            await self.send(
+                update.effective_chat.id,
+                f"Unsupported document type: {ext}",
+            )
+            return
+
+        # Size check
+        if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+            await self.send(
+                update.effective_chat.id,
+                "Document too large (max 20 MB).",
+            )
+            return
+
+        try:
+            file_obj = await doc.get_file()
+            doc_bytes = await file_obj.download_as_bytearray()
+            cached_path = cache_document_from_bytes(bytes(doc_bytes), original_name)
+        except Exception as exc:
+            logger.error("Failed to download document: %s", exc)
+            await self.send(update.effective_chat.id, "Failed to download the document.")
+            return
+
+        caption = update.message.caption or ""
+        mime = SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
+
+        # Try to extract text for inline injection
+        extracted = extract_text_from_document(cached_path)
+        if extracted:
+            user_text = f"[Content of {original_name}]:\n{extracted}"
+            if caption:
+                user_text = f"{caption}\n\n{user_text}"
+        else:
+            user_text = caption or f"[The user sent a document: {original_name}]"
+
+        event = MessageEvent(
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id if update.effective_user else 0,
+            text=user_text,
+            message_id=update.message.message_id,
+            platform=Platform.TELEGRAM,
+            message_type=MessageType.DOCUMENT,
+            username=update.effective_user.username if update.effective_user else None,
+            media_urls=[cached_path],
+            media_types=[mime],
+            caption=caption or None,
+        )
+        await self.on_message(event)
+
+    async def _handle_sticker(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle incoming sticker messages."""
+        if not update.message or not update.message.sticker or not update.effective_chat:
+            return
+
+        from prometheus.gateway.sticker_cache import (
+            build_animated_sticker_injection,
+            build_sticker_injection,
+            cache_sticker_description,
+            get_cached_description,
+        )
+
+        sticker = update.message.sticker
+        emoji = sticker.emoji or ""
+        set_name = sticker.set_name or ""
+        file_unique_id = sticker.file_unique_id
+
+        # Animated/video stickers can't be visually analyzed
+        if sticker.is_animated or sticker.is_video:
+            user_text = build_animated_sticker_injection(emoji)
+        else:
+            # Check cache first
+            cached = get_cached_description(file_unique_id)
+            if cached:
+                user_text = build_sticker_injection(
+                    cached["description"], cached.get("emoji", emoji), cached.get("set_name", set_name)
+                )
+            else:
+                # Download and analyze via vision
+                description = None
+                try:
+                    from prometheus.gateway.media_cache import cache_image_from_bytes
+                    file_obj = await sticker.get_file()
+                    sticker_bytes = await file_obj.download_as_bytearray()
+                    cached_path = cache_image_from_bytes(bytes(sticker_bytes), ext=".webp")
+                    description = await self._describe_image(cached_path)
+                except Exception as exc:
+                    logger.warning("Failed to analyze sticker: %s", exc)
+
+                if description:
+                    cache_sticker_description(file_unique_id, description, emoji, set_name)
+                    user_text = build_sticker_injection(description, emoji, set_name)
+                else:
+                    user_text = build_animated_sticker_injection(emoji)
+
+        event = MessageEvent(
+            chat_id=update.effective_chat.id,
+            user_id=update.effective_user.id if update.effective_user else 0,
+            text=user_text,
+            message_id=update.message.message_id,
+            platform=Platform.TELEGRAM,
+            message_type=MessageType.STICKER,
+            username=update.effective_user.username if update.effective_user else None,
+        )
+        await self.on_message(event)
+
+    # ------------------------------------------------------------------
+    # Media helper methods
+    # ------------------------------------------------------------------
+
+    async def _describe_image(self, image_path: str) -> str | None:
+        """Run image through VisionTool for a text description. Returns None on failure."""
+        try:
+            from prometheus.tools.builtin.vision import VisionTool, VisionInput
+            from prometheus.tools.base import ToolExecutionContext
+
+            tool = VisionTool()
+            result = await tool.execute(
+                VisionInput(image_path=image_path, question="Describe this image in detail."),
+                ToolExecutionContext(cwd=Path.cwd(), metadata={"provider": self._get_provider()}),
+            )
+            if not result.is_error and result.output:
+                return result.output
+        except Exception as exc:
+            logger.debug("Vision analysis unavailable: %s", exc)
+        return None
+
+    async def _transcribe_audio(self, audio_path: str) -> str | None:
+        """Run audio through WhisperSTT for transcription. Returns None on failure."""
+        try:
+            from prometheus.tools.builtin.whisper_stt import WhisperSTTTool, WhisperSTTInput
+            from prometheus.tools.base import ToolExecutionContext
+
+            tool = WhisperSTTTool()
+            result = await tool.execute(
+                WhisperSTTInput(audio_path=audio_path),
+                ToolExecutionContext(cwd=Path.cwd()),
+            )
+            if not result.is_error and result.output:
+                return result.output
+        except Exception as exc:
+            logger.debug("Whisper STT unavailable: %s", exc)
+        return None
+
+    def _get_provider(self):
+        """Return the model provider from the agent loop (for vision analysis)."""
+        try:
+            return self.agent_loop._provider
+        except AttributeError:
+            return None

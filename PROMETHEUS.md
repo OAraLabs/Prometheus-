@@ -14,7 +14,7 @@ prometheus/
   permissions/  Security gate + audit + exfiltration detection (Sprint 4, 11)
   context/      Context management + compression (Sprint 4)
   providers/    ModelProvider ABC + StubProvider (Sprint 1) ✓
-  gateway/      Telegram / messaging interface (Sprint 6)
+  gateway/      Telegram / messaging interface + media handling (Sprint 6, 15b)
   learning/     Learning loop + skill creation (Sprint 7) ✓
   tasks/        Task persistence (Sprint 5)
   memory/       LCM + persistent memory (Sprint 5)
@@ -805,6 +805,8 @@ messages = compressor.maybe_compress(messages)
 - [x] Sprint 13: DeepEval + Phoenix — G-Eval metrics, trend tracking, nightly cron
 - [x] Sprint 14: Constrained Decoding Judge — grammar-forced JSON, failure classifier, A/B tested
 - [x] Sprint 15: Telemetry Wiring Fix — daemon pipeline, error-path coverage, data reset CLI
+- [x] Sprint 15b: GRAFT Phase 1 — Telegram media/vision/voice, scoped lock, sticker cache
+- [x] Sprint 15c: GRAFT Phase 2 — Hook hot reload, compression Tier 2, approval queue, credential pool
 
 ---
 
@@ -2914,3 +2916,230 @@ pytest tests/test_telemetry_wiring.py -v          # telemetry + reset tests
 ```
 
 **Policy: every future sprint must add wiring tests to `test_wiring.py`.**
+
+---
+
+## Sprint 15b: GRAFT Phase 1 — Telegram Media + Vision + Voice ✓
+
+Restores donor features stripped during Sprint 6. Additive only — no existing handlers, commands, or behavior changed.
+
+### `prometheus.gateway.media_cache`
+`src/prometheus/gateway/media_cache.py` — disk-backed media cache (Hermes `base.py` pattern)
+
+```python
+# Module-level cache functions (not a class — matches Hermes pattern)
+cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str       # → ~/.prometheus/cache/images/img_{uuid}.jpg
+cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str       # → ~/.prometheus/cache/audio/audio_{uuid}.ogg
+cache_document_from_bytes(data: bytes, original_filename: str) -> str  # → ~/.prometheus/cache/documents/doc_{uuid}_{name}
+extract_text_from_document(path: str) -> str | None                 # inline text for .txt/.md/.py etc. (≤100KB)
+sniff_image_extension(file_path: str | None) -> str                 # guess ext from Telegram file_path
+cleanup_cache(subdir: str, max_age_hours: int = 24) -> int          # TTL-based eviction
+
+SUPPORTED_DOCUMENT_TYPES: dict[str, str]  # 20 extensions → MIME mappings
+```
+
+### `prometheus.gateway.sticker_cache`
+`src/prometheus/gateway/sticker_cache.py` — JSON file cache for sticker descriptions (Hermes `sticker_cache.py` pattern)
+
+```python
+get_cached_description(file_unique_id: str) -> dict | None
+cache_sticker_description(file_unique_id: str, description: str, emoji: str = "", set_name: str = "") -> None
+build_sticker_injection(description: str, emoji: str = "", set_name: str = "") -> str
+build_animated_sticker_injection(emoji: str = "") -> str
+
+STICKER_VISION_PROMPT: str  # "Describe this sticker in 1-2 sentences..."
+```
+
+### `prometheus.gateway.status`
+`src/prometheus/gateway/status.py` — scoped daemon lock (Hermes `status.py` pattern)
+
+```python
+acquire_daemon_lock() -> tuple[bool, str]   # (ok, reason) — atomic O_CREAT|O_EXCL, /proc stale detection
+release_daemon_lock() -> None               # only releases if current PID owns the lock
+```
+
+### `prometheus.tools.builtin.vision`
+`src/prometheus/tools/builtin/vision.py` — image analysis via multimodal LLM (Hermes `vision_tools.py` pattern)
+
+```python
+class VisionInput(BaseModel):
+    image_path: str
+    question: str = "Describe this image in detail."
+
+class VisionTool(BaseTool):
+    name = "vision_analyze"
+    async execute(arguments: VisionInput, context: ToolExecutionContext) -> ToolResult
+        # reads image → base64 data URL → sends to provider as multimodal content block
+    def is_read_only(...) -> True
+```
+
+### `prometheus.tools.builtin.whisper_stt`
+`src/prometheus/tools/builtin/whisper_stt.py` — speech-to-text (counterpart to existing `tts.py`)
+
+```python
+class WhisperSTTInput(BaseModel):
+    audio_path: str
+    language: str = "en"
+    model: str = "base"     # tiny, base, small, medium, large
+
+class WhisperSTTTool(BaseTool):
+    name = "whisper_stt"
+    async execute(arguments: WhisperSTTInput, context: ToolExecutionContext) -> ToolResult
+        # .ogg → ffmpeg → .wav → whisper/faster-whisper CLI → transcription text
+    def is_read_only(...) -> True
+```
+
+### Telegram media handlers (`src/prometheus/gateway/telegram.py`)
+
+Four handlers added alongside existing text/command handlers:
+
+```python
+# Registered in start() — existing handlers untouched
+self._app.add_handler(MessageHandler(filters.PHOTO,        self._handle_photo))
+self._app.add_handler(MessageHandler(filters.VOICE,        self._handle_voice))
+self._app.add_handler(MessageHandler(filters.Document.ALL, self._handle_document))
+self._app.add_handler(MessageHandler(filters.Sticker.ALL,  self._handle_sticker))
+```
+
+| Handler | Flow |
+|---|---|
+| `_handle_photo` | download → `cache_image_from_bytes` → `VisionTool` describes → dispatch enriched text |
+| `_handle_voice` | download .ogg → `cache_audio_from_bytes` → `WhisperSTTTool` transcribes → dispatch transcription |
+| `_handle_document` | download → `cache_document_from_bytes` → `extract_text_from_document` inline injection → dispatch |
+| `_handle_sticker` | cache check → if miss: download .webp → `VisionTool` → `cache_sticker_description` → dispatch |
+
+### `platform_base.py` additions
+
+```python
+class MessageType(str, Enum):
+    ...
+    STICKER = "sticker"   # NEW
+    AUDIO = "audio"       # NEW
+    VIDEO = "video"       # NEW
+
+@dataclass
+class MessageEvent:
+    ...
+    media_urls: list[str] = field(default_factory=list)   # NEW — local cached paths
+    media_types: list[str] = field(default_factory=list)  # NEW — MIME strings
+    caption: str | None = None                            # NEW
+```
+
+### `config/prometheus.yaml` additions
+
+```yaml
+gateway:
+  media:
+    max_file_size_mb: 20
+    cache_dir: "~/.prometheus/cache/media"
+    sticker_cache_dir: "~/.prometheus/cache/stickers"
+  rate_limits:
+    messages_per_minute: 30
+    media_downloads_per_minute: 10
+
+whisper:
+  enabled: true
+  model: "base"
+  device: "auto"
+  language: "en"
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 15b connects |
+|---|---|
+| `gateway/telegram.py` (Sprint 6) | 4 new media handlers registered in `start()` alongside existing text/command handlers |
+| `gateway/platform_base.py` (Sprint 6) | `MessageEvent` gains `media_urls`, `media_types`, `caption` fields; `MessageType` gains STICKER/AUDIO/VIDEO |
+| `gateway/config.py` (Sprint 6) | `PlatformConfig` gains `max_file_size_mb`, `media_cache_dir`, rate limit fields |
+| `scripts/daemon.py` (Sprint 6) | `acquire_daemon_lock()` at startup, `release_daemon_lock()` in signal handler |
+| `tools/builtin/tts.py` (Sprint 5) | `whisper_stt.py` mirrors TTS pattern (Pydantic input, async subprocess, engine auto-detection) |
+
+---
+
+## Sprint 15c: GRAFT Phase 2 — Hook Reload + Compression + Approval + Credentials ✓
+
+Four independent additive restorations. No existing behavior changed.
+
+### `prometheus.hooks.loader`
+`src/prometheus/hooks/loader.py` — builds HookRegistry from YAML config (OpenHarness `loader.py` pattern)
+
+```python
+def load_hook_registry(hooks_config: dict[str, list[dict]]) -> HookRegistry
+    # hooks_config: {"pre_tool_use": [{"type": "command", "command": "echo"}], ...}
+    # Returns populated HookRegistry. Skips unknown events/types gracefully.
+```
+
+### `prometheus.hooks.hot_reload`
+`src/prometheus/hooks/hot_reload.py` — mtime-based lazy reloader (OpenHarness `hot_reload.py` pattern)
+
+```python
+class HookReloader:
+    def __init__(self, config_path: Path) -> None
+    def current_registry(self) -> HookRegistry       # lazy check — reloads if mtime changed
+    async def start_watching(self, interval: float = 5.0, on_reload: callable = None) -> None
+    def stop_watching(self) -> None
+```
+
+### `prometheus.context.compression` — Tier 2 addition
+`src/prometheus/context/compression.py` — extended with async summarization
+
+```python
+class ContextCompressor:
+    # Existing Tier 1 (unchanged):
+    def maybe_compress(self, messages) -> list[ConversationMessage]
+
+    # New Tier 2:
+    async def maybe_compress_async(self, messages, provider: ModelProvider = None) -> list[ConversationMessage]
+        # Runs Tier 1 first. If budget still over 90% and provider available,
+        # summarizes old message batches (3-5 sentences each via LLM).
+        # Protected messages (last fresh_tail_count) never summarized.
+```
+
+### `prometheus.permissions.approval_queue`
+`src/prometheus/permissions/approval_queue.py` — Telegram confirmation flow for LEVEL 1 actions
+
+```python
+class ApprovalResult(str, Enum):
+    APPROVED, DENIED, TIMEOUT
+
+class ApprovalQueue:
+    def __init__(self, telegram_adapter=None, timeout_seconds: int = 300, default_chat_id: int = None)
+    async def request_approval(self, tool_name: str, description: str, chat_id: int = None) -> ApprovalResult
+    async def approve(self, request_id: str) -> bool
+    async def deny(self, request_id: str) -> bool
+    def list_pending(self) -> list[PendingAction]
+```
+
+Telegram commands: `/approve {id}`, `/deny {id}`, `/pending`
+
+### `prometheus.providers.credential_pool`
+`src/prometheus/providers/credential_pool.py` — multi-key rotation (Hermes `auxiliary_client.py` pattern)
+
+```python
+class CredentialPool:
+    def __init__(self, api_keys: list[str], dead_key_cooldown_seconds: int = 300)
+    def get_next(self) -> str             # round-robin, skips dead keys
+    def report_success(self, key: str)
+    def report_error(self, key: str, status_code: int)  # 429→rotate, 401→mark dead
+    @property
+    def active_count(self) -> int
+```
+
+### `config/prometheus.yaml` additions
+
+```yaml
+security:
+  approval_queue:
+    enabled: true
+    timeout_seconds: 300
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 15c connects |
+|---|---|
+| `hooks/executor.py` (Sprint 2) | `update_registry()` called by `HookReloader` on config change |
+| `context/compression.py` (Sprint 4) | `maybe_compress_async()` added alongside existing `maybe_compress()` |
+| `permissions/checker.py` (Sprint 4) | `SecurityGate.__init__` gains optional `approval_queue` parameter |
+| `gateway/telegram.py` (Sprint 6) | 3 new commands: `/approve`, `/deny`, `/pending` |
+| `scripts/daemon.py` (Sprint 6) | `ApprovalQueue` wired to `SecurityGate` + `TelegramAdapter` when enabled |

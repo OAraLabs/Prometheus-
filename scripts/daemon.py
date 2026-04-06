@@ -95,6 +95,13 @@ async def run_daemon(args: argparse.Namespace) -> None:
     gateway_config = config.get("gateway", {})
     security_config = config.get("security", {})
 
+    # Sprint 15 GRAFT: scoped daemon lock — prevent duplicate instances
+    from prometheus.gateway.status import acquire_daemon_lock, release_daemon_lock
+    lock_ok, lock_reason = acquire_daemon_lock()
+    if not lock_ok:
+        logger.error("Cannot start daemon: %s", lock_reason)
+        sys.exit(1)
+
     # Archive writer
     archive = ArchiveWriter()
     archive.archive_event("daemon_start", {"args": vars(args)})
@@ -161,6 +168,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
 
     def _signal_handler() -> None:
         logger.info("Shutdown signal received")
+        release_daemon_lock()
         shutdown_event.set()
 
     loop = asyncio.get_running_loop()
@@ -192,6 +200,20 @@ async def run_daemon(args: argparse.Namespace) -> None:
         await telegram.start()
         archive.archive_event("telegram_started")
         logger.info("Telegram adapter started")
+
+        # Sprint 15b GRAFT: wire approval queue if enabled
+        approval_cfg = security_config.get("approval_queue", {})
+        if approval_cfg.get("enabled", False):
+            from prometheus.permissions.approval_queue import ApprovalQueue
+            default_chat = (gateway_config.get("allowed_chat_ids") or [None])[0]
+            approval_queue = ApprovalQueue(
+                telegram_adapter=telegram,
+                timeout_seconds=approval_cfg.get("timeout_seconds", 300),
+                default_chat_id=default_chat,
+            )
+            security_gate._approval_queue = approval_queue
+            telegram._approval_queue = approval_queue
+            logger.info("Approval queue wired to Telegram adapter")
 
     # Slack adapter
     slack_adapter = None

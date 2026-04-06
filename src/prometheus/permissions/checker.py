@@ -128,6 +128,7 @@ class SecurityGate:
         mode: PermissionMode | str = PermissionMode.DEFAULT,
         audit_logger: AuditLogger | None = None,
         exfiltration_detector: ExfiltrationDetector | None = None,
+        approval_queue: object | None = None,
     ) -> None:
         self._denied_commands: list[str] = denied_commands or []
         self._denied_paths: list[str] = [
@@ -139,6 +140,9 @@ class SecurityGate:
         # Sprint 11: optional audit + exfiltration
         self._audit = audit_logger
         self._exfil = exfiltration_detector
+
+        # Sprint 15b GRAFT: optional approval queue for Telegram confirmation
+        self._approval_queue = approval_queue
 
         # Compile blocked patterns once
         self._blocked_re = [re.compile(p) for p in _ALWAYS_BLOCKED_PATTERNS]
