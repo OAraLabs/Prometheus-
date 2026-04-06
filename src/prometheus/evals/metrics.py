@@ -53,18 +53,10 @@ if TYPE_CHECKING:
 class TaskCompletionMetric(BaseMetric):
     """Measures whether the agent completed the requested task.
 
-    Uses G-Eval (chain-of-thought) for more reliable scoring with local
-    models. The judge reasons through criteria before producing a score,
-    which avoids brittle JSON parsing.
+    Uses constrained decoding (JSON schema mode) for reliable scoring.
+    The grammar constraint guarantees valid JSON output from the judge —
+    no parsing heuristics needed.
     """
-
-    _CRITERIA = [
-        "Did the agent attempt the requested task?",
-        "Did the agent use appropriate tools or methods to accomplish the task?",
-        "Does the agent's output address the user's request?",
-        "Is the task fully completed, or only partially done?",
-        "Are there any errors or omissions in the result?",
-    ]
 
     def __init__(self, judge: PrometheusJudge, threshold: float = 0.7) -> None:
         self.threshold = threshold
@@ -82,26 +74,17 @@ class TaskCompletionMetric(BaseMetric):
         return asyncio.run(self.a_measure(test_case))
 
     async def a_measure(self, test_case: LLMTestCase) -> float:
-        """Async measurement via G-Eval chain-of-thought."""
+        """Async measurement via constrained JSON judge."""
         meta = getattr(test_case, "additional_metadata", None) or {}
-        tool_trace = meta.get("tool_trace", [])
+        tool_trace = meta.get("tool_trace")
+        if tool_trace and not isinstance(tool_trace, list):
+            tool_trace = None
 
-        tools_summary = ""
-        if tool_trace:
-            tools_summary = "\nTools called: " + ", ".join(
-                t.get("tool_name", "?") for t in tool_trace if isinstance(t, dict)
-            )
-
-        context = (
-            f"Task: {test_case.input}\n\n"
-            f"Expected behavior: {test_case.expected_output or 'N/A'}\n\n"
-            f"Agent output:\n{(test_case.actual_output or '')[:3000]}"
-            f"{tools_summary}"
-        )
-
-        verdict = await self.judge.evaluate_geval(
-            criteria=self._CRITERIA,
-            context=context,
+        verdict = await self.judge.evaluate(
+            task_input=test_case.input,
+            agent_output=test_case.actual_output or "",
+            expected_behavior=test_case.expected_output or "",
+            tool_trace=tool_trace,
         )
         self.score = verdict.score
         self.reason = verdict.reasoning
@@ -171,17 +154,10 @@ class ToolUsageMetric(BaseMetric):
 class NoHallucinationMetric(BaseMetric):
     """Measures whether the agent's output is grounded in tool results.
 
-    Uses G-Eval (chain-of-thought) to check for fabricated information.
-    The judge reasons through groundedness criteria before scoring,
-    which produces more consistent results than JSON-only prompting.
+    Uses constrained decoding (JSON schema mode) for reliable scoring.
+    The judge evaluates whether the agent fabricated information not
+    present in actual tool outputs.
     """
-
-    _CRITERIA = [
-        "Does the agent's output only contain information from tool results it actually received?",
-        "Did the agent claim to perform actions it didn't actually take (no tool call evidence)?",
-        "Did the agent fabricate specific data, numbers, or details not present in any tool output?",
-        "If the agent couldn't complete the task, did it honestly say so rather than making up a result?",
-    ]
 
     def __init__(self, judge: PrometheusJudge, threshold: float = 0.8) -> None:
         self.threshold = threshold
@@ -199,7 +175,7 @@ class NoHallucinationMetric(BaseMetric):
         return asyncio.run(self.a_measure(test_case))
 
     async def a_measure(self, test_case: LLMTestCase) -> float:
-        """Async measurement via G-Eval chain-of-thought."""
+        """Async measurement via constrained JSON judge."""
         meta = getattr(test_case, "additional_metadata", None) or {}
         tool_trace = meta.get("tool_trace", [])
 
@@ -209,15 +185,18 @@ class NoHallucinationMetric(BaseMetric):
             if isinstance(t, dict)
         ) or "(no tool calls recorded)"
 
-        context = (
-            f"Task: {test_case.input}\n\n"
-            f"Agent output:\n{(test_case.actual_output or '')[:2000]}\n\n"
-            f"Tool results the agent had access to:\n{tool_results}"
+        expected = (
+            f"Agent output should be grounded in tool results. "
+            f"Check: Did the agent fabricate data not in tool outputs? "
+            f"Did it claim actions it didn't take? "
+            f"Tool results:\n{tool_results}"
         )
 
-        verdict = await self.judge.evaluate_geval(
-            criteria=self._CRITERIA,
-            context=context,
+        verdict = await self.judge.evaluate(
+            task_input=test_case.input,
+            agent_output=test_case.actual_output or "",
+            expected_behavior=expected,
+            tool_trace=[t for t in tool_trace if isinstance(t, dict)],
         )
         self.score = verdict.score
         self.reason = verdict.reasoning

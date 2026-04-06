@@ -18,7 +18,7 @@ from prometheus.evals.golden_dataset import (
     TaskTier,
     load_golden_dataset,
 )
-from prometheus.evals.judge import JudgeVerdict, PrometheusJudge
+from prometheus.evals.judge import JUDGE_SCORE_SCHEMA, JudgeVerdict, PrometheusJudge
 from prometheus.evals.metrics import (
     NoHallucinationMetric,
     TaskCompletionMetric,
@@ -292,6 +292,140 @@ class TestPrometheusJudge:
 
 
 # ---------------------------------------------------------------------------
+# Constrained Decoding (Sprint 14)
+# ---------------------------------------------------------------------------
+
+
+class TestConstrainedDecoding:
+    def test_schema_has_required_fields(self):
+        """JUDGE_SCORE_SCHEMA should require score and reasoning."""
+        assert "score" in JUDGE_SCORE_SCHEMA["properties"]
+        assert "reasoning" in JUDGE_SCORE_SCHEMA["properties"]
+        assert "score" in JUDGE_SCORE_SCHEMA["required"]
+        assert "reasoning" in JUDGE_SCORE_SCHEMA["required"]
+        assert JUDGE_SCORE_SCHEMA["additionalProperties"] is False
+
+    @pytest.mark.asyncio
+    async def test_call_llm_includes_response_format(self):
+        """_call_llm should include response_format in payload when provided."""
+        judge = PrometheusJudge(base_url="http://test:8080", model="test")
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": '{"score": 0.8, "reasoning": "ok"}'}}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        captured_payload = {}
+
+        async def capture_post(url, json=None):
+            captured_payload.update(json)
+            return mock_resp
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post = capture_post
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            schema_fmt = {
+                "type": "json_schema",
+                "json_schema": {"name": "test", "schema": JUDGE_SCORE_SCHEMA},
+            }
+            await judge._call_llm(
+                "system", "user",
+                response_format=schema_fmt,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+
+        assert "response_format" in captured_payload
+        assert captured_payload["response_format"]["type"] == "json_schema"
+        assert "chat_template_kwargs" in captured_payload
+        assert captured_payload["chat_template_kwargs"]["enable_thinking"] is False
+
+    @pytest.mark.asyncio
+    async def test_call_llm_no_extras_by_default(self):
+        """_call_llm should NOT include response_format when not provided."""
+        judge = PrometheusJudge(base_url="http://test:8080", model="test")
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "hello"}}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        captured_payload = {}
+
+        async def capture_post(url, json=None):
+            captured_payload.update(json)
+            return mock_resp
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post = capture_post
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await judge._call_llm("system", "user")
+
+        assert "response_format" not in captured_payload
+        assert "chat_template_kwargs" not in captured_payload
+
+    @pytest.mark.asyncio
+    async def test_reasoning_content_fallback(self):
+        """Should extract JSON from reasoning_content when content is empty."""
+        judge = PrometheusJudge(base_url="http://test:8080", model="test")
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {
+                "content": "",
+                "reasoning_content": 'The agent did well. {"score": 0.9, "reasoning": "completed"} done.',
+            }}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post = AsyncMock(return_value=mock_resp)
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await judge._call_llm("system", "user")
+
+        parsed = json.loads(result)
+        assert parsed["score"] == 0.9
+        assert parsed["reasoning"] == "completed"
+
+    def test_extract_json_from_reasoning(self):
+        """Should find JSON with score field in reasoning text."""
+        judge = PrometheusJudge()
+        result = judge._extract_json_from_reasoning(
+            'Thinking... {"score": 0.7, "reasoning": "mostly done"} end'
+        )
+        assert json.loads(result)["score"] == 0.7
+
+    def test_extract_json_no_match(self):
+        """Should return empty string when no JSON found."""
+        judge = PrometheusJudge()
+        result = judge._extract_json_from_reasoning("just plain text no json here")
+        assert result == ""
+
+    def test_parse_verdict_direct_json(self):
+        """Should parse clean JSON directly (constrained output)."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict('{"score": 0.85, "reasoning": "well done"}')
+        assert verdict.score == 0.85
+        assert verdict.reasoning == "well done"
+
+    def test_parse_verdict_empty(self):
+        """Should handle empty response."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict("")
+        assert verdict.score == 0.0
+
+
+# ---------------------------------------------------------------------------
 # ToolUsageMetric
 # ---------------------------------------------------------------------------
 
@@ -373,9 +507,9 @@ class TestToolUsageMetric:
 class TestTaskCompletionMetric:
     @pytest.mark.asyncio
     async def test_high_score(self):
-        """Should pass through judge's G-Eval score."""
+        """Should pass through judge's constrained score."""
         mock_judge = AsyncMock(spec=PrometheusJudge)
-        mock_judge.evaluate_geval = AsyncMock(
+        mock_judge.evaluate = AsyncMock(
             return_value=JudgeVerdict(score=0.9, reasoning="well done", raw_response="")
         )
 
@@ -388,13 +522,13 @@ class TestTaskCompletionMetric:
         score = await metric.a_measure(tc)
         assert score == 0.9
         assert metric.is_successful()
-        mock_judge.evaluate_geval.assert_called_once()
+        mock_judge.evaluate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_low_score(self):
         """Should fail when below threshold."""
         mock_judge = AsyncMock(spec=PrometheusJudge)
-        mock_judge.evaluate_geval = AsyncMock(
+        mock_judge.evaluate = AsyncMock(
             return_value=JudgeVerdict(score=0.3, reasoning="poor", raw_response="")
         )
 
@@ -417,7 +551,7 @@ class TestNoHallucinationMetric:
     async def test_grounded_output(self):
         """Should score high when output is grounded."""
         mock_judge = AsyncMock(spec=PrometheusJudge)
-        mock_judge.evaluate_geval = AsyncMock(
+        mock_judge.evaluate = AsyncMock(
             return_value=JudgeVerdict(
                 score=1.0, reasoning="fully grounded", raw_response=""
             )
@@ -437,13 +571,13 @@ class TestNoHallucinationMetric:
         score = await metric.a_measure(tc)
         assert score == 1.0
         assert metric.is_successful()
-        mock_judge.evaluate_geval.assert_called_once()
+        mock_judge.evaluate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_hallucinated_output(self):
         """Should score low when output contains hallucinations."""
         mock_judge = AsyncMock(spec=PrometheusJudge)
-        mock_judge.evaluate_geval = AsyncMock(
+        mock_judge.evaluate = AsyncMock(
             return_value=JudgeVerdict(
                 score=0.2, reasoning="fabricated results", raw_response=""
             )
@@ -478,7 +612,7 @@ class TestEvalRunner:
         ]
 
         mock_judge = AsyncMock(spec=PrometheusJudge)
-        mock_judge.evaluate_geval = AsyncMock(
+        mock_judge.evaluate = AsyncMock(
             return_value=JudgeVerdict(score=0.9, reasoning="good", raw_response="")
         )
 
@@ -554,7 +688,7 @@ class TestEvalRunner:
         mock_loop._tool_trace = []
 
         mock_judge = AsyncMock(spec=PrometheusJudge)
-        mock_judge.evaluate_geval = AsyncMock(
+        mock_judge.evaluate = AsyncMock(
             return_value=JudgeVerdict(score=0.8, reasoning="ok", raw_response="")
         )
 

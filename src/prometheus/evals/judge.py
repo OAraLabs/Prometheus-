@@ -3,9 +3,15 @@
 Evaluates agent outputs against expected behavior descriptions.
 Uses the same OpenAI-compatible /v1/chat/completions API as the main model.
 
+Key reliability feature (Sprint 14): **Constrained decoding** via llama.cpp's
+``response_format`` with ``json_schema`` type. The server converts the schema
+to a GBNF grammar and masks invalid tokens at decode time — the model
+physically cannot produce invalid JSON. This eliminates parse failures that
+plagued G-Eval and raw JSON prompting with local models.
+
 Supports two evaluation modes:
-- evaluate(): JSON-based scoring (original)
-- evaluate_geval(): G-Eval chain-of-thought scoring (more reliable with local models)
+- evaluate(): JSON with constrained decoding (primary, used by metrics)
+- evaluate_geval(): G-Eval chain-of-thought (kept for manual/debug use)
 """
 
 from __future__ import annotations
@@ -20,6 +26,19 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# JSON Schema for judge scoring responses.
+# Passed to llama.cpp's response_format — converted to GBNF grammar
+# under the hood, constraining token generation at decode time.
+JUDGE_SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number"},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["score", "reasoning"],
+    "additionalProperties": False,
+}
+
 _JUDGE_SYSTEM_PROMPT = """\
 /no_think
 You are a strict evaluation judge. Do NOT use internal reasoning. Respond directly.
@@ -31,7 +50,7 @@ Rate the agent's task completion from 0.0 to 1.0:
 - 0.3 = Task attempted but largely failed
 - 0.0 = Task not attempted or completely wrong
 
-Respond with ONLY a JSON object: {"score": <float>, "reasoning": "<brief explanation>"}
+Respond with a JSON object: {"score": <float>, "reasoning": "<brief explanation>"}
 """
 
 _GEVAL_SYSTEM_PROMPT = """\
@@ -97,42 +116,79 @@ class PrometheusJudge:
         return "unknown"
 
     async def _call_llm(
-        self, system: str, user: str, max_tokens: int = 1024, retries: int = 2
+        self,
+        system: str,
+        user: str,
+        max_tokens: int = 1024,
+        retries: int = 2,
+        response_format: dict[str, Any] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> str:
         """Send a chat completion request and return the response text.
 
-        Retries up to `retries` times if the model returns an empty response,
-        bumping temperature slightly each attempt to nudge different output.
-        Starts at temp=0.0 for maximum determinism (helps thinking models
-        like Qwen3.5 produce structured output instead of reasoning).
+        Args:
+            response_format: If provided, passed to llama.cpp to constrain
+                output via GBNF grammar (e.g. json_schema mode).
+            chat_template_kwargs: If provided, passed to llama.cpp to control
+                template behavior (e.g. {"enable_thinking": False}).
+
+        Retries up to `retries` times if the model returns an empty response.
+        With constrained decoding, retries should rarely trigger.
         """
         model = await self._detect_model()
         for attempt in range(retries + 1):
             temp = attempt * 0.2  # 0.0 → 0.2 → 0.4
+            payload: dict[str, Any] = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temp,
+            }
+            if response_format is not None:
+                payload["response_format"] = response_format
+            if chat_template_kwargs is not None:
+                payload["chat_template_kwargs"] = chat_template_kwargs
+
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.post(
                     f"{self._base_url}/v1/chat/completions",
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                        "max_tokens": max_tokens,
-                        "temperature": temp,
-                    },
+                    json=payload,
                 )
                 resp.raise_for_status()
                 data = resp.json()
-            content = data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"].get("content", "")
+
+            # Qwen3.5 bug: thinking leaks into reasoning_content, content empty
+            if not content or not content.strip():
+                reasoning = data["choices"][0]["message"].get("reasoning_content", "")
+                if reasoning:
+                    log.warning("Empty content, extracting from reasoning_content")
+                    extracted = self._extract_json_from_reasoning(reasoning)
+                    if extracted:
+                        return extracted
+
             if content and content.strip():
                 return content
             if attempt < retries:
                 log.warning(
                     "Empty LLM response (attempt %d/%d), retrying with temp=%.2f",
-                    attempt + 1, retries + 1, temp + 0.15,
+                    attempt + 1, retries + 1, temp + 0.2,
                 )
         log.warning("Empty LLM response after %d attempts", retries + 1)
+        return ""
+
+    def _extract_json_from_reasoning(self, reasoning: str) -> str:
+        """Extract JSON from reasoning_content when content field is empty."""
+        match = re.search(r'\{[^{}]*"score"[^{}]*\}', reasoning)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+                return json.dumps(parsed)
+            except json.JSONDecodeError:
+                pass
         return ""
 
     # ------------------------------------------------------------------
@@ -146,7 +202,12 @@ class PrometheusJudge:
         expected_behavior: str,
         tool_trace: list[dict[str, Any]] | None = None,
     ) -> JudgeVerdict:
-        """Judge an agent's output against expected behavior (JSON mode).
+        """Judge an agent's output against expected behavior.
+
+        Uses constrained decoding (JSON schema mode) to guarantee valid
+        output from llama.cpp. The grammar constraint makes parse failures
+        impossible — the model can only produce tokens that form valid JSON
+        matching JUDGE_SCORE_SCHEMA.
 
         Returns a JudgeVerdict with score (0.0-1.0) and reasoning.
         """
@@ -159,7 +220,20 @@ class PrometheusJudge:
             )
             user_prompt += f"\nTools called: {tools_summary}"
 
-        raw = await self._call_llm(_JUDGE_SYSTEM_PROMPT, user_prompt, max_tokens=512)
+        raw = await self._call_llm(
+            _JUDGE_SYSTEM_PROMPT,
+            user_prompt,
+            max_tokens=512,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "judge_score",
+                    "strict": True,
+                    "schema": JUDGE_SCORE_SCHEMA,
+                },
+            },
+            chat_template_kwargs={"enable_thinking": False},
+        )
         return self._parse_verdict(raw)
 
     # ------------------------------------------------------------------
@@ -204,8 +278,29 @@ Example ending: SCORE: 0.85"""
     # ------------------------------------------------------------------
 
     def _parse_verdict(self, raw: str) -> JudgeVerdict:
-        """Parse the judge's JSON response into a JudgeVerdict."""
+        """Parse the judge's JSON response into a JudgeVerdict.
+
+        With constrained decoding, the response is guaranteed valid JSON
+        matching JUDGE_SCORE_SCHEMA. Direct json.loads() is the primary
+        path. Substring extraction is kept as fallback for unconstrained calls.
+        """
+        if not raw or not raw.strip():
+            log.warning("Empty judge response")
+            return JudgeVerdict(score=0.0, reasoning="Empty response", raw_response=raw)
+
         try:
+            # Primary: direct parse (works when grammar-constrained)
+            parsed = json.loads(raw)
+            return JudgeVerdict(
+                score=max(0.0, min(1.0, float(parsed.get("score", 0.0)))),
+                reasoning=str(parsed.get("reasoning", "")),
+                raw_response=raw,
+            )
+        except json.JSONDecodeError:
+            pass
+
+        try:
+            # Fallback: extract JSON substring (for unconstrained calls)
             start = raw.index("{")
             end = raw.rindex("}") + 1
             parsed = json.loads(raw[start:end])
