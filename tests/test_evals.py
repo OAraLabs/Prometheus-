@@ -1,0 +1,705 @@
+"""Tests for Sprint 13: DeepEval + Phoenix evaluation suite.
+
+All external dependencies (deepeval, phoenix, httpx) are mocked —
+these tests run without any optional packages installed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from prometheus.evals.golden_dataset import (
+    GoldenTask,
+    TaskTier,
+    load_golden_dataset,
+)
+from prometheus.evals.judge import JudgeVerdict, PrometheusJudge
+from prometheus.evals.metrics import (
+    NoHallucinationMetric,
+    TaskCompletionMetric,
+    ToolUsageMetric,
+)
+from prometheus.evals.runner import EvalResult, EvalRunner, MetricScore, _SimpleTestCase
+from prometheus.evals.trends import TrendTracker, TrendRow
+
+
+# ---------------------------------------------------------------------------
+# Golden Dataset
+# ---------------------------------------------------------------------------
+
+
+class TestGoldenDataset:
+    def test_load_all(self):
+        """Should return 26 tasks when skip_network=False."""
+        tasks = load_golden_dataset(skip_network=False)
+        assert len(tasks) == 26
+
+    def test_load_skip_network(self):
+        """Default should skip network-dependent tasks."""
+        tasks = load_golden_dataset()
+        network_tasks = [t for t in tasks if t.requires_network]
+        assert len(network_tasks) == 0
+        assert len(tasks) == 24  # 26 - 2 network tasks
+
+    def test_load_tier1(self):
+        """Should return 21 Tier 1 tasks."""
+        tasks = load_golden_dataset(tier=1, skip_network=False)
+        assert len(tasks) == 21
+        assert all(t.tier == TaskTier.TIER_1 for t in tasks)
+
+    def test_load_tier2(self):
+        """Should return 5 Tier 2 tasks."""
+        tasks = load_golden_dataset(tier=2, skip_network=False)
+        assert len(tasks) == 5
+        assert all(t.tier == TaskTier.TIER_2 for t in tasks)
+
+    def test_unique_ids(self):
+        """All task IDs should be unique."""
+        tasks = load_golden_dataset(skip_network=False)
+        ids = [t.id for t in tasks]
+        assert len(ids) == len(set(ids))
+
+    def test_required_fields(self):
+        """Every task should have id, name, input, expected_behavior."""
+        for task in load_golden_dataset(skip_network=False):
+            assert task.id, f"Task missing id"
+            assert task.name, f"Task {task.id} missing name"
+            assert task.input, f"Task {task.id} missing input"
+            assert task.expected_behavior, f"Task {task.id} missing expected_behavior"
+            assert task.tier in (TaskTier.TIER_1, TaskTier.TIER_2)
+
+    def test_network_tasks_flagged(self):
+        """Tasks with web tools should have requires_network=True."""
+        all_tasks = load_golden_dataset(skip_network=False)
+        web_tasks = [t for t in all_tasks if t.requires_network]
+        assert len(web_tasks) >= 2
+        for t in web_tasks:
+            assert any(
+                tool in t.expected_tools for tool in ("web_search", "web_fetch")
+            ) or "web" in t.tags
+
+
+# ---------------------------------------------------------------------------
+# PrometheusJudge
+# ---------------------------------------------------------------------------
+
+
+class TestPrometheusJudge:
+    @pytest.mark.asyncio
+    async def test_evaluate_success(self):
+        """Judge should return a JudgeVerdict with score and reasoning."""
+        judge = PrometheusJudge(base_url="http://test:8080")
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"score": 0.85, "reasoning": "Task completed well"}'
+                    }
+                }
+            ]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post = AsyncMock(return_value=mock_response)
+            mock_instance.get = AsyncMock(
+                return_value=MagicMock(
+                    json=lambda: {"data": [{"id": "test-model"}]},
+                    raise_for_status=MagicMock(),
+                )
+            )
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            verdict = await judge.evaluate(
+                task_input="test task",
+                agent_output="test output",
+                expected_behavior="should work",
+            )
+
+        assert isinstance(verdict, JudgeVerdict)
+        assert verdict.score == 0.85
+        assert verdict.reasoning == "Task completed well"
+
+    def test_parse_verdict_valid_json(self):
+        """Should parse valid JSON verdict."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict('{"score": 0.9, "reasoning": "great"}')
+        assert verdict.score == 0.9
+        assert verdict.reasoning == "great"
+
+    def test_parse_verdict_json_with_surrounding_text(self):
+        """Should extract JSON from surrounding text."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict(
+            'Here is my evaluation: {"score": 0.7, "reasoning": "mostly done"} end'
+        )
+        assert verdict.score == 0.7
+
+    def test_parse_verdict_invalid_json(self):
+        """Should fallback to regex score extraction."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict("I rate this 0.6 out of 1.0")
+        assert verdict.score == 0.6
+
+    def test_parse_verdict_clamp(self):
+        """Score should be clamped to [0, 1]."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_verdict('{"score": 1.5, "reasoning": "over"}')
+        assert verdict.score == 1.0
+        verdict = judge._parse_verdict('{"score": -0.5, "reasoning": "under"}')
+        assert verdict.score == 0.0
+
+    def test_parse_geval_verdict(self):
+        """Should extract score from SCORE: line."""
+        judge = PrometheusJudge()
+        raw = (
+            "Step 1: The agent used bash correctly.\n"
+            "Step 2: Output looks good.\n"
+            "SCORE: 0.85"
+        )
+        verdict = judge._parse_geval_verdict(raw)
+        assert verdict.score == 0.85
+        assert "bash correctly" in verdict.reasoning
+
+    def test_parse_geval_verdict_case_insensitive(self):
+        """Should handle Score: and score: variations."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_geval_verdict("Good work.\nscore: 0.7")
+        assert verdict.score == 0.7
+
+    def test_parse_geval_verdict_clamp(self):
+        """G-Eval score should be clamped to [0, 1]."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_geval_verdict("SCORE: 1.5")
+        assert verdict.score == 1.0
+
+    def test_parse_geval_verdict_no_score(self):
+        """Should fall back when no SCORE: line found."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_geval_verdict("I think this is 0.6 quality")
+        assert verdict.score == 0.6  # fallback regex
+
+
+# ---------------------------------------------------------------------------
+# ToolUsageMetric
+# ---------------------------------------------------------------------------
+
+
+class TestToolUsageMetric:
+    def test_all_tools_present(self):
+        """Score should be 1.0 when all expected tools were called."""
+        metric = ToolUsageMetric(threshold=0.5)
+        tc = _SimpleTestCase(
+            input="List files",
+            actual_output="Here are the files...",
+            expected_output="Uses bash",
+            context=["Tools expected: bash"],
+            additional_metadata={
+                "tool_trace": [{"tool_name": "bash", "result": "ok"}]
+            },
+        )
+        score = metric.measure(tc)
+        assert score == 1.0
+        assert metric.is_successful()
+
+    def test_missing_tools(self):
+        """Score should be partial when some tools were not called."""
+        metric = ToolUsageMetric(threshold=0.5)
+        tc = _SimpleTestCase(
+            input="Write and read",
+            actual_output="Done",
+            expected_output="Uses file_write and file_read",
+            context=["Tools expected: file_write, file_read"],
+            additional_metadata={
+                "tool_trace": [{"tool_name": "file_write", "result": "ok"}]
+            },
+        )
+        score = metric.measure(tc)
+        assert score == 0.5  # 1 of 2 expected tools
+
+    def test_no_expected_tools(self):
+        """Score should be 1.0 when no tools are expected."""
+        metric = ToolUsageMetric()
+        tc = _SimpleTestCase(
+            input="What is 2+2?",
+            actual_output="4",
+            expected_output="Returns 4",
+            context=[],
+        )
+        score = metric.measure(tc)
+        assert score == 1.0
+
+    def test_no_tools_used(self):
+        """Score should be 0.0 when expected tools were not called."""
+        metric = ToolUsageMetric(threshold=0.5)
+        tc = _SimpleTestCase(
+            input="Read file",
+            actual_output="...",
+            expected_output="Uses file_read",
+            context=["Tools expected: file_read"],
+            additional_metadata={"tool_trace": []},
+        )
+        score = metric.measure(tc)
+        assert score == 0.0
+        assert not metric.is_successful()
+
+    @pytest.mark.asyncio
+    async def test_async_measure(self):
+        """a_measure should delegate to sync measure."""
+        metric = ToolUsageMetric()
+        tc = _SimpleTestCase(
+            input="test", actual_output="out", expected_output="exp"
+        )
+        score = await metric.a_measure(tc)
+        assert score == 1.0  # no expected tools
+
+
+# ---------------------------------------------------------------------------
+# TaskCompletionMetric
+# ---------------------------------------------------------------------------
+
+
+class TestTaskCompletionMetric:
+    @pytest.mark.asyncio
+    async def test_high_score(self):
+        """Should pass through judge's G-Eval score."""
+        mock_judge = AsyncMock(spec=PrometheusJudge)
+        mock_judge.evaluate_geval = AsyncMock(
+            return_value=JudgeVerdict(score=0.9, reasoning="well done", raw_response="")
+        )
+
+        metric = TaskCompletionMetric(judge=mock_judge, threshold=0.7)
+        tc = _SimpleTestCase(
+            input="test task",
+            actual_output="completed",
+            expected_output="should complete",
+        )
+        score = await metric.a_measure(tc)
+        assert score == 0.9
+        assert metric.is_successful()
+        mock_judge.evaluate_geval.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_low_score(self):
+        """Should fail when below threshold."""
+        mock_judge = AsyncMock(spec=PrometheusJudge)
+        mock_judge.evaluate_geval = AsyncMock(
+            return_value=JudgeVerdict(score=0.3, reasoning="poor", raw_response="")
+        )
+
+        metric = TaskCompletionMetric(judge=mock_judge, threshold=0.7)
+        tc = _SimpleTestCase(
+            input="test", actual_output="failed", expected_output="should pass"
+        )
+        score = await metric.a_measure(tc)
+        assert score == 0.3
+        assert not metric.is_successful()
+
+
+# ---------------------------------------------------------------------------
+# NoHallucinationMetric
+# ---------------------------------------------------------------------------
+
+
+class TestNoHallucinationMetric:
+    @pytest.mark.asyncio
+    async def test_grounded_output(self):
+        """Should score high when output is grounded."""
+        mock_judge = AsyncMock(spec=PrometheusJudge)
+        mock_judge.evaluate_geval = AsyncMock(
+            return_value=JudgeVerdict(
+                score=1.0, reasoning="fully grounded", raw_response=""
+            )
+        )
+
+        metric = NoHallucinationMetric(judge=mock_judge, threshold=0.8)
+        tc = _SimpleTestCase(
+            input="list files",
+            actual_output="file1.txt, file2.txt",
+            expected_output="lists files",
+            additional_metadata={
+                "tool_trace": [
+                    {"tool_name": "bash", "result": "file1.txt\nfile2.txt"}
+                ]
+            },
+        )
+        score = await metric.a_measure(tc)
+        assert score == 1.0
+        assert metric.is_successful()
+        mock_judge.evaluate_geval.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_hallucinated_output(self):
+        """Should score low when output contains hallucinations."""
+        mock_judge = AsyncMock(spec=PrometheusJudge)
+        mock_judge.evaluate_geval = AsyncMock(
+            return_value=JudgeVerdict(
+                score=0.2, reasoning="fabricated results", raw_response=""
+            )
+        )
+
+        metric = NoHallucinationMetric(judge=mock_judge, threshold=0.8)
+        tc = _SimpleTestCase(
+            input="test", actual_output="made up stuff", expected_output="real data"
+        )
+        score = await metric.a_measure(tc)
+        assert score == 0.2
+        assert not metric.is_successful()
+
+
+# ---------------------------------------------------------------------------
+# EvalRunner
+# ---------------------------------------------------------------------------
+
+
+class TestEvalRunner:
+    @pytest.mark.asyncio
+    async def test_run_task(self):
+        """Runner should execute a task and return EvalResult."""
+        mock_result = MagicMock()
+        mock_result.text = "Task completed successfully"
+        mock_result.turns = 3
+
+        mock_loop = MagicMock()
+        mock_loop.run_async = AsyncMock(return_value=mock_result)
+        mock_loop._tool_trace = [
+            {"tool_name": "bash", "result": "ok", "is_error": False}
+        ]
+
+        mock_judge = AsyncMock(spec=PrometheusJudge)
+        mock_judge.evaluate_geval = AsyncMock(
+            return_value=JudgeVerdict(score=0.9, reasoning="good", raw_response="")
+        )
+
+        runner = EvalRunner(
+            agent_loop=mock_loop,
+            judge=mock_judge,
+            system_prompt="You are helpful.",
+        )
+
+        task = GoldenTask(
+            id="test-1",
+            name="Test task",
+            tier=1,
+            input="Do something",
+            expected_behavior="Should do the thing",
+            expected_tools=["bash"],
+            tags=["test"],
+        )
+
+        result = await runner.run_task(task)
+
+        assert isinstance(result, EvalResult)
+        assert result.task_id == "test-1"
+        assert result.agent_output == "Task completed successfully"
+        assert result.turns == 3
+        assert result.latency_ms >= 0
+        assert result.error is None
+        assert len(result.tool_trace) == 1
+        mock_loop.run_async.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_task_crash(self):
+        """Runner should handle agent crashes gracefully."""
+        mock_loop = MagicMock()
+        mock_loop.run_async = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_loop._tool_trace = []
+
+        mock_judge = AsyncMock(spec=PrometheusJudge)
+
+        runner = EvalRunner(
+            agent_loop=mock_loop,
+            judge=mock_judge,
+            system_prompt="test",
+        )
+
+        task = GoldenTask(
+            id="crash-1",
+            name="Crash test",
+            tier=1,
+            input="Crash me",
+            expected_behavior="Should not crash",
+            expected_tools=[],
+            tags=[],
+        )
+
+        result = await runner.run_task(task)
+
+        assert result.error == "boom"
+        assert result.agent_output == ""
+        assert result.latency_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_run_all(self):
+        """Should run all tasks and return results list."""
+        mock_result = MagicMock()
+        mock_result.text = "done"
+        mock_result.turns = 1
+
+        mock_loop = MagicMock()
+        mock_loop.run_async = AsyncMock(return_value=mock_result)
+        mock_loop._tool_trace = []
+
+        mock_judge = AsyncMock(spec=PrometheusJudge)
+        mock_judge.evaluate_geval = AsyncMock(
+            return_value=JudgeVerdict(score=0.8, reasoning="ok", raw_response="")
+        )
+
+        runner = EvalRunner(
+            agent_loop=mock_loop,
+            judge=mock_judge,
+            system_prompt="test",
+        )
+
+        tasks = [
+            GoldenTask(
+                id=f"t-{i}",
+                name=f"Task {i}",
+                tier=1,
+                input=f"Do thing {i}",
+                expected_behavior="Do it",
+                expected_tools=[],
+                tags=[],
+            )
+            for i in range(3)
+        ]
+
+        results = await runner.run_all(tasks=tasks)
+        assert len(results) == 3
+        assert mock_loop.run_async.call_count == 3
+
+    def test_save_results(self, tmp_path):
+        """Results should be saved as timestamped JSON."""
+        mock_judge = MagicMock()
+        mock_loop = MagicMock()
+
+        runner = EvalRunner(
+            agent_loop=mock_loop,
+            judge=mock_judge,
+            system_prompt="test",
+        )
+
+        results = [
+            EvalResult(
+                task_id="t-1",
+                task_name="Test",
+                tier=1,
+                agent_output="done",
+                turns=2,
+                latency_ms=150.0,
+                metrics=[
+                    MetricScore(
+                        metric_name="Task Completion",
+                        score=0.9,
+                        threshold=0.7,
+                        passed=True,
+                    )
+                ],
+            )
+        ]
+
+        path = runner.save_results(results, output_dir=tmp_path)
+        assert path.exists()
+        assert path.suffix == ".json"
+
+        data = json.loads(path.read_text())
+        assert data["task_count"] == 1
+        assert len(data["results"]) == 1
+        assert data["results"][0]["task_id"] == "t-1"
+        assert "summary" in data
+
+    def test_print_summary(self, capsys):
+        """Should print a readable summary."""
+        mock_judge = MagicMock()
+        mock_loop = MagicMock()
+
+        runner = EvalRunner(
+            agent_loop=mock_loop,
+            judge=mock_judge,
+            system_prompt="test",
+        )
+
+        results = [
+            EvalResult(
+                task_id="t-1",
+                task_name="Test",
+                tier=1,
+                agent_output="done",
+                turns=2,
+                latency_ms=100.0,
+                metrics=[
+                    MetricScore(
+                        metric_name="Task Completion",
+                        score=0.9,
+                        threshold=0.7,
+                        passed=True,
+                    )
+                ],
+            )
+        ]
+
+        runner.print_summary(results)
+        captured = capsys.readouterr()
+        assert "EVALUATION SUMMARY" in captured.out
+        assert "t-1" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Tracing
+# ---------------------------------------------------------------------------
+
+
+class TestTracing:
+    def test_tracing_disabled_by_default(self):
+        """Tracing should be off unless env var set."""
+        os.environ.pop("PROMETHEUS_TRACING", None)
+        from prometheus.tracing.phoenix import is_tracing_enabled
+
+        assert not is_tracing_enabled()
+
+    def test_span_context_noop(self):
+        """span_context should be a passthrough when disabled."""
+        os.environ.pop("PROMETHEUS_TRACING", None)
+        from prometheus.tracing.spans import span_context
+
+        with span_context("test_span", {"key": "value"}) as s:
+            pass  # Should not raise
+
+    def test_traced_decorator_sync(self):
+        """@traced should not modify sync function behavior when disabled."""
+        os.environ.pop("PROMETHEUS_TRACING", None)
+        from prometheus.tracing.spans import traced
+
+        @traced("test_func")
+        def my_func(x):
+            return x * 2
+
+        assert my_func(5) == 10
+
+    @pytest.mark.asyncio
+    async def test_traced_decorator_async(self):
+        """@traced should not modify async function behavior when disabled."""
+        os.environ.pop("PROMETHEUS_TRACING", None)
+        from prometheus.tracing.spans import traced
+
+        @traced("test_async")
+        async def my_async(x):
+            return x + 1
+
+        result = await my_async(10)
+        assert result == 11
+
+    def test_init_tracing_disabled(self):
+        """init_tracing should return None when disabled."""
+        os.environ.pop("PROMETHEUS_TRACING", None)
+        from prometheus.tracing.phoenix import init_tracing, shutdown_tracing
+
+        # Reset state
+        shutdown_tracing()
+
+        result = init_tracing({})
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Trend Tracking
+# ---------------------------------------------------------------------------
+
+
+class TestTrendTracker:
+    def test_record_and_get_latest(self, tmp_path):
+        """Should store and retrieve run summaries."""
+        tracker = TrendTracker(tmp_path / "trends.db")
+
+        tracker.record({
+            "total_tasks": 10,
+            "completed": 9,
+            "errored": 1,
+            "avg_latency_ms": 250.0,
+            "metric_averages": {"Task Completion": 0.82, "Tool Usage": 0.95},
+        })
+        tracker.record({
+            "total_tasks": 10,
+            "completed": 10,
+            "errored": 0,
+            "avg_latency_ms": 200.0,
+            "metric_averages": {"Task Completion": 0.88, "Tool Usage": 0.97},
+        })
+
+        rows = tracker.get_latest(5)
+        assert len(rows) == 2
+        # Latest first
+        assert rows[0].completed == 10
+        assert rows[0].metric_averages["Task Completion"] == 0.88
+        assert rows[1].completed == 9
+
+        tracker.close()
+
+    def test_get_previous(self, tmp_path):
+        """Should return the most recent stored run."""
+        tracker = TrendTracker(tmp_path / "trends.db")
+
+        assert tracker.get_previous() is None  # empty
+
+        tracker.record({
+            "total_tasks": 5,
+            "completed": 5,
+            "errored": 0,
+            "avg_latency_ms": 100.0,
+            "metric_averages": {"Task Completion": 0.75},
+        })
+
+        prev = tracker.get_previous()
+        assert prev is not None
+        assert prev.task_count == 5
+        assert prev.metric_averages["Task Completion"] == 0.75
+
+        tracker.close()
+
+    def test_format_trend_comparison_with_previous(self, tmp_path):
+        """Should show delta vs previous run."""
+        tracker = TrendTracker(tmp_path / "trends.db")
+
+        previous = TrendRow(
+            timestamp="2026-04-05",
+            task_count=10,
+            completed=10,
+            errored=0,
+            avg_latency_ms=200.0,
+            metric_averages={"Task Completion": 0.72, "Tool Usage": 0.90},
+        )
+
+        current = {"Task Completion": 0.85, "Tool Usage": 0.92}
+
+        output = tracker.format_trend_comparison(current, previous)
+        assert "+0.130" in output  # 0.85 - 0.72
+        assert "+0.020" in output  # 0.92 - 0.90
+        assert "Task Completion" in output
+
+        tracker.close()
+
+    def test_format_trend_comparison_no_previous(self, tmp_path):
+        """Should show (new) when no previous run exists."""
+        tracker = TrendTracker(tmp_path / "trends.db")
+
+        current = {"Task Completion": 0.85}
+        output = tracker.format_trend_comparison(current, None)
+        assert "(new)" in output
+
+        tracker.close()
+
+    def test_format_trend_empty_metrics(self, tmp_path):
+        """Should handle empty metrics gracefully."""
+        tracker = TrendTracker(tmp_path / "trends.db")
+        output = tracker.format_trend_comparison({}, None)
+        assert "(no metrics)" in output
+        tracker.close()

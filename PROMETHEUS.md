@@ -24,6 +24,8 @@ prometheus/
   telemetry/    Tool call tracking (Sprint 3)
   config/       Settings + path management + env var overrides (Sprint 11) ✓
   mcp/          MCP integration — tool servers + Context7 (Sprint 12) ✓
+  evals/        DeepEval evaluation suite + G-Eval metrics (Sprint 13) ✓
+  tracing/      Phoenix/OpenTelemetry trace visualization (Sprint 13) ✓
 ```
 
 ## Key Conventions
@@ -775,6 +777,7 @@ messages = compressor.maybe_compress(messages)
 - [x] Sprint 10: Model Router + Divergence Detector
 - [x] Sprint 11: Security Hardening — env overrides, audit logging, exfiltration detection
 - [x] Sprint 12: MCP Integration + Context7
+- [x] Sprint 13: DeepEval + Phoenix — G-Eval metrics, trend tracking, nightly cron
 
 ---
 
@@ -2491,4 +2494,174 @@ tests/
   test_mcp_transport.py        — 20 tests (stdio, HTTP, resolve priority)
   test_mcp_names.py            — 12 tests (sanitization, collision avoidance)
   test_mcp_adapter.py          — 17 tests (adapter schema, execute, registry, runtime unit)
+```
+
+## Sprint 13: DeepEval + Phoenix Evaluation Suite ✓
+
+Automated quality measurement with LLM-as-judge scoring, visual trace debugging, and nightly cron.
+
+### `prometheus.evals.golden_dataset`
+`src/prometheus/evals/golden_dataset.py` — 26 canonical evaluation tasks
+
+```python
+class TaskTier(IntEnum):
+    TIER_1 = 1  # Atomic single-tool (21 tasks)
+    TIER_2 = 2  # Multi-step workflows (5 tasks)
+
+@dataclass
+class GoldenTask:
+    id: str
+    name: str
+    tier: int
+    input: str                   # Prompt for agent
+    expected_behavior: str       # Free-text for LLM judge
+    expected_tools: list[str]
+    tags: list[str]
+    requires_network: bool       # True for web_search/web_fetch tasks
+    max_turns: int = 10
+
+load_golden_dataset(tier=None, skip_network=True) -> list[GoldenTask]
+```
+
+### `prometheus.evals.judge`
+`src/prometheus/evals/judge.py` — LLM-as-judge via llama.cpp `/v1/chat/completions`
+
+```python
+@dataclass
+class JudgeVerdict:
+    score: float         # 0.0-1.0
+    reasoning: str
+    raw_response: str
+
+class PrometheusJudge:
+    def __init__(self, base_url="http://GPU_HOST:8080", model=None, timeout=120.0)
+
+    # JSON-based scoring (original)
+    async def evaluate(task_input, agent_output, expected_behavior, tool_trace=None) -> JudgeVerdict
+
+    # G-Eval: chain-of-thought scoring (more reliable with local models)
+    async def evaluate_geval(criteria: list[str], context: str) -> JudgeVerdict
+```
+
+G-Eval lets the model reason through numbered criteria before producing a `SCORE: X.X` line. More consistent than JSON-only prompting with Qwen/Gemma because the model thinks before scoring.
+
+### `prometheus.evals.metrics`
+`src/prometheus/evals/metrics.py` — three evaluation metrics (DeepEval-compatible stubs when deepeval not installed)
+
+```python
+class TaskCompletionMetric(BaseMetric):     # G-Eval chain-of-thought, threshold=0.7
+    def __init__(self, judge: PrometheusJudge, threshold=0.7)
+
+class ToolUsageMetric(BaseMetric):          # Deterministic, no LLM needed, threshold=0.5
+    def __init__(self, threshold=0.5)
+
+class NoHallucinationMetric(BaseMetric):    # G-Eval chain-of-thought, threshold=0.8
+    def __init__(self, judge: PrometheusJudge, threshold=0.8)
+```
+
+`TaskCompletionMetric` and `NoHallucinationMetric` use `evaluate_geval()`. `ToolUsageMetric` is deterministic — compares tool trace against expected tools, no LLM call.
+
+### `prometheus.evals.runner`
+`src/prometheus/evals/runner.py` — orchestrates golden tasks through `AgentLoop`
+
+```python
+@dataclass
+class MetricScore:
+    metric_name: str; score: float; threshold: float; passed: bool; reasoning: str
+
+@dataclass
+class EvalResult:
+    task_id: str; task_name: str; tier: int; agent_output: str
+    turns: int; latency_ms: float; tool_trace: list[dict]
+    metrics: list[MetricScore]; error: str | None
+
+class EvalRunner:
+    def __init__(self, agent_loop: AgentLoop, judge: PrometheusJudge, system_prompt: str, *, config=None)
+    async def run_task(task: GoldenTask) -> EvalResult
+    async def run_all(tasks=None, *, tier=None, skip_network=True) -> list[EvalResult]
+    def save_results(results, output_dir=None) -> Path     # JSON + trend record
+    def print_summary(results, output_dir=None) -> None    # stdout with trend comparison
+```
+
+Critical: copies `AgentLoop._tool_trace` immediately after `run_async()` (reset at line 504, cleared by post-task hook at line 533).
+
+### `prometheus.evals.trends`
+`src/prometheus/evals/trends.py` — score tracking over time via SQLite
+
+```python
+@dataclass
+class TrendRow:
+    timestamp: str; task_count: int; completed: int; errored: int
+    avg_latency_ms: float; metric_averages: dict[str, float]
+
+class TrendTracker:
+    def __init__(self, db_path=None)               # default: ~/.prometheus/eval_results/trends.db
+    def record(summary: dict) -> None              # append run summary row
+    def get_latest(n=10) -> list[TrendRow]         # most recent N runs
+    def get_previous() -> TrendRow | None          # last run before current
+    def format_trend_comparison(current, previous) -> str  # "Task Completion: 0.850 (+0.130 vs prev)"
+```
+
+`save_results()` automatically calls `TrendTracker.record()`. `print_summary()` shows deltas vs previous run.
+
+### `prometheus.tracing`
+`src/prometheus/tracing/` — optional Phoenix/OpenTelemetry integration
+
+```python
+# phoenix.py
+init_tracing(config=None) -> TracerProvider | None   # gated by PROMETHEUS_TRACING=1
+get_tracer() -> Tracer | _NoOpTracer                 # no-op when disabled
+shutdown_tracing() -> None                           # flush + cleanup
+
+# spans.py
+@traced(name=None, attributes=None)                  # decorator for sync/async functions
+span_context(name, attributes=None)                  # context manager for ad-hoc spans
+```
+
+Zero-cost when disabled: `_NoOpTracer` and `_NoOpSpan` avoid any overhead in the hot path.
+
+### Nightly Script
+`scripts/run_nightly_evals.py` — cron-ready standalone runner
+
+```bash
+# Cron: 0 3 * * * cd ~/Prometheus && .venv/bin/python scripts/run_nightly_evals.py
+python scripts/run_nightly_evals.py              # default: skip network tasks
+python scripts/run_nightly_evals.py --tier 1     # tier 1 only
+python scripts/run_nightly_evals.py --no-skip-network  # include web tasks
+PROMETHEUS_TRACING=1 python scripts/run_nightly_evals.py  # with Phoenix spans
+```
+
+Imports factory functions from `__main__.py` (same pattern as `scripts/daemon.py`). Health-checks judge endpoint before running.
+
+### Wiring Into Existing Modules
+
+| Existing Module | How Sprint 13 Connects |
+|--------|-------------|
+| `engine/agent_loop.py` | `EvalRunner` calls `AgentLoop.run_async()`, reads `_tool_trace` for metrics |
+| `__main__.py` | Nightly script imports `load_config`, `create_provider`, `create_tool_registry`, `create_adapter`, `create_security_gate`, `build_system_prompt` |
+| `benchmarks/` | Golden dataset covers same tool categories as Sprint 8 suite but uses `input`/`expected_behavior` for LLM judging instead of deterministic checks |
+| `telemetry/tracker.py` | Complements existing `ToolCallTelemetry` — evals measure quality, telemetry measures reliability |
+| `pyproject.toml` | `evals = ["deepeval>=2.0", "arize-phoenix>=5.0", "opentelemetry-api>=1.20", "opentelemetry-sdk>=1.20"]` optional deps |
+| `config/prometheus.yaml` | `evals:` (judge_base_url, results_dir, skip_network_tasks) and `tracing:` (enabled, phoenix_endpoint, service_name) sections |
+
+### File Tree
+
+```
+evals/
+  __init__.py                  — package exports
+  golden_dataset.py            — GoldenTask, TaskTier, load_golden_dataset()
+  judge.py                     — PrometheusJudge (evaluate + evaluate_geval)
+  metrics.py                   — TaskCompletionMetric, ToolUsageMetric, NoHallucinationMetric
+  runner.py                    — EvalRunner, EvalResult, MetricScore
+  trends.py                    — TrendTracker, TrendRow (SQLite)
+tracing/
+  __init__.py                  — package exports
+  phoenix.py                   — init_tracing(), get_tracer(), shutdown_tracing()
+  spans.py                     — @traced decorator, span_context()
+scripts/
+  run_nightly_evals.py         — cron-ready nightly eval runner
+config/prometheus.yaml         — evals + tracing sections added
+pyproject.toml                 — evals optional dependency group
+tests/
+  test_evals.py                — 40 tests (dataset, judge, G-Eval, metrics, runner, trends, tracing)
 ```

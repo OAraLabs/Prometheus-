@@ -140,3 +140,15 @@ mcp_servers:
   # filesystem:
   #   command: npx
   #   args: ["-y", "@anthropic/filesystem-mcp", "/home/will/projects"]
+
+# Evaluation Suite (Sprint 13)
+evals:
+  judge_base_url: "http://GPU_HOST:8080"
+  results_dir: "~/.prometheus/eval_results"
+  skip_network_tasks: true
+
+# Phoenix Tracing (Sprint 13)
+tracing:
+  enabled: false                      # also gated by PROMETHEUS_TRACING=1 env var
+  phoenix_endpoint: "http://127.0.0.1:6006"
+  service_name: "prometheus"
