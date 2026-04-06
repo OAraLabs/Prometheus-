@@ -96,25 +96,42 @@ class PrometheusJudge:
             log.warning("Could not detect judge model: %s", exc)
         return "unknown"
 
-    async def _call_llm(self, system: str, user: str, max_tokens: int = 1024) -> str:
-        """Send a chat completion request and return the response text."""
+    async def _call_llm(
+        self, system: str, user: str, max_tokens: int = 1024, retries: int = 2
+    ) -> str:
+        """Send a chat completion request and return the response text.
+
+        Retries up to `retries` times if the model returns an empty response,
+        bumping temperature slightly each attempt to nudge different output.
+        """
         model = await self._detect_model()
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{self._base_url}/v1/chat/completions",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.1,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        return data["choices"][0]["message"]["content"]
+        for attempt in range(retries + 1):
+            temp = 0.1 + (attempt * 0.15)  # 0.1 → 0.25 → 0.4
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    f"{self._base_url}/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                        "max_tokens": max_tokens,
+                        "temperature": temp,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            if content and content.strip():
+                return content
+            if attempt < retries:
+                log.warning(
+                    "Empty LLM response (attempt %d/%d), retrying with temp=%.2f",
+                    attempt + 1, retries + 1, temp + 0.15,
+                )
+        log.warning("Empty LLM response after %d attempts", retries + 1)
+        return ""
 
     # ------------------------------------------------------------------
     # JSON-based evaluation (original)

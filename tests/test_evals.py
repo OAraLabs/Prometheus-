@@ -221,6 +221,75 @@ class TestPrometheusJudge:
         verdict = judge._parse_geval_verdict("   ")
         assert verdict.score == 0.0
 
+    @pytest.mark.asyncio
+    async def test_call_llm_retries_on_empty(self):
+        """Should retry when model returns empty response."""
+        judge = PrometheusJudge(base_url="http://test:8080")
+
+        call_count = 0
+
+        def make_response(content):
+            mock = MagicMock()
+            mock.json.return_value = {
+                "choices": [{"message": {"content": content}}]
+            }
+            mock.raise_for_status = MagicMock()
+            return mock
+
+        async def fake_post(url, json=None):
+            nonlocal call_count
+            call_count += 1
+            # First two calls return empty, third returns real content
+            if call_count <= 2:
+                return make_response("")
+            return make_response("SCORE: 0.9")
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post = fake_post
+            mock_instance.get = AsyncMock(
+                return_value=MagicMock(
+                    json=lambda: {"data": [{"id": "test-model"}]},
+                    raise_for_status=MagicMock(),
+                )
+            )
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await judge._call_llm("system", "user", retries=2)
+
+        assert result == "SCORE: 0.9"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_call_llm_returns_empty_after_exhausted_retries(self):
+        """Should return empty string after all retries exhausted."""
+        judge = PrometheusJudge(base_url="http://test:8080")
+
+        def make_empty():
+            mock = MagicMock()
+            mock.json.return_value = {
+                "choices": [{"message": {"content": ""}}]
+            }
+            mock.raise_for_status = MagicMock()
+            return mock
+
+        with patch("httpx.AsyncClient") as mock_client:
+            mock_instance = AsyncMock()
+            mock_instance.post = AsyncMock(return_value=make_empty())
+            mock_instance.get = AsyncMock(
+                return_value=MagicMock(
+                    json=lambda: {"data": [{"id": "test-model"}]},
+                    raise_for_status=MagicMock(),
+                )
+            )
+            mock_client.return_value.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await judge._call_llm("system", "user", retries=1)
+
+        assert result == ""
+
 
 # ---------------------------------------------------------------------------
 # ToolUsageMetric
