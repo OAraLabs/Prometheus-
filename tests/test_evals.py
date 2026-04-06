@@ -188,6 +188,34 @@ class TestPrometheusJudge:
         verdict = judge._parse_geval_verdict("I think this is 0.6 quality")
         assert verdict.score == 0.6  # fallback regex
 
+    def test_parse_geval_verdict_alt_patterns(self):
+        """Should find score from alternative patterns like 'final score'."""
+        judge = PrometheusJudge()
+        # "final score: X"
+        verdict = judge._parse_geval_verdict(
+            "1. Good work.\n2. Mostly done.\nFinal score: 0.8"
+        )
+        assert verdict.score == 0.8
+        # "score is X"
+        verdict = judge._parse_geval_verdict("Overall the score is 0.75")
+        assert verdict.score == 0.75
+
+    def test_parse_geval_verdict_last_line_decimal(self):
+        """Should find standalone 0.X on last line as last resort."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_geval_verdict(
+            "1. Agent did the task well.\n2. Output is correct.\n0.9"
+        )
+        assert verdict.score == 0.9
+
+    def test_parse_geval_verdict_empty(self):
+        """Should handle empty response."""
+        judge = PrometheusJudge()
+        verdict = judge._parse_geval_verdict("")
+        assert verdict.score == 0.0
+        verdict = judge._parse_geval_verdict("   ")
+        assert verdict.score == 0.0
+
 
 # ---------------------------------------------------------------------------
 # ToolUsageMetric
@@ -217,10 +245,10 @@ class TestToolUsageMetric:
         tc = _SimpleTestCase(
             input="Write and read",
             actual_output="Done",
-            expected_output="Uses file_write and file_read",
-            context=["Tools expected: file_write, file_read"],
+            expected_output="Uses write_file and read_file",
+            context=["Tools expected: write_file, read_file"],
             additional_metadata={
-                "tool_trace": [{"tool_name": "file_write", "result": "ok"}]
+                "tool_trace": [{"tool_name": "write_file", "result": "ok"}]
             },
         )
         score = metric.measure(tc)
@@ -244,8 +272,8 @@ class TestToolUsageMetric:
         tc = _SimpleTestCase(
             input="Read file",
             actual_output="...",
-            expected_output="Uses file_read",
-            context=["Tools expected: file_read"],
+            expected_output="Uses read_file",
+            context=["Tools expected: read_file"],
             additional_metadata={"tool_trace": []},
         )
         score = metric.measure(tc)

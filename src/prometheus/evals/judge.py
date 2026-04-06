@@ -38,14 +38,18 @@ Respond with ONLY a JSON object: {"score": <float>, "reasoning": "<brief explana
 """
 
 _GEVAL_SYSTEM_PROMPT = """\
-You are an evaluation judge. You will evaluate an AI agent's output \
-by reasoning through specific criteria step by step.
+You are an evaluation judge. Evaluate an AI agent's output by reasoning through criteria step by step.
 
-For each criterion, explain your assessment briefly. \
-After evaluating all criteria, provide your final score.
+Rules:
+1. For each criterion, write one brief sentence of assessment.
+2. After all criteria, you MUST write your final score on its own line.
+3. The score line format is exactly: SCORE: 0.X (a number between 0.0 and 1.0)
 
-IMPORTANT: Your very last line MUST be exactly: SCORE: <number>
-where <number> is between 0.0 and 1.0.
+Example output format:
+1. The agent attempted the task. Yes, it ran the correct command.
+2. The output is accurate. It matches what was expected.
+3. No fabricated information. All data came from tool results.
+SCORE: 0.85
 """
 
 
@@ -170,8 +174,8 @@ class PrometheusJudge:
 Evaluate step by step using these criteria:
 {criteria_text}
 
-Think through each criterion, then write your final score.
-Your last line MUST be: SCORE: <number from 0.0 to 1.0>"""
+Write one sentence per criterion, then end with SCORE: followed by a number.
+Example ending: SCORE: 0.85"""
 
         raw = await self._call_llm(_GEVAL_SYSTEM_PROMPT, user_prompt, max_tokens=1024)
         return self._parse_geval_verdict(raw)
@@ -198,17 +202,36 @@ Your last line MUST be: SCORE: <number from 0.0 to 1.0>"""
     def _parse_geval_verdict(self, raw: str) -> JudgeVerdict:
         """Parse G-Eval chain-of-thought response.
 
-        Looks for 'SCORE: X.X' at the end of the response. The reasoning
-        is everything before the SCORE line.
+        Looks for 'SCORE: X.X' in the response. Falls back to alternative
+        patterns like 'score is 0.X', 'rating: 0.X', or a standalone
+        decimal on the last non-empty line.
         """
-        # Look for SCORE: pattern (case-insensitive, anywhere in response)
+        if not raw or not raw.strip():
+            log.warning("Empty G-Eval response")
+            return JudgeVerdict(score=0.0, reasoning="Empty response", raw_response=raw)
+
+        # Primary: SCORE: pattern (case-insensitive)
         match = re.search(r"SCORE:\s*(\d+\.?\d*)", raw, re.IGNORECASE)
+
+        # Fallback patterns if SCORE: not found
+        if not match:
+            match = re.search(
+                r"(?:final\s+score|rating|score\s+is|score\s*=)\s*:?\s*(\d+\.?\d*)",
+                raw, re.IGNORECASE,
+            )
+
+        # Last resort: standalone decimal (0.X or 1.0) on the last non-empty line
+        if not match:
+            last_lines = [l.strip() for l in raw.strip().splitlines() if l.strip()]
+            if last_lines:
+                last_match = re.search(r"\b(0\.\d+|1\.0)\b", last_lines[-1])
+                if last_match:
+                    match = last_match
+
         if match:
             score = max(0.0, min(1.0, float(match.group(1))))
-            # Everything before the SCORE line is reasoning
             reasoning_end = match.start()
-            reasoning = raw[:reasoning_end].strip()
-            # Take last ~500 chars of reasoning (the most relevant part)
+            reasoning = raw[:reasoning_end].strip() if reasoning_end > 0 else raw.strip()
             if len(reasoning) > 500:
                 reasoning = "..." + reasoning[-500:]
             return JudgeVerdict(
@@ -217,7 +240,7 @@ Your last line MUST be: SCORE: <number from 0.0 to 1.0>"""
                 raw_response=raw,
             )
 
-        log.warning("No SCORE: found in G-Eval response: %s", raw[:200])
+        log.warning("No score found in G-Eval response: %s", raw[:200])
         return self._fallback_parse(raw)
 
     def _fallback_parse(self, raw: str) -> JudgeVerdict:
