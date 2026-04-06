@@ -45,7 +45,7 @@ class BashTool(BaseTool):
         workspace: str | Path | None = None,
         max_output: int = _DEFAULT_MAX_OUTPUT,
     ) -> None:
-        self._workspace = Path(workspace).resolve() if workspace else None
+        self._workspace = Path(workspace).expanduser().resolve() if workspace else None
         self._max_output = max_output
 
     async def execute(self, arguments: BashToolInput, context: ToolExecutionContext) -> ToolResult:
