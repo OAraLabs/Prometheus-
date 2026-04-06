@@ -31,20 +31,8 @@ from prometheus.gateway.cron_scheduler import run_scheduler_loop
 from prometheus.gateway.heartbeat import Heartbeat
 from prometheus.gateway.telegram import TelegramAdapter
 from prometheus.providers.llama_cpp import LlamaCppProvider
+from prometheus.__main__ import create_tool_registry
 from prometheus.tools.base import ToolRegistry
-from prometheus.tools.builtin import (
-    BashTool,
-    FileEditTool,
-    FileReadTool,
-    FileWriteTool,
-    GlobTool,
-    GrepTool,
-)
-from prometheus.tools.builtin.cron_create import CronCreateTool
-from prometheus.tools.builtin.cron_delete import CronDeleteTool
-from prometheus.tools.builtin.cron_list import CronListTool
-from prometheus.tools.builtin.wiki_compile import WikiCompileTool
-from prometheus.tools.builtin.wiki_query import WikiQueryTool
 
 logger = logging.getLogger("prometheus.daemon")
 
@@ -71,23 +59,25 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
         return yaml.safe_load(fh) or {}
 
 
-def build_tool_registry(workspace: str | None = None) -> ToolRegistry:
-    """Create the default tool registry with all builtin + cron tools."""
-    registry = ToolRegistry()
-    for tool in [
-        BashTool(workspace=workspace),
-        FileReadTool(),
-        FileWriteTool(),
-        FileEditTool(),
-        GrepTool(),
-        GlobTool(),
-        CronCreateTool(),
-        CronDeleteTool(),
-        CronListTool(),
-        WikiCompileTool(),
-        WikiQueryTool(),
-    ]:
-        registry.register(tool)
+def build_tool_registry(security_cfg: dict[str, Any] | None = None) -> ToolRegistry:
+    """Create the tool registry with all builtin tools (same as CLI).
+
+    Reuses create_tool_registry() from __main__ so daemon and CLI
+    always have the same tool set.
+    """
+    if security_cfg is None:
+        security_cfg = {}
+    registry = create_tool_registry(security_cfg)
+
+    # Add wiki tools (daemon-specific, not in CLI)
+    try:
+        from prometheus.tools.builtin.wiki_compile import WikiCompileTool
+        from prometheus.tools.builtin.wiki_query import WikiQueryTool
+        registry.register(WikiCompileTool())
+        registry.register(WikiQueryTool())
+    except Exception:
+        pass
+
     return registry
 
 
@@ -116,9 +106,8 @@ async def run_daemon(args: argparse.Namespace) -> None:
     else:
         logger.info("Using model name from config: %s", config_model)
 
-    # Tool registry
-    workspace = security_config.get("workspace_root")
-    registry = build_tool_registry(workspace=workspace)
+    # Tool registry — same tools as CLI mode
+    registry = build_tool_registry(security_cfg=security_config)
 
     # Agent loop
     agent_loop = AgentLoop(
