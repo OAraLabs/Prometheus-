@@ -23,6 +23,7 @@ prometheus/
   benchmarks/   Benchmark suite + runner (Sprint 8) ✓
   telemetry/    Tool call tracking (Sprint 3)
   config/       Settings + path management + env var overrides (Sprint 11) ✓
+  mcp/          MCP integration — tool servers + Context7 (Sprint 12) ✓
 ```
 
 ## Key Conventions
@@ -773,6 +774,7 @@ messages = compressor.maybe_compress(messages)
 - [x] Sprint 9: SENTINEL — Proactive Daemon + AutoDream
 - [x] Sprint 10: Model Router + Divergence Detector
 - [x] Sprint 11: Security Hardening — env overrides, audit logging, exfiltration detection
+- [x] Sprint 12: MCP Integration + Context7
 
 ---
 
@@ -2311,4 +2313,182 @@ tests/
   test_config_env.py           — 13 tests (env overrides, secret file loading, symlink rejection)
   test_exfiltration.py         — 18 tests (block patterns + allow patterns + URL check)
   test_audit.py                — 16 tests (JSONL/SQLite write, query, redaction, gate integration)
+```
+
+---
+
+## Sprint 12: MCP Integration + Context7 ✓
+
+### `prometheus.mcp.types`
+`src/prometheus/mcp/types.py` — catalog and status types
+
+```python
+@dataclass
+class McpServerCatalog:
+    server_name: str
+    launch_summary: str
+    tool_count: int
+
+@dataclass
+class McpCatalogTool:
+    server_name: str
+    safe_server_name: str
+    tool_name: str
+    description: str
+    input_schema: dict[str, Any]
+
+@dataclass
+class McpToolCatalog:
+    version: int = 1
+    generated_at: float = 0.0
+    servers: dict[str, McpServerCatalog]
+    tools: list[McpCatalogTool]
+
+@dataclass
+class McpConnectionStatus:
+    name: str
+    state: Literal["connected", "failed", "pending", "disabled"]
+    transport: str = "unknown"
+    detail: str = ""
+    tool_count: int = 0
+
+def create_config_fingerprint(servers: dict) -> str   # sha1 for change detection
+```
+
+### `prometheus.mcp.transport`
+`src/prometheus/mcp/transport.py` — transport resolution (OpenClaw `mcp-transport-config.ts`)
+
+```python
+@dataclass
+class ResolvedStdioTransport:
+    kind: Literal["stdio"]
+    command: str
+    args: list[str]
+    env: dict[str, str] | None
+    cwd: str | None
+    timeout_ms: int
+    @property description -> str
+
+@dataclass
+class ResolvedHttpTransport:
+    kind: Literal["http"]
+    transport_type: Literal["sse", "streamable-http"]
+    url: str
+    headers: dict[str, str] | None
+    timeout_ms: int
+    @property description -> str         # redacts passwords
+
+def resolve_stdio_config(raw: dict) -> ResolvedStdioTransport | None
+def resolve_http_config(raw: dict, transport_type: str = "sse") -> ResolvedHttpTransport | None
+def resolve_transport(server_name: str, raw: dict) -> ResolvedTransport | None
+    # Priority: stdio (command) > streamable-http > sse (url)
+```
+
+### `prometheus.mcp.names`
+`src/prometheus/mcp/names.py` — safe tool naming (OpenClaw `pi-bundle-mcp-names.ts`)
+
+```python
+def sanitize_server_name(name: str, used_names: set[str]) -> str
+def sanitize_tool_name(name: str) -> str
+def build_safe_tool_name(server_name: str, tool_name: str, reserved_names: set[str]) -> str
+    # Returns "mcp__{server}__{tool}" with collision suffix if needed
+```
+
+### `prometheus.mcp.runtime`
+`src/prometheus/mcp/runtime.py` — connection management (OpenClaw `pi-bundle-mcp-runtime.ts`)
+
+```python
+class McpConnectionError(Exception): ...
+
+class McpRuntime:
+    def __init__(server_configs: dict[str, dict])
+    @property config_fingerprint -> str              # detect config changes
+
+    async def connect_all() -> None                  # connect + discover tools
+    def get_catalog() -> McpToolCatalog
+    def list_statuses() -> list[McpConnectionStatus]
+    def list_tools() -> list[McpCatalogTool]
+    async def call_tool(server_name: str, tool_name: str, arguments: dict) -> str
+    async def close() -> None
+```
+
+Internals ported from OpenClaw:
+- `_connect_with_timeout(session, timeout_ms)` — `asyncio.wait_for` wrapper
+- `_list_all_tools(session)` — paginated tool listing
+
+### `prometheus.mcp.adapter`
+`src/prometheus/mcp/adapter.py` — wraps MCP tools as `BaseTool` instances
+
+```python
+class McpToolAdapter(BaseTool):
+    input_model = _McpDynamicInput            # ConfigDict(extra="allow") for arbitrary MCP args
+    def __init__(runtime: McpRuntime, tool_info: McpCatalogTool, safe_name: str)
+    def to_api_schema() -> dict               # returns MCP-provided schema, not pydantic
+    def to_openai_schema() -> dict            # same, in OpenAI format
+    async def execute(arguments, context) -> ToolResult
+    def is_read_only(arguments) -> True
+
+def register_mcp_tools(registry: ToolRegistry, runtime: McpRuntime) -> int
+    # Registers all MCP tools with collision-safe names. Returns count.
+```
+
+### `prometheus.tools.builtin.mcp_status`
+`src/prometheus/tools/builtin/mcp_status.py` — connection status tool
+
+```python
+class McpStatusTool(BaseTool):
+    name = "mcp_status"
+    input_model = McpStatusInput              # server: str | None
+    def __init__(runtime: McpRuntime)
+    async def execute(arguments, context) -> ToolResult
+    def is_read_only(arguments) -> True
+```
+
+### Wiring into Existing Modules
+
+| Module | Integration |
+|--------|-------------|
+| `__main__.py` | `create_mcp_runtime(config, registry)` factory: creates `McpRuntime`, calls `connect_all()`, registers tools + `McpStatusTool` |
+| `__main__.py:main()` | MCP init moved into `_async_main()` so connections live in same event loop as agent loop |
+| `__main__.py:_async_main()` | `await create_mcp_runtime(config, registry)` before run_interactive/run_once; `await mcp_runtime.close()` in finally |
+| `pyproject.toml` | `mcp = ["mcp>=1.0"]` added to optional dependencies |
+| `config/prometheus.yaml` | `mcp_servers:` section with Context7 configured |
+
+### Config Schema
+`config/prometheus.yaml` — new top-level key
+
+```yaml
+mcp_servers:
+  context7:
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+    connectionTimeoutMs: 60000
+
+  # HTTP/SSE example (not yet implemented):
+  # remote_server:
+  #   url: http://localhost:3000/mcp
+  #   transport: sse
+  #   headers:
+  #     Authorization: "Bearer xxx"
+```
+
+### File Tree
+
+```
+mcp/
+  __init__.py                  — package exports
+  types.py                     — McpCatalogTool, McpToolCatalog, McpConnectionStatus
+  transport.py                 — ResolvedStdioTransport, ResolvedHttpTransport, resolve_transport()
+  names.py                     — sanitize_server_name(), build_safe_tool_name()
+  runtime.py                   — McpRuntime (connect, discover, call, close)
+  adapter.py                   — McpToolAdapter (BaseTool wrapper), register_mcp_tools()
+tools/builtin/
+  mcp_status.py                — McpStatusTool
+__main__.py                    — create_mcp_runtime(), _async_main() lifecycle
+config/prometheus.yaml         — mcp_servers section added
+pyproject.toml                 — mcp optional dependency
+tests/
+  test_mcp_transport.py        — 20 tests (stdio, HTTP, resolve priority)
+  test_mcp_names.py            — 12 tests (sanitization, collision avoidance)
+  test_mcp_adapter.py          — 17 tests (adapter schema, execute, registry, runtime unit)
 ```

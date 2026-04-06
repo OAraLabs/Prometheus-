@@ -257,6 +257,31 @@ def create_adapter(model_cfg: dict[str, Any]):
     return ModelAdapter(formatter=AnthropicFormatter(), strictness="NONE")
 
 
+async def create_mcp_runtime(config: dict[str, Any], registry: Any) -> Any:
+    """Create MCP runtime, connect servers, register tools (Sprint 12)."""
+    mcp_servers = config.get("mcp_servers", {})
+    if not mcp_servers:
+        log.debug("MCP: no servers configured")
+        return None
+
+    try:
+        from prometheus.mcp.runtime import McpRuntime
+        from prometheus.mcp.adapter import register_mcp_tools
+        from prometheus.tools.builtin.mcp_status import McpStatusTool
+
+        runtime = McpRuntime(mcp_servers)
+        await runtime.connect_all()
+
+        count = register_mcp_tools(registry, runtime)
+        registry.register(McpStatusTool(runtime))
+        log.info("MCP: registered %d tools + mcp_status", count)
+
+        return runtime
+    except Exception as exc:
+        log.warning("MCP runtime not available: %s", exc)
+        return None
+
+
 def create_model_router(config: dict[str, Any]):
     """Create the model router (Sprint 10)."""
     from prometheus.adapter.router import ModelRouter
@@ -576,10 +601,22 @@ def main() -> None:
     import uuid
     session_id = f"cli-{uuid.uuid4().hex[:8]}"
 
-    if args.once:
-        asyncio.run(run_once(context, args.once))
-    else:
-        asyncio.run(run_interactive(context, lcm_engine, session_id))
+    async def _async_main() -> None:
+        # Sprint 12: MCP servers (must live in same async context as agent loop)
+        mcp_runtime = None
+        if config.get("mcp_servers"):
+            mcp_runtime = await create_mcp_runtime(config, registry)
+
+        try:
+            if args.once:
+                await run_once(context, args.once)
+            else:
+                await run_interactive(context, lcm_engine, session_id)
+        finally:
+            if mcp_runtime:
+                await mcp_runtime.close()
+
+    asyncio.run(_async_main())
 
     # Cleanup
     if lcm_engine:

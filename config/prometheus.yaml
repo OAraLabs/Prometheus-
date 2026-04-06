@@ -127,3 +127,16 @@ sentinel:
   digest_lookback_hours: 24         # telemetry digest window
   auto_fix_wiki: true               # let wiki linter auto-fix safe issues
   synthesis_enabled: true           # enable LLM-powered knowledge synthesis
+
+# MCP Servers (Sprint 12)
+mcp_servers:
+  # Context7 — up-to-date library documentation
+  context7:
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+    connectionTimeoutMs: 60000        # Context7 can be slow on first start
+
+  # Example: filesystem server (disabled — uncomment to enable)
+  # filesystem:
+  #   command: npx
+  #   args: ["-y", "@anthropic/filesystem-mcp", "/home/will/projects"]

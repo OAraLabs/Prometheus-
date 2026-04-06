@@ -22,6 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
 browser = ["playwright>=1.40"]
+mcp = ["mcp>=1.0"]
 slack = ["slack-bolt>=1.18.0", "slack-sdk>=3.27.0"]
 dev = [
     "pytest>=8.0",
