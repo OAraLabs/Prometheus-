@@ -190,13 +190,15 @@ async def test_bash_tool_workspace_lock_allows_inside(workspace: Path):
 
 
 @pytest.mark.asyncio
-async def test_bash_tool_workspace_lock_blocks_outside(workspace: Path):
+async def test_bash_tool_workspace_lock_falls_back_when_no_explicit_cwd(workspace: Path):
+    """When context cwd is outside workspace and no explicit cwd is given,
+    BashTool falls back to the workspace root instead of blocking."""
     outside = Path(tempfile.gettempdir())
     ctx = ToolExecutionContext(cwd=outside)
     tool = BashTool(workspace=workspace)
-    result = await tool.execute(BashToolInput(command="echo pwned"), ctx)
-    assert result.is_error
-    assert "Workspace lock violation" in result.output
+    result = await tool.execute(BashToolInput(command="pwd"), ctx)
+    assert not result.is_error
+    assert str(workspace) in result.output
 
 
 @pytest.mark.asyncio

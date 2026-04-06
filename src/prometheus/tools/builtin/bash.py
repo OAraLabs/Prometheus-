@@ -55,13 +55,18 @@ class BashTool(BaseTool):
             try:
                 cwd.relative_to(self._workspace)
             except ValueError:
-                return ToolResult(
-                    output=(
-                        f"Workspace lock violation: {cwd} is outside "
-                        f"allowed workspace {self._workspace}"
-                    ),
-                    is_error=True,
-                )
+                if not arguments.cwd:
+                    # No explicit cwd requested — fall back to workspace root
+                    # instead of blocking (daemon often runs from repo dir)
+                    cwd = self._workspace
+                else:
+                    return ToolResult(
+                        output=(
+                            f"Workspace lock violation: {cwd} is outside "
+                            f"allowed workspace {self._workspace}"
+                        ),
+                        is_error=True,
+                    )
 
         process = await asyncio.create_subprocess_exec(
             "/bin/bash",
