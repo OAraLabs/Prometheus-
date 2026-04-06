@@ -22,7 +22,7 @@ context:
 
 security:
   permission_mode: "default"
-  workspace_root: "~/.prometheus/workspace"
+  workspace_root: "~"
   denied_commands:
     - "rm -rf /"
     - "rm -rf ~"
