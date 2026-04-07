@@ -22,6 +22,8 @@ def cmd_help() -> str:
         "Commands:\n"
         "/status    — Model, uptime, tools, memory, SENTINEL\n"
         "/model     — Current model name and provider\n"
+        "/profile   — Show/switch agent profiles\n"
+        "/anatomy   — Hardware, GPU, VRAM, infrastructure\n"
         "/wiki      — Wiki stats and recent entries\n"
         "/sentinel  — SENTINEL subsystem status\n"
         "/benchmark — Run a quick smoke test\n"
@@ -225,6 +227,110 @@ def cmd_context(system_prompt: str, model_name: str) -> str:
     filled = round(usage_pct / 100 * bar_len)
     bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
     lines.append(f"[{bar}] {usage_pct:.0f}% used")
+
+    return "\n".join(lines)
+
+
+def cmd_profile(arg: str = "", current: str = "full") -> str:
+    """Handle /profile command — show or switch profiles."""
+    try:
+        from prometheus.config.profiles import ProfileStore
+    except ImportError:
+        return "Profile system not available."
+
+    store = ProfileStore()
+
+    if not arg:
+        # Show current + list available
+        lines = [f"Current profile: {current}\n", "Available profiles:"]
+        for p in store.list_profiles():
+            marker = " [active]" if p.name == current else ""
+            lines.append(f"  {p.name}{marker} -- {p.description}")
+        lines.append("\nSwitch: /profile <name>")
+        return "\n".join(lines)
+
+    # Switch to named profile
+    profile = store.get(arg.strip())
+    if profile is None:
+        names = ", ".join(store.names())
+        return f"Unknown profile: {arg}\nAvailable: {names}"
+
+    tools_desc = "all" if profile.tools is None else ", ".join(profile.tools)
+    bootstrap_desc = ", ".join(profile.bootstrap_files) or "(none)"
+    lines = [
+        f"Switched to: {profile.name}",
+        f"  {profile.description}",
+        f"  Tools: {tools_desc}",
+        f"  Bootstrap: {bootstrap_desc}",
+    ]
+    for sub, enabled in profile.subsystems.items():
+        lines.append(f"  {sub}: {'enabled' if enabled else 'disabled'}")
+    return "\n".join(lines)
+
+
+def cmd_anatomy() -> str:
+    """Return infrastructure summary text."""
+    try:
+        from prometheus.tools.builtin.anatomy import _scanner, _writer, _project_store
+    except ImportError:
+        return "Anatomy module not available."
+
+    if _scanner is None or _writer is None:
+        return "Anatomy not initialized. Is the daemon running with anatomy enabled?"
+
+    import asyncio
+    from prometheus.infra.anatomy import AnatomyScanner
+    from prometheus.infra.anatomy_writer import AnatomyWriter
+
+    scanner: AnatomyScanner = _scanner  # type: ignore[assignment]
+    writer: AnatomyWriter = _writer  # type: ignore[assignment]
+
+    try:
+        state = asyncio.get_event_loop().run_until_complete(scanner.quick_scan())
+    except RuntimeError:
+        # Already in an async context — use a new loop
+        try:
+            loop = asyncio.new_event_loop()
+            state = loop.run_until_complete(scanner.quick_scan())
+            loop.close()
+        except Exception as exc:
+            return f"Anatomy scan failed: {exc}"
+
+    lines: list[str] = ["Prometheus Anatomy\n"]
+
+    lines.append(f"Host: {state.hostname} ({state.platform})")
+    if state.cpu:
+        lines.append(f"CPU: {state.cpu[:50]}")
+    if state.ram_total_gb:
+        lines.append(f"RAM: {state.ram_available_gb:.1f}GB free / {state.ram_total_gb:.0f}GB")
+
+    if state.gpu_name:
+        lines.append(f"\nGPU: {state.gpu_name}")
+        if state.gpu_vram_total_mb:
+            used = state.gpu_vram_used_mb or 0
+            free = state.gpu_vram_free_mb or 0
+            total = state.gpu_vram_total_mb
+            lines.append(f"VRAM: {used}MB / {total}MB ({free}MB free)")
+
+    if state.model_name:
+        lines.append(f"\nModel: {state.model_name}")
+        if state.model_quantization:
+            lines.append(f"Quant: {state.model_quantization}")
+    lines.append(f"Engine: {state.inference_engine} @ {state.inference_url}")
+    lines.append(f"Vision: {'enabled' if state.vision_enabled else 'disabled'}")
+
+    if state.whisper_model:
+        lines.append(f"Whisper: {state.whisper_model}")
+    if state.tailscale_ip:
+        lines.append(f"Tailscale: {state.tailscale_ip} ({len(state.tailscale_peers)} peers)")
+
+    # Active project
+    if _project_store is not None:
+        from prometheus.infra.project_configs import ProjectConfigStore
+        store: ProjectConfigStore = _project_store  # type: ignore[assignment]
+        active = store.get_active()
+        if active:
+            lines.append(f"\nConfig: {active.name} ({active.description})")
 
     return "\n".join(lines)
 

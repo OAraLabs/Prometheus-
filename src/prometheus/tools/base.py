@@ -100,6 +100,14 @@ class ToolRegistry:
         """Return all tool schemas in OpenAI function-calling format."""
         return [tool.to_openai_schema() for tool in self._tools.values()]
 
+    def schemas_for_names(self, names: list[str]) -> list[dict[str, Any]]:
+        """Return tool schemas for the given tool names (preserving order)."""
+        return [
+            self._tools[n].to_api_schema()
+            for n in names
+            if n in self._tools
+        ]
+
     def list_schemas_for_task(self, task_description: str) -> list[dict[str, Any]]:
         """Return tool schemas relevant to the given task description.
 

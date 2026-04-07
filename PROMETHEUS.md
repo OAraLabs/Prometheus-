@@ -807,6 +807,10 @@ messages = compressor.maybe_compress(messages)
 - [x] Sprint 15: Telemetry Wiring Fix — daemon pipeline, error-path coverage, data reset CLI
 - [x] Sprint 15b: GRAFT Phase 1 — Telegram media/vision/voice, scoped lock, sticker cache
 - [x] Sprint 15c: GRAFT Phase 2 — Hook hot reload, compression Tier 2, approval queue, credential pool
+- [x] Sprint 16: GRAFT-THREAD — Gateway-agnostic conversation memory
+- [x] Sprint 17: BOOTSTRAP — Layer 1 identity files (SOUL.md, AGENTS.md, memory wiring)
+- [x] Sprint 18: ANATOMY — Infrastructure self-awareness (hardware, model, VRAM, project configs)
+- [x] Sprint 19: PROFILES — Agent profiles for context-efficient tool/bootstrap loading
 
 ---
 
@@ -3237,3 +3241,239 @@ was passed, giving the model no indication a photo existed.
 | `tools/builtin/vision.py` (Sprint 15b) | VisionTool's multimodal request now reaches llama.cpp instead of crashing |
 | `gateway/telegram.py` (Sprint 15b) | `_handle_photo()` fallback text improved when vision unavailable |
 | `~/.config/prometheus/env` (new) | `EnvironmentFile` for secrets; `prometheus.service` reads token from here |
+
+## Sprint 17: BOOTSTRAP — Layer 1 Identity Files ✓
+
+Prometheus had no persistent identity. The model didn't know who it was, who
+the owner was, or what agents it could spawn. This sprint adds the Layer 1
+bootstrap system — permanent files that load into every system prompt, plus
+wiring for MEMORY.md and USER.md which existed but were never injected.
+
+### Bootstrap files (`~/.prometheus/`)
+
+```
+~/.prometheus/
+├── SOUL.md     — identity, hardware, capabilities, behavioral rules (STATIC, every prompt)
+├── AGENTS.md   — agent registry, specializations, spawn rules (STATIC, every prompt)
+├── MEMORY.md   — persistent facts (DYNAMIC, auto-loaded per turn)
+└── USER.md     — user model (DYNAMIC, auto-loaded per turn)
+```
+
+### `prometheus.context.prompt_assembler` — updated
+`src/prometheus/context/prompt_assembler.py`
+
+```python
+def _load_bootstrap_file(filename: str) -> str | None
+    """Load a bootstrap file from ~/.prometheus/. Returns content or None."""
+
+def _load_memory_and_user() -> str
+    """Load MEMORY.md + USER.md via format_memory_for_prompt(). Returns formatted string."""
+
+def build_runtime_system_prompt(
+    *, cwd: str, config: dict | None = None,
+    memory_content: str = "",       # if empty, auto-loads MEMORY.md + USER.md
+    skills: list | None = None,
+    task_state: str = "",
+    loaded_skill_content: str = "",
+) -> str
+    # Assembly order:
+    # STATIC:  SOUL.md → AGENTS.md → base prompt + environment
+    # DYNAMIC: reasoning → skills → PROMETHEUS.md → MEMORY.md + USER.md → task → skill
+    # Config key "bootstrap" controls load_soul / load_agents toggles
+```
+
+### `config/prometheus.yaml` — new section
+
+```yaml
+bootstrap:
+  load_soul: true       # ~/.prometheus/SOUL.md
+  load_agents: true     # ~/.prometheus/AGENTS.md
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 17 connects |
+|---|---|
+| `context/prompt_assembler.py` (Sprint 1) | `build_runtime_system_prompt()` extended with `_load_bootstrap_file()` for SOUL.md + AGENTS.md in static section; `_load_memory_and_user()` auto-populates dynamic section |
+| `memory/hermes_memory_tool.py` (Sprint 5) | `format_memory_for_prompt()` now called by `_load_memory_and_user()` — was previously defined but never invoked |
+| `config/prometheus.yaml` (Sprint 0) | New `bootstrap:` block with `load_soul` and `load_agents` toggles |
+| `scripts/daemon.py` (Sprint 6) | No changes — `build_runtime_system_prompt(config=config)` picks up bootstrap config automatically |
+| `engine/__init__.py` (Sprint 1) | Lazy `__getattr__` for `AgentLoop`/`RunResult` to break circular import chain (`providers.base` ↔ `engine.__init__` ↔ `engine.agent_loop`) |
+
+## Sprint 18: ANATOMY — Infrastructure Self-Awareness ✓
+
+Prometheus had no awareness of its own hardware, loaded models, VRAM usage,
+or how the Mini and 4090 are wired together. ANATOMY gives Prometheus a view
+of its own body — hardware, engines, resources — and the ability to track
+different project configurations across context switches.
+
+### `prometheus.infra.anatomy`
+`src/prometheus/infra/anatomy.py` — novel code
+
+```python
+@dataclass
+class AnatomyState:
+    hostname: str; platform: str; cpu: str
+    ram_total_gb: float; ram_available_gb: float
+    gpu_name: str | None; gpu_vram_total_mb: int | None
+    gpu_vram_used_mb: int | None; gpu_vram_free_mb: int | None
+    model_name: str | None; model_file: str | None; model_quantization: str | None
+    inference_engine: str; inference_url: str; inference_features: list[str]
+    vision_enabled: bool; whisper_model: str | None
+    tailscale_ip: str | None; tailscale_peers: list[str]
+    disk_total_gb: float; disk_free_gb: float; prometheus_data_size_mb: float
+    scanned_at: str
+
+class AnatomyScanner:
+    def __init__(self, llama_cpp_url: str, ollama_url: str, inference_engine: str) -> None
+    async def scan(self) -> AnatomyState        # full infra scan
+    async def quick_scan(self) -> AnatomyState   # model + VRAM only
+```
+
+Detection methods: `_detect_gpu` (nvidia-smi), `_detect_model` (llama.cpp `/v1/models` + `/props` + `/slots`; Ollama `/api/tags`), `_detect_tailscale` (`tailscale status --json`), `_detect_disk` (`shutil.disk_usage`), `_check_cmdline_vision` (pgrep `--mmproj`).
+
+### `prometheus.infra.anatomy_writer`
+`src/prometheus/infra/anatomy_writer.py` — novel code
+
+```python
+class AnatomyWriter:
+    def __init__(self, anatomy_path: Path | None = None) -> None
+    def write(self, state: AnatomyState, project_summaries: list[dict]) -> str
+    def update_active_section(self, state: AnatomyState) -> None
+    def render_mermaid(self, state: AnatomyState) -> str
+    def render_summary(self, state: AnatomyState, project_names: list[str]) -> str
+```
+
+### `prometheus.infra.project_configs`
+`src/prometheus/infra/project_configs.py` — novel code
+
+```python
+@dataclass
+class ModelSlot:
+    name: str; role: str; engine: str; machine: str
+    vram_estimate_gb: float; port: int; gguf_file: str | None; extra_flags: list[str]
+
+@dataclass
+class ProjectConfig:
+    name: str; description: str; models: list[ModelSlot]; services: list[str]
+    notes: str; last_used: str | None; active: bool
+
+class ProjectConfigStore:
+    def __init__(self, projects_dir: Path | None = None) -> None
+    def list_projects(self) -> list[ProjectConfig]
+    def get(self, name: str) -> ProjectConfig | None
+    def get_active(self) -> ProjectConfig | None
+    def save(self, config: ProjectConfig) -> None
+    def activate(self, name: str) -> bool
+    def summaries(self) -> list[dict]
+```
+
+Project configs stored as YAML in `~/.prometheus/anatomy/projects/*.yaml`.
+
+### `prometheus.tools.builtin.anatomy`
+`src/prometheus/tools/builtin/anatomy.py` — novel code
+
+```python
+class AnatomyTool(BaseTool):
+    name = "anatomy"
+    # Actions: scan, status, projects, switch, diagram, history
+    async def execute(self, arguments: AnatomyInput, context: ToolExecutionContext) -> ToolResult
+
+def set_anatomy_components(scanner, writer, project_store) -> None
+```
+
+### `prometheus.context.prompt_assembler` — updated
+```python
+def _load_anatomy_summary() -> str | None
+    # Extracts Active Configuration section from ANATOMY.md
+    # Injects into static section after AGENTS.md, before base prompt
+```
+
+### `config/prometheus.yaml` — new section
+```yaml
+anatomy:
+  enabled: true
+  scan_on_startup: true
+  periodic_quick_scan: true
+  quick_scan_interval_seconds: 300
+  include_in_system_prompt: true
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 18 connects |
+|---|---|
+| `context/prompt_assembler.py` (Sprint 17) | `_load_anatomy_summary()` extracts Active Configuration from ANATOMY.md into static section (after AGENTS.md, before base prompt) |
+| `gateway/commands.py` (Sprint 6) | New `cmd_anatomy()` function; `/anatomy` added to `/help` listing |
+| `gateway/telegram.py` (Sprint 6) | New `_cmd_anatomy` handler + `CommandHandler("anatomy", ...)` registration |
+| `scripts/daemon.py` (Sprint 6) | `AnatomyScanner` + `AnatomyWriter` + `ProjectConfigStore` created at startup; `set_anatomy_components()` wires to tool; startup scan writes ANATOMY.md |
+| `config/prometheus.yaml` (Sprint 0) | New `anatomy:` block controls scan-on-startup, periodic scan, and system prompt inclusion |
+
+## Sprint 19: PROFILES — Agent Profiles ✓
+
+Every Prometheus session loaded all tools, all bootstrap files, all subsystems.
+On a 24K context window, this wastes ~20% before a single user message. Profiles
+let you select a configuration that loads only what's needed.
+
+### `prometheus.config.profiles`
+`src/prometheus/config/profiles.py` — novel code
+
+```python
+@dataclass
+class AgentProfile:
+    name: str                    # "full", "coder", "research", "assistant", "minimal"
+    description: str
+    bootstrap_files: list[str]   # which .md files to load
+    tools: list[str] | None      # tool names to include, None = all
+    exclude_tools: list[str]     # tools to exclude (applied after include)
+    subsystems: dict[str, bool]  # {"sentinel": True, "wiki": True, ...}
+    max_tool_schemas: int | None # cap on tool schemas, None = no cap
+
+class ProfileStore:
+    def __init__(self, custom_dir: Path | None = None) -> None
+    def get(self, name: str) -> AgentProfile | None
+    def list_profiles(self) -> list[AgentProfile]
+    def names(self) -> list[str]
+
+def get_profile_store() -> ProfileStore
+def filter_tools_by_profile(all_schemas: list[dict], profile: AgentProfile) -> list[dict]
+```
+
+Builtin profiles: `full` (all tools, all bootstrap), `coder` (9 tools, SOUL.md only),
+`research` (9 read-only tools), `assistant` (7 tools, memory-rich), `minimal` (2 tools).
+Custom profiles via YAML in `~/.prometheus/profiles/` override builtins with same name.
+
+### `prometheus.tools.base.ToolRegistry` — updated
+```python
+class ToolRegistry:
+    def schemas_for_names(self, names: list[str]) -> list[dict[str, Any]]
+        # Return tool schemas for specific tool names (preserving order)
+```
+
+### `prometheus.context.prompt_assembler` — updated
+```python
+def build_runtime_system_prompt(
+    *, cwd, config, memory_content, skills, task_state,
+    loaded_skill_content,
+    profile: AgentProfile | None = None,  # NEW — controls bootstrap file loading
+) -> str
+    # When profile is set, only bootstrap files in profile.bootstrap_files are loaded
+    # When profile is None, falls back to legacy bootstrap config toggles
+```
+
+### `config/prometheus.yaml` — new section
+```yaml
+profiles:
+  default: "full"
+  custom_dir: "~/.prometheus/profiles"
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 19 connects |
+|---|---|
+| `context/prompt_assembler.py` (Sprint 17) | `build_runtime_system_prompt()` gains `profile=` parameter; when set, profile controls which bootstrap files load instead of config toggles |
+| `tools/base.py` (Sprint 2) | `ToolRegistry.schemas_for_names()` added for profile-filtered schema lists |
+| `gateway/commands.py` (Sprint 6) | New `cmd_profile()` function; `/profile` added to `/help` listing |
+| `gateway/telegram.py` (Sprint 6) | New `_cmd_profile` handler + `CommandHandler("profile", ...)` registration; stores `_active_profile_name` per adapter |
+| `config/prometheus.yaml` (Sprint 0) | New `profiles:` block with default profile and custom directory |

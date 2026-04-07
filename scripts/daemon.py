@@ -312,6 +312,32 @@ async def run_daemon(args: argparse.Namespace) -> None:
     except Exception as exc:
         logger.warning("Memory extractor not available: %s", exc)
 
+    # Infrastructure self-awareness — AnatomyScanner (Sprint 18 ANATOMY)
+    anatomy_config = config.get("anatomy", {})
+    if anatomy_config.get("enabled", True):
+        try:
+            from prometheus.infra.anatomy import AnatomyScanner
+            from prometheus.infra.anatomy_writer import AnatomyWriter
+            from prometheus.infra.project_configs import ProjectConfigStore
+            from prometheus.tools.builtin.anatomy import set_anatomy_components
+
+            scanner = AnatomyScanner(
+                llama_cpp_url=model_config.get("base_url", "http://localhost:8080"),
+                ollama_url=model_config.get("fallback_url", "http://localhost:11434"),
+                inference_engine=model_config.get("provider", "llama_cpp"),
+            )
+            anatomy_writer = AnatomyWriter()
+            project_store = ProjectConfigStore()
+            set_anatomy_components(scanner, anatomy_writer, project_store)
+
+            if anatomy_config.get("scan_on_startup", True):
+                state = await scanner.scan()
+                anatomy_writer.write(state, project_store.summaries())
+                logger.info("Infrastructure scan complete: %s, model=%s",
+                            state.hostname, state.model_name)
+        except Exception as exc:
+            logger.warning("Anatomy system not available: %s", exc)
+
     # Learning loop — SkillCreator (auto-generate skills from successful tasks)
     try:
         from prometheus.learning.skill_creator import SkillCreator

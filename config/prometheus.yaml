@@ -2,6 +2,11 @@ system:
   name: "Prometheus"
   version: "0.1.0"
 
+# Layer 1 Bootstrap — identity files loaded into every system prompt
+bootstrap:
+  load_soul: true       # ~/.prometheus/SOUL.md — identity, personality, behavioral rules
+  load_agents: true     # ~/.prometheus/AGENTS.md — agent registry, spawn rules
+
 model:
   provider: "llama_cpp"
   base_url: "http://GPU_HOST:8080"
@@ -150,6 +155,19 @@ sentinel:
   digest_lookback_hours: 24         # telemetry digest window
   auto_fix_wiki: true               # let wiki linter auto-fix safe issues
   synthesis_enabled: true           # enable LLM-powered knowledge synthesis
+
+# Agent Profiles (Sprint 19 PROFILES)
+profiles:
+  default: "full"                           # default profile name
+  custom_dir: "~/.prometheus/profiles"      # custom profile YAML directory
+
+# Infrastructure Self-Awareness (Sprint 18 ANATOMY)
+anatomy:
+  enabled: true
+  scan_on_startup: true              # run full scan when daemon starts
+  periodic_quick_scan: true          # update VRAM usage periodically via heartbeat
+  quick_scan_interval_seconds: 300   # 5 minutes
+  include_in_system_prompt: true     # load compact summary into static section
 
 # MCP Servers (Sprint 12)
 mcp_servers:

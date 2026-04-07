@@ -1518,3 +1518,597 @@ class TestSprint16VisionMultimodal:
         # Tool returned the description
         assert result.output == "A test image"
         assert not result.is_error
+
+
+# ===========================================================================
+# Sprint 17: BOOTSTRAP — Layer 1 Identity Files
+# ===========================================================================
+
+
+class TestSprint17BootstrapWiring:
+    """Verify Layer 1 bootstrap files are loaded into the assembled system prompt
+    via real instances of prompt_assembler and hermes_memory_tool."""
+
+    def test_soul_md_loaded_and_appears_first_in_static(self, tmp_path: Path) -> None:
+        """SOUL.md is read from disk and placed first in the static section."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "SOUL.md").write_text(
+            "# Prometheus Identity\nYou are Prometheus, sovereign AI.",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+            from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        static, _ = prompt.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        assert "Prometheus Identity" in static
+        # Must be before base prompt
+        assert static.index("Prometheus Identity") < static.index("# Environment")
+
+    def test_agents_md_loaded_into_static(self, tmp_path: Path) -> None:
+        """AGENTS.md is read from disk and placed in the static section."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "AGENTS.md").write_text(
+            "# Agent Registry\nSpawn subagents for parallel work.",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+            from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        static, _ = prompt.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        assert "Agent Registry" in static
+
+    def test_memory_and_user_auto_loaded_into_dynamic(self, tmp_path: Path) -> None:
+        """MEMORY.md + USER.md are loaded via format_memory_for_prompt() into dynamic."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "MEMORY.md").write_text(
+            "Will prefers concise responses",
+            encoding="utf-8",
+        )
+        (config_dir / "USER.md").write_text(
+            "Senior engineer building AI agents",
+            encoding="utf-8",
+        )
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ), patch(
+            "prometheus.memory.hermes_memory_tool.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+            from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        _, dynamic = prompt.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        assert "Will prefers concise responses" in dynamic
+        assert "Senior engineer building AI agents" in dynamic
+
+    def test_format_memory_for_prompt_actually_invoked(self, tmp_path: Path) -> None:
+        """Prove format_memory_for_prompt is called at runtime, not just defined."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "MEMORY.md").write_text("fact_alpha_7x9", encoding="utf-8")
+        (config_dir / "USER.md").write_text("", encoding="utf-8")
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ), patch(
+            "prometheus.memory.hermes_memory_tool.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        # The unique sentinel string must appear in the assembled output
+        assert "fact_alpha_7x9" in prompt
+
+    def test_bootstrap_config_disables_soul(self, tmp_path: Path) -> None:
+        """Setting load_soul: false in config suppresses SOUL.md loading."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "SOUL.md").write_text("# Should Not Appear", encoding="utf-8")
+
+        config = {"bootstrap": {"load_soul": False}}
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path), config=config)
+
+        assert "Should Not Appear" not in prompt
+
+    def test_bootstrap_config_disables_agents(self, tmp_path: Path) -> None:
+        """Setting load_agents: false in config suppresses AGENTS.md loading."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "AGENTS.md").write_text("# Should Not Appear", encoding="utf-8")
+
+        config = {"bootstrap": {"load_agents": False}}
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path), config=config)
+
+        assert "Should Not Appear" not in prompt
+
+    def test_soul_before_agents_before_base(self, tmp_path: Path) -> None:
+        """Assembly order: SOUL.md → AGENTS.md → base system prompt."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "SOUL.md").write_text("SOUL_MARKER_17A", encoding="utf-8")
+        (config_dir / "AGENTS.md").write_text("AGENTS_MARKER_17B", encoding="utf-8")
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+            from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        static, _ = prompt.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        soul_pos = static.index("SOUL_MARKER_17A")
+        agents_pos = static.index("AGENTS_MARKER_17B")
+        env_pos = static.index("# Environment")
+        assert soul_pos < agents_pos < env_pos
+
+    def test_missing_bootstrap_files_graceful(self, tmp_path: Path) -> None:
+        """Empty config dir — no SOUL.md or AGENTS.md — doesn't crash."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+            from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        # Still produces a valid prompt with boundary
+        assert SYSTEM_PROMPT_DYNAMIC_BOUNDARY in prompt
+        assert "Prometheus" in prompt
+
+    def test_explicit_memory_content_skips_auto_load(self, tmp_path: Path) -> None:
+        """When caller passes memory_content, auto-load is skipped."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "MEMORY.md").write_text("should_not_appear", encoding="utf-8")
+        (config_dir / "USER.md").write_text("", encoding="utf-8")
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ), patch(
+            "prometheus.memory.hermes_memory_tool.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+
+            prompt = build_runtime_system_prompt(
+                cwd=str(tmp_path),
+                memory_content="explicit_override_content",
+            )
+
+        assert "explicit_override_content" in prompt
+        assert "should_not_appear" not in prompt
+
+    def test_daemon_config_picks_up_bootstrap(self, tmp_path: Path) -> None:
+        """Simulate daemon.py call pattern — config dict with bootstrap key."""
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "SOUL.md").write_text("# Daemon Soul Test", encoding="utf-8")
+
+        config = {
+            "model": {"provider": "llama_cpp", "model": "gemma4-26b"},
+            "bootstrap": {"load_soul": True, "load_agents": True},
+        }
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path), config=config)
+
+        assert "Daemon Soul Test" in prompt
+        assert "gemma4-26b" in prompt
+
+
+# ===========================================================================
+# Sprint 18: ANATOMY — Infrastructure Self-Awareness
+# ===========================================================================
+
+
+class TestSprint18AnatomyWiring:
+    """Verify ANATOMY components are wired and invoked at runtime."""
+
+    def test_scanner_produces_state_with_real_detections(self) -> None:
+        """AnatomyScanner.scan() runs real platform/RAM/disk detection."""
+        from prometheus.infra.anatomy import AnatomyScanner
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        state = asyncio.run(scanner.scan())
+
+        assert state.hostname  # detected real hostname
+        assert state.platform in ("Linux", "Darwin", "Windows")
+        assert state.ram_total_gb > 0  # detected real RAM
+        assert state.disk_total_gb > 0  # detected real disk
+        assert state.scanned_at  # timestamp set
+
+    def test_writer_generates_anatomy_md_from_real_scan(self, tmp_path: Path) -> None:
+        """AnatomyWriter.write() produces valid ANATOMY.md from a real scan."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        state = asyncio.run(scanner.scan())
+
+        writer = AnatomyWriter(anatomy_path=tmp_path / "ANATOMY.md")
+        content = writer.write(state)
+
+        path = tmp_path / "ANATOMY.md"
+        assert path.exists()
+        assert "Active Configuration" in content
+        assert state.hostname in content
+        assert "Last scanned:" in content
+
+    def test_project_store_loads_and_activates(self, tmp_path: Path) -> None:
+        """ProjectConfigStore save/load/activate round-trip with real YAML."""
+        from prometheus.infra.project_configs import (
+            ModelSlot,
+            ProjectConfig,
+            ProjectConfigStore,
+        )
+
+        store = ProjectConfigStore(projects_dir=tmp_path / "projects")
+        store.save(ProjectConfig(
+            name="alpha",
+            description="First config",
+            models=[ModelSlot(name="ModelA", vram_estimate_gb=10.0)],
+            active=True,
+        ))
+        store.save(ProjectConfig(name="beta", description="Second config", active=False))
+
+        # Activate beta
+        store.activate("beta")
+
+        # Re-read from disk (fresh store instance proves real persistence)
+        store2 = ProjectConfigStore(projects_dir=tmp_path / "projects")
+        assert store2.get("alpha").active is False
+        assert store2.get("beta").active is True
+        assert store2.get_active().name == "beta"
+
+    def test_anatomy_tool_invoked_at_runtime(self, tmp_path: Path) -> None:
+        """AnatomyTool.execute() runs a real quick_scan via wired components."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+        from prometheus.infra.project_configs import ProjectConfigStore
+        from prometheus.tools.builtin.anatomy import (
+            AnatomyInput,
+            AnatomyTool,
+            set_anatomy_components,
+        )
+        from prometheus.tools.base import ToolExecutionContext
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        writer = AnatomyWriter(anatomy_path=tmp_path / "ANATOMY.md")
+        store = ProjectConfigStore(projects_dir=tmp_path / "projects")
+        set_anatomy_components(scanner, writer, store)
+
+        tool = AnatomyTool()
+        ctx = ToolExecutionContext(cwd=tmp_path)
+        result = asyncio.run(tool.execute(AnatomyInput(action="status"), ctx))
+
+        assert not result.is_error
+        assert "## Infrastructure" in result.output
+
+        # Cleanup: reset singletons
+        import prometheus.tools.builtin.anatomy as mod
+        mod._scanner = None
+        mod._writer = None
+        mod._project_store = None
+
+    def test_anatomy_tool_scan_writes_file(self, tmp_path: Path) -> None:
+        """AnatomyTool 'scan' action writes ANATOMY.md to disk."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+        from prometheus.infra.project_configs import ProjectConfigStore
+        from prometheus.tools.builtin.anatomy import (
+            AnatomyInput,
+            AnatomyTool,
+            set_anatomy_components,
+        )
+        from prometheus.tools.base import ToolExecutionContext
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        writer = AnatomyWriter(anatomy_path=tmp_path / "ANATOMY.md")
+        store = ProjectConfigStore(projects_dir=tmp_path / "projects")
+        set_anatomy_components(scanner, writer, store)
+
+        tool = AnatomyTool()
+        ctx = ToolExecutionContext(cwd=tmp_path)
+        result = asyncio.run(tool.execute(AnatomyInput(action="scan"), ctx))
+
+        assert not result.is_error
+        assert (tmp_path / "ANATOMY.md").exists()
+        text = (tmp_path / "ANATOMY.md").read_text()
+        assert "Active Configuration" in text
+
+        import prometheus.tools.builtin.anatomy as mod
+        mod._scanner = None
+        mod._writer = None
+        mod._project_store = None
+
+    def test_anatomy_tool_diagram_returns_mermaid(self, tmp_path: Path) -> None:
+        """AnatomyTool 'diagram' action returns Mermaid graph."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+        from prometheus.infra.project_configs import ProjectConfigStore
+        from prometheus.tools.builtin.anatomy import (
+            AnatomyInput,
+            AnatomyTool,
+            set_anatomy_components,
+        )
+        from prometheus.tools.base import ToolExecutionContext
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        writer = AnatomyWriter(anatomy_path=tmp_path / "ANATOMY.md")
+        store = ProjectConfigStore(projects_dir=tmp_path / "projects")
+        set_anatomy_components(scanner, writer, store)
+
+        tool = AnatomyTool()
+        ctx = ToolExecutionContext(cwd=tmp_path)
+        result = asyncio.run(tool.execute(AnatomyInput(action="diagram"), ctx))
+
+        assert not result.is_error
+        assert "```mermaid" in result.output
+        assert "graph LR" in result.output
+
+        import prometheus.tools.builtin.anatomy as mod
+        mod._scanner = None
+        mod._writer = None
+        mod._project_store = None
+
+    def test_anatomy_summary_in_system_prompt(self, tmp_path: Path) -> None:
+        """ANATOMY.md Active Configuration section appears in static prompt."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+
+        # Run a real scan and write ANATOMY.md
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        state = asyncio.run(scanner.scan())
+        writer = AnatomyWriter(anatomy_path=config_dir / "ANATOMY.md")
+        writer.write(state)
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            from prometheus.context.prompt_assembler import build_runtime_system_prompt
+            from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        static, _ = prompt.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        # The real hostname should appear in the static section via ANATOMY.md
+        assert state.hostname in static
+        assert "## Infrastructure" in static
+
+    def test_update_active_preserves_architecture(self, tmp_path: Path) -> None:
+        """AnatomyWriter.update_active_section updates VRAM without clobbering other sections."""
+        from prometheus.infra.anatomy import AnatomyState
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+
+        writer = AnatomyWriter(anatomy_path=tmp_path / "ANATOMY.md")
+
+        state1 = AnatomyState(
+            hostname="test", platform="Linux", cpu="test-cpu",
+            gpu_name="RTX 4090", gpu_vram_total_mb=24576,
+            gpu_vram_used_mb=18000, gpu_vram_free_mb=6576,
+            inference_engine="llama_cpp", inference_url="http://localhost:8080",
+            scanned_at="2026-04-06T21:00:00Z",
+        )
+        writer.write(state1)
+        assert "Architecture" in (tmp_path / "ANATOMY.md").read_text()
+
+        state2 = AnatomyState(
+            hostname="test", platform="Linux", cpu="test-cpu",
+            gpu_name="RTX 4090", gpu_vram_total_mb=24576,
+            gpu_vram_used_mb=22000, gpu_vram_free_mb=2576,
+            inference_engine="llama_cpp", inference_url="http://localhost:8080",
+            scanned_at="2026-04-06T21:05:00Z",
+        )
+        writer.update_active_section(state2)
+
+        text = (tmp_path / "ANATOMY.md").read_text()
+        assert "22000MB" in text  # new VRAM value
+        assert "18000MB" not in text  # old VRAM value gone
+        assert "Architecture" in text  # other sections preserved
+
+    def test_daemon_wiring_pattern(self, tmp_path: Path) -> None:
+        """Simulate the daemon.py wiring: scanner → writer → store → set_anatomy_components."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+        from prometheus.infra.project_configs import ProjectConfigStore
+        from prometheus.tools.builtin.anatomy import set_anatomy_components
+        import prometheus.tools.builtin.anatomy as mod
+
+        scanner = AnatomyScanner(
+            llama_cpp_url="http://127.0.0.1:99999",
+            inference_engine="llama_cpp",
+        )
+        writer = AnatomyWriter(anatomy_path=tmp_path / "ANATOMY.md")
+        store = ProjectConfigStore(projects_dir=tmp_path / "projects")
+        set_anatomy_components(scanner, writer, store)
+
+        # Verify the module-level singletons are set
+        assert mod._scanner is scanner
+        assert mod._writer is writer
+        assert mod._project_store is store
+
+        # Simulate startup scan
+        state = asyncio.run(scanner.scan())
+        writer.write(state, store.summaries())
+        assert (tmp_path / "ANATOMY.md").exists()
+
+        # Cleanup
+        mod._scanner = None
+        mod._writer = None
+        mod._project_store = None
+
+
+# ===========================================================================
+# Sprint 19: PROFILES — Agent Profiles
+# ===========================================================================
+
+
+class TestSprint19ProfilesWiring:
+    """Verify profile system is wired and invoked at runtime."""
+
+    def test_profile_store_loads_all_builtins(self) -> None:
+        """ProfileStore loads 5 builtin profiles from hardcoded definitions."""
+        from prometheus.config.profiles import ProfileStore
+
+        store = ProfileStore(custom_dir=Path(f"/tmp/_pytest_empty_{id(self)}"))
+        names = store.names()
+        assert "full" in names
+        assert "coder" in names
+        assert "research" in names
+        assert "assistant" in names
+        assert "minimal" in names
+        assert len(names) >= 5
+
+    def test_custom_yaml_profile_loads(self, tmp_path: Path) -> None:
+        """Custom YAML profiles are loaded and override builtins."""
+        from prometheus.config.profiles import ProfileStore
+
+        custom_dir = tmp_path / "profiles"
+        custom_dir.mkdir()
+        (custom_dir / "devops.yaml").write_text(
+            "name: devops\ndescription: DevOps work\ntools:\n  - bash\n  - grep\n",
+            encoding="utf-8",
+        )
+        store = ProfileStore(custom_dir=custom_dir)
+        p = store.get("devops")
+        assert p is not None
+        assert p.tools == ["bash", "grep"]
+
+    def test_filter_tools_invoked_at_runtime(self) -> None:
+        """filter_tools_by_profile actually filters a real schema list."""
+        from prometheus.config.profiles import AgentProfile, filter_tools_by_profile
+
+        profile = AgentProfile(name="coder", tools=["bash", "file_read"])
+        schemas = [
+            {"name": "bash", "description": "shell"},
+            {"name": "file_read", "description": "read"},
+            {"name": "wiki_query", "description": "wiki"},
+            {"name": "grep", "description": "search"},
+        ]
+        result = filter_tools_by_profile(schemas, profile)
+        names = [s["name"] for s in result]
+        assert names == ["bash", "file_read"]
+
+    def test_profile_controls_prompt_bootstrap(self, tmp_path: Path) -> None:
+        """Profile.bootstrap_files controls which files appear in system prompt."""
+        from prometheus.config.profiles import AgentProfile
+        from prometheus.context.prompt_assembler import build_runtime_system_prompt
+        from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "SOUL.md").write_text("SOUL_MARKER_19", encoding="utf-8")
+        (config_dir / "AGENTS.md").write_text("AGENTS_MARKER_19", encoding="utf-8")
+
+        # Profile loads only SOUL.md
+        lean = AgentProfile(name="lean", bootstrap_files=["SOUL.md"])
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path), profile=lean)
+
+        static, _ = prompt.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        assert "SOUL_MARKER_19" in static
+        assert "AGENTS_MARKER_19" not in static
+
+    def test_no_profile_preserves_legacy(self, tmp_path: Path) -> None:
+        """Without profile param, legacy bootstrap config still works."""
+        from prometheus.context.prompt_assembler import build_runtime_system_prompt
+        from prometheus.context.system_prompt import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "SOUL.md").write_text("SOUL_LEGACY", encoding="utf-8")
+
+        with patch(
+            "prometheus.context.prompt_assembler.get_config_dir",
+            return_value=config_dir,
+        ):
+            prompt = build_runtime_system_prompt(cwd=str(tmp_path))
+
+        assert "SOUL_LEGACY" in prompt
+
+    def test_tool_registry_schemas_for_names(self) -> None:
+        """ToolRegistry.schemas_for_names returns filtered schema list."""
+        registry = _make_registry()
+        schemas = registry.schemas_for_names(["echo"])
+        assert len(schemas) == 1
+        assert schemas[0]["name"] == "echo"
+
+        schemas_both = registry.schemas_for_names(["echo", "bash"])
+        assert len(schemas_both) == 2
+
+        schemas_missing = registry.schemas_for_names(["nonexistent"])
+        assert len(schemas_missing) == 0
+
+    def test_cmd_profile_list_and_switch(self) -> None:
+        """cmd_profile shows profiles and switches correctly."""
+        from prometheus.gateway.commands import cmd_profile
+
+        # List
+        text = cmd_profile()
+        assert "full" in text
+        assert "coder" in text
+        assert "Available profiles:" in text
+
+        # Switch
+        text = cmd_profile(arg="coder")
+        assert "Switched to: coder" in text
+        assert "bash" in text
+
+        # Unknown
+        text = cmd_profile(arg="nonexistent")
+        assert "Unknown profile" in text

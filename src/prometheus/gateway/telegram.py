@@ -26,6 +26,7 @@ from telegram.ext import (
 )
 
 from prometheus.gateway.config import Platform, PlatformConfig
+from prometheus.gateway.commands import cmd_anatomy, cmd_profile
 from prometheus.gateway.platform_base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -133,6 +134,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("benchmark", self._cmd_benchmark))
         self._app.add_handler(CommandHandler("context", self._cmd_context))
         self._app.add_handler(CommandHandler("skills", self._cmd_skills))
+        self._app.add_handler(CommandHandler("anatomy", self._cmd_anatomy))
+        self._app.add_handler(CommandHandler("profile", self._cmd_profile))
         # Sprint 15b GRAFT: approval queue commands
         self._app.add_handler(CommandHandler("approve", self._cmd_approve))
         self._app.add_handler(CommandHandler("deny", self._cmd_deny))
@@ -679,6 +682,42 @@ class TelegramAdapter(BasePlatformAdapter):
             response_text,
             reply_to=event.message_id,
         )
+
+    # ------------------------------------------------------------------
+    # Sprint 18 ANATOMY: infrastructure self-awareness
+    # ------------------------------------------------------------------
+
+    async def _cmd_anatomy(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /anatomy command — show infrastructure summary."""
+        if update.effective_chat is None:
+            return
+        text = cmd_anatomy()
+        await self.send(update.effective_chat.id, text, parse_mode=None)
+
+    async def _cmd_profile(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /profile [name] — show or switch agent profiles."""
+        if update.effective_chat is None:
+            return
+        chat_id = update.effective_chat.id
+        args = (update.message.text or "").split(maxsplit=1)
+        arg = args[1].strip() if len(args) > 1 else ""
+        current = getattr(self, "_active_profile_name", "full")
+
+        text = cmd_profile(arg=arg, current=current)
+
+        # If switching, store the new profile name on the adapter
+        if arg:
+            from prometheus.config.profiles import ProfileStore
+            store = ProfileStore()
+            profile = store.get(arg.strip())
+            if profile is not None:
+                self._active_profile_name = profile.name
+
+        await self.send(chat_id, text, parse_mode=None)
 
     # ------------------------------------------------------------------
     # Sprint 15b GRAFT: approval queue commands
