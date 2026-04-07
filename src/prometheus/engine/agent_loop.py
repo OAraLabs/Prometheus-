@@ -81,6 +81,8 @@ class LoopContext:
     # Sprint 10: Model Router + Divergence Detector
     model_router: object | None = None
     divergence_detector: object | None = None
+    # Sprint 20: LSP post-result hooks (modify tool result after execution)
+    post_result_hooks: list[object] | None = None
 
 
 async def run_loop(
@@ -489,6 +491,14 @@ async def _execute_tool_call(
             },
         )
 
+    # Sprint 20: Post-result hooks (e.g., LSP diagnostics — can modify result)
+    if context.post_result_hooks:
+        for hook in context.post_result_hooks:
+            try:
+                tool_result = await hook(tool_name, tool_input, tool_result)
+            except Exception:
+                log.debug("Post-result hook failed", exc_info=True)
+
     return tool_result
 
 
@@ -519,6 +529,7 @@ class AgentLoop:
         cwd: Path | None = None,
         model_router: object | None = None,
         divergence_detector: object | None = None,
+        post_result_hooks: list[object] | None = None,
     ) -> None:
         self._provider = provider
         self._model = model
@@ -535,6 +546,8 @@ class AgentLoop:
         # Sprint 10
         self._model_router = model_router
         self._divergence_detector = divergence_detector
+        # Sprint 20: LSP post-result hooks
+        self._post_result_hooks = post_result_hooks
 
     def set_post_task_hook(self, hook: Callable) -> None:
         """Register a callback invoked after each completed task.
@@ -577,6 +590,7 @@ class AgentLoop:
             cwd=self._cwd,
             model_router=self._model_router,
             divergence_detector=self._divergence_detector,
+            post_result_hooks=self._post_result_hooks,
         )
 
         last_text = ""

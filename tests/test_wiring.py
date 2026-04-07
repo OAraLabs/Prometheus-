@@ -2112,3 +2112,341 @@ class TestSprint19ProfilesWiring:
         # Unknown
         text = cmd_profile(arg="nonexistent")
         assert "Unknown profile" in text
+
+
+# ===========================================================================
+# Sprint 20: LSP — Language Server Protocol Integration
+# ===========================================================================
+
+
+class TestSprint20LSPWiring:
+    """Verify LSP components are wired and invoked at runtime."""
+
+    # -- Language map --------------------------------------------------
+
+    def test_language_map_resolves_python_file(self, tmp_path: Path) -> None:
+        """get_server_for_file returns pyright definition for .py files."""
+        from prometheus.lsp.languages import get_server_for_file
+
+        py = tmp_path / "main.py"
+        py.write_text("x = 1\n")
+        server = get_server_for_file(str(py))
+        assert server is not None
+        assert server.language_id == "python"
+        assert "pyright" in server.command[0]
+
+    def test_language_map_returns_none_for_unsupported(self, tmp_path: Path) -> None:
+        """get_server_for_file returns None for unrecognized extensions."""
+        from prometheus.lsp.languages import get_server_for_file
+
+        txt = tmp_path / "notes.txt"
+        txt.write_text("hello")
+        assert get_server_for_file(str(txt)) is None
+
+    def test_custom_server_overrides_builtin(self) -> None:
+        """Custom server definitions from config override builtins."""
+        from prometheus.lsp.languages import get_server_for_file
+
+        custom = {"python": {"command": ["pylsp"]}}
+        server = get_server_for_file("test.py", custom_servers=custom)
+        assert server is not None
+        assert server.command == ["pylsp"]
+
+    def test_find_project_root_finds_marker(self, tmp_path: Path) -> None:
+        """find_project_root walks up to find pyproject.toml."""
+        from prometheus.lsp.languages import find_project_root
+
+        (tmp_path / "pyproject.toml").touch()
+        sub = tmp_path / "src" / "pkg"
+        sub.mkdir(parents=True)
+        f = sub / "main.py"
+        f.write_text("x = 1\n")
+
+        root = find_project_root(f, ["pyproject.toml"])
+        assert root == tmp_path
+
+    # -- Orchestrator lifecycle ----------------------------------------
+
+    def test_orchestrator_broken_server_tracking(self, tmp_path: Path) -> None:
+        """Orchestrator marks broken servers and doesn't retry them."""
+        from prometheus.lsp.orchestrator import LSPOrchestrator
+        from prometheus.lsp.languages import LSPServerDef, find_project_root
+
+        server_def = LSPServerDef(
+            language_id="python",
+            extensions=[".py"],
+            command=["pyright-langserver", "--stdio"],
+            root_markers=["pyproject.toml"],
+        )
+        (tmp_path / "pyproject.toml").touch()
+        src = tmp_path / "test.py"
+        src.write_text("x = 1\n")
+
+        orch = LSPOrchestrator()
+        root = find_project_root(src, server_def.root_markers)
+        key = f"{server_def.language_id}:{root}"
+
+        # Simulate a broken server
+        orch._broken.add(key)
+
+        # ensure_server should return None without attempting spawn
+        result = asyncio.run(orch.ensure_server(str(src)))
+        assert result is None
+
+    def test_orchestrator_shutdown_clears_state(self) -> None:
+        """shutdown_all clears client dict and spawning set."""
+        from prometheus.lsp.orchestrator import LSPOrchestrator
+
+        orch = LSPOrchestrator()
+        # Inject a mock client
+        mock_client = MagicMock()
+        mock_client.stop = AsyncMock()
+        orch._clients["python:/proj"] = mock_client
+
+        asyncio.run(orch.shutdown_all())
+        assert len(orch._clients) == 0
+        mock_client.stop.assert_called_once()
+
+    # -- LSPTool wiring ------------------------------------------------
+
+    def test_lsp_tool_registered_in_coder_profile(self) -> None:
+        """Coder profile includes 'lsp' in its tool list."""
+        from prometheus.config.profiles import ProfileStore
+
+        store = ProfileStore(custom_dir=Path(f"/tmp/_pytest_empty_lsp_{id(self)}"))
+        coder = store.get("coder")
+        assert coder is not None
+        assert "lsp" in coder.tools
+
+    def test_lsp_tool_set_orchestrator_wiring(self, tmp_path: Path) -> None:
+        """set_lsp_orchestrator wires orchestrator into the module-level global."""
+        import prometheus.tools.builtin.lsp as lsp_mod
+        from prometheus.tools.builtin.lsp import LSPTool, set_lsp_orchestrator
+
+        sentinel = object()
+        old = lsp_mod._orchestrator
+        try:
+            set_lsp_orchestrator(sentinel)
+            assert lsp_mod._orchestrator is sentinel
+        finally:
+            lsp_mod._orchestrator = old
+
+    def test_lsp_tool_invoked_through_execute_tool_call(self, tmp_path: Path) -> None:
+        """LSPTool.execute is called via _execute_tool_call with real registry."""
+        from prometheus.tools.builtin.lsp import LSPTool
+
+        # Create a real tool and registry
+        registry = ToolRegistry()
+        registry.register(LSPTool())
+
+        ctx = LoopContext(
+            provider=AsyncMock(),
+            model="test",
+            system_prompt="test",
+            max_tokens=1024,
+            tool_registry=registry,
+            cwd=tmp_path,
+        )
+
+        # No orchestrator wired — should return a helpful error, not crash
+        py = tmp_path / "test.py"
+        py.write_text("x = 1\n")
+
+        result = asyncio.run(
+            _execute_tool_call(ctx, "lsp", "lsp-1", {
+                "action": "diagnostics",
+                "file": str(py),
+            })
+        )
+        assert result.is_error
+        assert "not available" in result.content
+
+    def test_lsp_tool_with_orchestrator_in_metadata(self, tmp_path: Path) -> None:
+        """LSPTool picks up orchestrator from context.metadata when module global is unset."""
+        from prometheus.tools.builtin.lsp import LSPTool
+        import prometheus.tools.builtin.lsp as lsp_mod
+
+        mock_orch = MagicMock()
+        mock_orch.get_diagnostics = AsyncMock(return_value=[])
+
+        registry = ToolRegistry()
+        registry.register(LSPTool())
+
+        old = lsp_mod._orchestrator
+        lsp_mod._orchestrator = None
+        try:
+            ctx = LoopContext(
+                provider=AsyncMock(),
+                model="test",
+                system_prompt="test",
+                max_tokens=1024,
+                tool_registry=registry,
+                cwd=tmp_path,
+                tool_metadata={"lsp_orchestrator": mock_orch},
+            )
+
+            py = tmp_path / "test.py"
+            py.write_text("x = 1\n")
+
+            result = asyncio.run(
+                _execute_tool_call(ctx, "lsp", "lsp-2", {
+                    "action": "diagnostics",
+                    "file": str(py),
+                })
+            )
+            assert not result.is_error
+            assert "No diagnostics" in result.content
+            mock_orch.get_diagnostics.assert_called_once()
+        finally:
+            lsp_mod._orchestrator = old
+
+    # -- Diagnostics hook wiring ---------------------------------------
+
+    def test_post_result_hooks_invoked_in_execute_tool_call(self, tmp_path: Path) -> None:
+        """post_result_hooks in LoopContext are actually called during _execute_tool_call."""
+        invoked = []
+
+        async def tracking_hook(tool_name, tool_input, tool_result):
+            invoked.append(tool_name)
+            return tool_result
+
+        registry = _make_registry()
+        ctx = LoopContext(
+            provider=AsyncMock(),
+            model="test",
+            system_prompt="test",
+            max_tokens=1024,
+            tool_registry=registry,
+            cwd=tmp_path,
+            post_result_hooks=[tracking_hook],
+        )
+
+        result = asyncio.run(
+            _execute_tool_call(ctx, "echo", "t1", {"text": "hi"})
+        )
+        assert not result.is_error
+        assert result.content == "hi"
+        assert invoked == ["echo"]
+
+    def test_diagnostics_hook_modifies_result_in_loop(self, tmp_path: Path) -> None:
+        """LSPDiagnosticsHook appends diagnostics to write_file result via post_result_hooks."""
+        from prometheus.hooks.lsp_diagnostics import LSPDiagnosticsHook
+        from prometheus.lsp.client import Diagnostic
+        from prometheus.tools.builtin.file_write import FileWriteTool
+
+        # Real orchestrator mock — only mock the LSP server, not the hook
+        mock_orch = MagicMock()
+        mock_orch.notify_file_changed = AsyncMock()
+        mock_orch.get_diagnostics = AsyncMock(return_value=[
+            Diagnostic(
+                path=str(tmp_path / "bad.py"),
+                line=1, col=10, severity=1,
+                message="Type 'str' not assignable to 'int'",
+            ),
+        ])
+
+        hook = LSPDiagnosticsHook(orchestrator=mock_orch, delay_ms=0)
+
+        registry = ToolRegistry()
+        registry.register(FileWriteTool())
+
+        ctx = LoopContext(
+            provider=AsyncMock(),
+            model="test",
+            system_prompt="test",
+            max_tokens=1024,
+            tool_registry=registry,
+            cwd=tmp_path,
+            post_result_hooks=[hook],
+        )
+
+        result = asyncio.run(
+            _execute_tool_call(ctx, "write_file", "wf-1", {
+                "path": str(tmp_path / "bad.py"),
+                "content": "x: int = 'hello'\n",
+            })
+        )
+        assert not result.is_error
+        assert "Wrote" in result.content
+        assert "\u26a0\ufe0f LSP detected 1 issue(s)" in result.content
+        assert "Type 'str'" in result.content
+        mock_orch.notify_file_changed.assert_called_once()
+
+    def test_diagnostics_hook_skips_non_mutation_tools(self, tmp_path: Path) -> None:
+        """LSPDiagnosticsHook does NOT fire for read-only tools like echo."""
+        from prometheus.hooks.lsp_diagnostics import LSPDiagnosticsHook
+
+        mock_orch = MagicMock()
+        mock_orch.notify_file_changed = AsyncMock()
+        mock_orch.get_diagnostics = AsyncMock(return_value=[])
+
+        hook = LSPDiagnosticsHook(orchestrator=mock_orch, delay_ms=0)
+
+        registry = _make_registry()
+        ctx = LoopContext(
+            provider=AsyncMock(),
+            model="test",
+            system_prompt="test",
+            max_tokens=1024,
+            tool_registry=registry,
+            cwd=tmp_path,
+            post_result_hooks=[hook],
+        )
+
+        result = asyncio.run(
+            _execute_tool_call(ctx, "echo", "t1", {"text": "hi"})
+        )
+        assert result.content == "hi"
+        mock_orch.notify_file_changed.assert_not_called()
+
+    def test_agent_loop_passes_post_result_hooks(self) -> None:
+        """AgentLoop constructor passes post_result_hooks to LoopContext."""
+        invoked = []
+
+        async def hook(tool_name, tool_input, tool_result):
+            invoked.append(tool_name)
+            return tool_result
+
+        provider = ScriptedProvider([
+            _tool_response("echo", "t1", {"text": "hi"}),
+            _text_response("done"),
+        ])
+        registry = _make_registry()
+        loop = AgentLoop(
+            provider=provider,
+            model="test",
+            tool_registry=registry,
+            post_result_hooks=[hook],
+        )
+        result = loop.run(system_prompt="test", user_message="go")
+        assert result.text == "done"
+        assert "echo" in invoked
+
+    # -- Daemon wiring pattern -----------------------------------------
+
+    def test_daemon_lsp_wiring_pattern(self, tmp_path: Path) -> None:
+        """Simulate the daemon.py wiring: orchestrator → set_lsp_orchestrator → registry."""
+        from prometheus.lsp.orchestrator import LSPOrchestrator
+        from prometheus.hooks.lsp_diagnostics import LSPDiagnosticsHook
+        from prometheus.tools.builtin.lsp import LSPTool, set_lsp_orchestrator
+        import prometheus.tools.builtin.lsp as lsp_mod
+
+        old = lsp_mod._orchestrator
+        try:
+            # Simulate daemon startup wiring
+            orch = LSPOrchestrator(custom_servers={})
+            set_lsp_orchestrator(orch)
+            assert lsp_mod._orchestrator is orch
+
+            registry = ToolRegistry()
+            registry.register(LSPTool())
+            assert registry.get("lsp") is not None
+
+            hook = LSPDiagnosticsHook(orchestrator=orch, delay_ms=500)
+            # Verify hook is callable
+            assert callable(hook)
+
+            # Simulate shutdown
+            asyncio.run(orch.shutdown_all())
+        finally:
+            lsp_mod._orchestrator = old

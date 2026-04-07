@@ -11,6 +11,7 @@ from prometheus.hooks.schemas import (
     PromptHookDefinition,
 )
 from prometheus.hooks.types import AggregatedHookResult, HookResult
+from prometheus.hooks.lsp_diagnostics import LSPDiagnosticsHook
 
 __all__ = [
     "AggregatedHookResult",
@@ -23,5 +24,6 @@ __all__ = [
     "HookRegistry",
     "HookResult",
     "HttpHookDefinition",
+    "LSPDiagnosticsHook",
     "PromptHookDefinition",
 ]

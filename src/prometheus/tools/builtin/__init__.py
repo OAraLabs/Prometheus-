@@ -20,6 +20,7 @@ from prometheus.tools.builtin.lcm_describe import LCMDescribeTool
 from prometheus.tools.builtin.lcm_expand import LCMExpandTool
 from prometheus.tools.builtin.lcm_expand_query import LCMExpandQueryTool
 from prometheus.tools.builtin.lcm_grep import LCMGrepTool
+from prometheus.tools.builtin.lsp import LSPTool
 from prometheus.tools.builtin.sessions_list import SessionsListTool
 from prometheus.tools.builtin.sessions_send import SessionsSendTool
 from prometheus.tools.builtin.sessions_spawn import SessionsSpawnTool
@@ -51,6 +52,7 @@ __all__ = [
     "LCMExpandTool",
     "LCMExpandQueryTool",
     "LCMGrepTool",
+    "LSPTool",
     "SessionsListTool",
     "SessionsSendTool",
     "SessionsSpawnTool",

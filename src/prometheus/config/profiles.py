@@ -53,7 +53,7 @@ _BUILTINS: dict[str, AgentProfile] = {
         bootstrap_files=["SOUL.md"],
         tools=[
             "bash", "file_read", "file_write", "file_edit", "grep", "glob",
-            "todo_write", "task_create", "agent",
+            "todo_write", "task_create", "agent", "lsp",
         ],
         exclude_tools=[],
         subsystems={"sentinel": False, "wiki": False, "cron": False, "learning": False},

@@ -3477,3 +3477,174 @@ profiles:
 | `gateway/commands.py` (Sprint 6) | New `cmd_profile()` function; `/profile` added to `/help` listing |
 | `gateway/telegram.py` (Sprint 6) | New `_cmd_profile` handler + `CommandHandler("profile", ...)` registration; stores `_active_profile_name` per adapter |
 | `config/prometheus.yaml` (Sprint 0) | New `profiles:` block with default profile and custom directory |
+
+## Sprint 20: LSP — Language Server Protocol Integration ✓
+
+Prometheus used grep and text matching to understand code structure. LSP gives it
+real compiler-grade intelligence — go-to-definition, find-references, type info,
+diagnostics. Three-layer architecture modeled after OpenCode; the `context` action
+(Claude Code's symbolContext concept) packages definition + references + type info
+into one call instead of three round trips. The diagnostics hook auto-checks for
+type errors after every file mutation — the model sees "your edit broke 3 type
+checks" in the same turn and can fix immediately.
+
+### `prometheus.lsp.languages`
+`src/prometheus/lsp/languages.py` — novel code
+
+```python
+@dataclass
+class LSPServerDef:
+    language_id: str              # "python", "typescript", "go", "rust", "c"
+    extensions: list[str]         # [".py", ".pyi"]
+    command: list[str]            # ["pyright-langserver", "--stdio"]
+    root_markers: list[str]      # ["pyproject.toml", ".git"]
+    install_command: list[str] | None
+    initialization_options: dict[str, Any]
+
+BUILTIN_SERVERS: dict[str, LSPServerDef]  # python, typescript, go, rust, c
+EXTENSION_TO_LANGUAGE: dict[str, str]     # .py → "python", .ts → "typescript", etc.
+
+def find_project_root(filepath: Path, root_markers: list[str]) -> Path
+def get_server_for_file(filepath, custom_servers=None) -> LSPServerDef | None
+```
+
+Built-in servers: `python` (pyright), `typescript`, `go` (gopls), `rust` (rust-analyzer), `c` (clangd).
+Custom servers from `prometheus.yaml` `lsp.servers` override builtins or add new languages.
+
+### `prometheus.lsp.client`
+`src/prometheus/lsp/client.py` — novel code
+
+```python
+@dataclass
+class Location:    # path, line, col (1-indexed)
+@dataclass
+class Diagnostic:  # path, line, col, severity (1=Error..4=Hint), message, source
+@dataclass
+class HoverInfo:   # contents (type/doc string)
+@dataclass
+class DocumentSymbol:  # name, kind, range, detail, children
+
+class LSPClient:
+    def __init__(self, server_def: LSPServerDef, project_root: Path) -> None
+    async def start(self) -> None           # spawn process, initialize handshake
+    async def stop(self) -> None            # shutdown + exit + kill
+    async def did_open(self, filepath) -> None
+    async def did_change(self, filepath) -> None
+    async def did_close(self, filepath) -> None
+    async def get_definition(self, filepath, line, col) -> list[Location]
+    async def get_references(self, filepath, line, col) -> list[Location]
+    async def get_hover(self, filepath, line, col) -> HoverInfo | None
+    async def get_diagnostics(self, filepath) -> list[Diagnostic]
+    async def get_document_symbols(self, filepath) -> list[DocumentSymbol]
+    async def rename_symbol(self, filepath, line, col, new_name) -> dict
+```
+
+JSON-RPC 2.0 over stdin/stdout with Content-Length framing. Full document sync
+(no incremental). Diagnostics cached from `textDocument/publishDiagnostics`
+notifications. Async reader loop dispatches responses via `asyncio.Future`.
+
+### `prometheus.lsp.orchestrator`
+`src/prometheus/lsp/orchestrator.py` — novel code
+
+```python
+class LSPOrchestrator:
+    def __init__(self, custom_servers: dict | None = None) -> None
+    async def ensure_server(self, filepath) -> LSPClient | None  # lazy spawn
+    async def get_definition(self, filepath, line, col) -> list[Location]
+    async def get_references(self, filepath, line, col) -> list[Location]
+    async def get_hover(self, filepath, line, col) -> HoverInfo | None
+    async def get_diagnostics(self, filepath) -> list[Diagnostic]
+    async def get_symbols(self, filepath) -> list[DocumentSymbol]
+    async def rename(self, filepath, line, col, new_name) -> dict
+    async def get_symbol_context(self, filepath, line, col) -> str  # THE power move
+    async def notify_file_changed(self, filepath) -> None
+    async def shutdown_all(self) -> None
+```
+
+Manages multiple concurrent LSP clients keyed by `language_id:project_root`.
+Lazy spawning (server starts on first file access), broken server tracking
+(failed servers blacklisted for the session), promise coalescing (concurrent
+requests for the same server share one spawn task).
+
+`get_symbol_context` fans out definition + references + hover concurrently
+and packages everything into one formatted text block.
+
+### `prometheus.tools.builtin.lsp`
+`src/prometheus/tools/builtin/lsp.py` — novel code
+
+```python
+class LSPTool(BaseTool):
+    name = "lsp"
+    # Actions: definition, references, hover, diagnostics, symbols, rename, context
+    # Input: action, file, line?, column?, symbol?, new_name?
+    # is_read_only = True (except rename)
+
+def set_lsp_orchestrator(orch) -> None  # module-level wiring
+```
+
+Single tool with 7 actions. The `context` action is the recommended default —
+one call instead of three. Symbol name resolution: if `symbol` is given without
+`line`/`column`, the file is searched for the first occurrence.
+
+### `prometheus.hooks.lsp_diagnostics`
+`src/prometheus/hooks/lsp_diagnostics.py` — novel code
+
+```python
+class LSPDiagnosticsHook:
+    def __init__(self, orchestrator, delay_ms=500, enabled=True) -> None
+    async def __call__(self, tool_name, tool_input, tool_result) -> ToolResultBlock
+```
+
+Post-result hook that fires after `write_file` and `edit_file`. Notifies the
+LSP server of the change, waits for diagnostics to settle, and appends any
+errors/warnings to the tool result text. The model sees type errors in the
+same turn as the edit.
+
+### `prometheus.engine.agent_loop` — updated
+```python
+@dataclass
+class LoopContext:
+    post_result_hooks: list[object] | None = None  # NEW — modify result after execution
+
+class AgentLoop:
+    def __init__(self, ..., post_result_hooks=None) -> None  # NEW param
+```
+
+Post-result hooks run after tool execution and the existing POST_TOOL_USE hook.
+Each hook is an async callable `(tool_name, tool_input, tool_result) → tool_result`.
+
+### `config/prometheus.yaml` — new section
+```yaml
+lsp:
+  enabled: true
+  auto_diagnostics: true
+  diagnostics_delay_ms: 500
+  auto_install: false
+  servers: {}
+```
+
+### File tree
+```
+src/prometheus/lsp/
+  __init__.py          — package exports
+  languages.py         — server definitions, extension mapping, root detection
+  client.py            — JSON-RPC client over stdin/stdout
+  orchestrator.py      — lifecycle management, routing, symbol context
+src/prometheus/tools/builtin/lsp.py    — LSPTool (7 actions)
+src/prometheus/hooks/lsp_diagnostics.py — post-result diagnostics hook
+tests/test_lsp_client.py               — 22 tests
+tests/test_lsp_orchestrator.py         — 10 tests
+tests/test_lsp_tool.py                 — 16 tests
+tests/test_lsp_diagnostics_hook.py     — 11 tests
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 20 connects |
+|---|---|
+| `engine/agent_loop.py` (Sprint 1) | `LoopContext` gains `post_result_hooks`; `_execute_tool_call` iterates hooks after tool execution to allow result modification |
+| `config/profiles.py` (Sprint 19) | `"lsp"` added to coder profile's tool list |
+| `tools/builtin/__init__.py` (Sprint 2) | `LSPTool` exported |
+| `hooks/__init__.py` (Sprint 2) | `LSPDiagnosticsHook` exported |
+| `scripts/daemon.py` (Sprint 6) | `LSPOrchestrator` created if `lsp.enabled`; `set_lsp_orchestrator()` wires to tool; `LSPDiagnosticsHook` registered as post-result hook; `orchestrator.shutdown_all()` in graceful shutdown |
+| `config/prometheus.yaml` (Sprint 0) | New `lsp:` block controls enablement, auto-diagnostics, delay, and custom servers |

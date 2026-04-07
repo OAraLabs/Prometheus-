@@ -156,6 +156,21 @@ sentinel:
   auto_fix_wiki: true               # let wiki linter auto-fix safe issues
   synthesis_enabled: true           # enable LLM-powered knowledge synthesis
 
+# Language Server Protocol (Sprint 20 LSP)
+lsp:
+  enabled: true
+  auto_diagnostics: true
+  diagnostics_delay_ms: 500
+  auto_install: false
+  servers: {}
+    # Override or add custom servers:
+    # python:
+    #   command: ["pylsp"]
+    # vue:
+    #   command: ["vue-language-server", "--stdio"]
+    #   extensions: [".vue"]
+    #   root_markers: ["package.json"]
+
 # Agent Profiles (Sprint 19 PROFILES)
 profiles:
   default: "full"                           # default profile name

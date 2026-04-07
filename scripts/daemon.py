@@ -149,6 +149,33 @@ async def run_daemon(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
+    # Sprint 20: LSP orchestrator + diagnostics hook
+    lsp_orchestrator = None
+    post_result_hooks: list = []
+    lsp_config = config.get("lsp", {})
+    if lsp_config.get("enabled", False):
+        try:
+            from prometheus.lsp.orchestrator import LSPOrchestrator
+            from prometheus.hooks.lsp_diagnostics import LSPDiagnosticsHook
+            from prometheus.tools.builtin.lsp import LSPTool, set_lsp_orchestrator
+
+            lsp_orchestrator = LSPOrchestrator(
+                custom_servers=lsp_config.get("servers") or {},
+            )
+            set_lsp_orchestrator(lsp_orchestrator)
+            registry.register(LSPTool())
+            logger.info("LSP orchestrator initialised")
+
+            if lsp_config.get("auto_diagnostics", True):
+                diag_hook = LSPDiagnosticsHook(
+                    orchestrator=lsp_orchestrator,
+                    delay_ms=lsp_config.get("diagnostics_delay_ms", 500),
+                )
+                post_result_hooks.append(diag_hook)
+                logger.info("LSP diagnostics hook registered")
+        except Exception as exc:
+            logger.warning("LSP not available: %s", exc)
+
     # Agent loop
     agent_loop = AgentLoop(
         provider=provider,
@@ -160,6 +187,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         telemetry=telemetry,
         model_router=model_router,
         divergence_detector=divergence_detector,
+        post_result_hooks=post_result_hooks or None,
     )
 
     # Shared session manager for all gateways
@@ -438,6 +466,9 @@ async def run_daemon(args: argparse.Namespace) -> None:
     # Graceful shutdown
     logger.info("Shutting down...")
     archive.archive_event("daemon_shutdown")
+
+    if lsp_orchestrator:
+        await lsp_orchestrator.shutdown_all()
 
     if telegram:
         await telegram.stop()
