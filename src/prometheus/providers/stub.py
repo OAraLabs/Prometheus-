@@ -40,6 +40,11 @@ def _build_openai_messages(request: ApiMessageRequest) -> list[dict[str, Any]]:
         result.append({"role": "system", "content": request.system_prompt})
 
     for msg in request.messages:
+        # Pass through pre-formatted dicts (e.g. multimodal vision requests)
+        if isinstance(msg, dict):
+            result.append(msg)
+            continue
+
         text_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []

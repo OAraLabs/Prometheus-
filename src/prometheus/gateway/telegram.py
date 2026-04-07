@@ -650,6 +650,10 @@ class TelegramAdapter(BasePlatformAdapter):
         session = self.session_manager.get_or_create(event.session_key())
         session.add_user_message(event.text)
         pre_len = len(session.get_messages())
+        logger.debug(
+            "THREAD session=%s messages=%d new_user=%r",
+            event.session_key(), pre_len, event.text,
+        )
 
         try:
             result = await self.agent_loop.run_async(
@@ -660,6 +664,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # Append assistant response (and any tool call/result pairs) to session
             session.add_result_messages(result.messages, pre_len)
             session.trim(self.session_manager.MAX_SESSION_MESSAGES)
+            logger.debug(
+                "THREAD after: session=%s total_messages=%d result_messages=%d",
+                event.session_key(), len(session.get_messages()), len(result.messages),
+            )
             response_text = result.text or "(no response)"
         except Exception as exc:
             logger.error("Agent error for chat %d: %s", event.chat_id, exc)
@@ -773,12 +781,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         caption = update.message.caption or ""
-        user_text = caption or "[The user sent a photo]"
 
         # Try vision analysis to describe the image
         description = await self._describe_image(cached_path)
         if description:
             user_text = f"[Image: {description}]\n{caption}".strip()
+        elif caption:
+            user_text = f"[The user sent a photo with caption:] {caption}"
+        else:
+            user_text = "[The user sent a photo]"
 
         event = MessageEvent(
             chat_id=update.effective_chat.id,
