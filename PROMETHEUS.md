@@ -3202,3 +3202,38 @@ class AgentLoop:
 | `gateway/slack.py` (Sprint 6) | `_dispatch_to_agent()` uses same `SessionManager`; `/prometheus-reset` clears via `session_manager.clear()` |
 | `scripts/daemon.py` (Sprint 6) | Creates one `SessionManager` and passes it to both `TelegramAdapter` and `SlackAdapter` |
 | `engine/__init__.py` (Sprint 1) | Exports `ChatSession` and `SessionManager` |
+
+### `prometheus.providers.stub._build_openai_messages` — multimodal passthrough
+`src/prometheus/providers/stub.py` — used by both `StubProvider` and `LlamaCppProvider`
+
+```python
+def _build_openai_messages(request: ApiMessageRequest) -> list[dict[str, Any]]
+    # Now passes through pre-formatted dicts (e.g. multimodal image_url
+    # content blocks from VisionTool) instead of crashing on them.
+    # ConversationMessage objects are converted as before.
+```
+
+### `prometheus.gateway.telegram._handle_photo` — improved fallback
+`src/prometheus/gateway/telegram.py`
+
+When vision analysis fails (model doesn't support it, or server error), the photo
+handler now injects `[The user sent a photo with caption:] ...` so the LLM knows
+an image was attached even without a description. Previously only the bare caption
+was passed, giving the model no indication a photo existed.
+
+### Infrastructure: llama-server vision on 4090
+
+```
+~/.config/systemd/user/llama-server.service  (on gpu-node)
+  --mmproj /home/gpu-node/models/mmproj-BF16.gguf   # Gemma 4 vision projector
+  --ubatch-size 2048 --batch-size 2048                # required for image tokens
+```
+
+### Additional wiring
+
+| Existing module | How Sprint 16 connects |
+|---|---|
+| `providers/stub.py` (Sprint 1) | `_build_openai_messages()` passes through dict messages for multimodal content |
+| `tools/builtin/vision.py` (Sprint 15b) | VisionTool's multimodal request now reaches llama.cpp instead of crashing |
+| `gateway/telegram.py` (Sprint 15b) | `_handle_photo()` fallback text improved when vision unavailable |
+| `~/.config/prometheus/env` (new) | `EnvironmentFile` for secrets; `prometheus.service` reads token from here |

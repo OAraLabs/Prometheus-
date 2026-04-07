@@ -1403,3 +1403,118 @@ class TestSprint16DaemonWiring:
         assert tg.session_manager is sm
         assert sl.session_manager is sm
         assert tg.session_manager is sl.session_manager
+
+
+class TestSprint16VisionMultimodal:
+    """Verify multimodal dict passthrough in _build_openai_messages."""
+
+    def test_dict_messages_passed_through(self):
+        """Pre-formatted dicts (vision image_url) survive _build_openai_messages."""
+        from prometheus.providers.stub import _build_openai_messages
+        from prometheus.providers.base import ApiMessageRequest
+
+        # Simulate what VisionTool sends: a raw dict with image_url content
+        multimodal_msg = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc123"}},
+            ],
+        }
+        request = ApiMessageRequest(
+            model="test",
+            messages=[multimodal_msg],
+            system_prompt="Describe images.",
+            max_tokens=500,
+        )
+        result = _build_openai_messages(request)
+
+        # System prompt + the dict message passed through intact
+        assert len(result) == 2
+        assert result[0]["role"] == "system"
+        assert result[1] is multimodal_msg  # exact same dict, not transformed
+
+    def test_mixed_dict_and_conversation_messages(self):
+        """Mix of ConversationMessage objects and raw dicts both work."""
+        from prometheus.providers.stub import _build_openai_messages
+        from prometheus.providers.base import ApiMessageRequest
+
+        user_msg = ConversationMessage.from_user_text("hello")
+        assistant_msg = ConversationMessage(
+            role="assistant", content=[TextBlock(text="hi")]
+        )
+        multimodal_msg = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,xyz"}},
+            ],
+        }
+
+        request = ApiMessageRequest(
+            model="test",
+            messages=[user_msg, assistant_msg, multimodal_msg],
+            system_prompt=None,
+            max_tokens=500,
+        )
+        result = _build_openai_messages(request)
+
+        assert len(result) == 3
+        assert result[0]["role"] == "user"
+        assert result[0]["content"] == "hello"
+        assert result[1]["role"] == "assistant"
+        assert result[2] is multimodal_msg
+
+    def test_vision_tool_executes_with_provider(self, tmp_path):
+        """VisionTool builds a valid request that reaches the provider."""
+        from prometheus.tools.builtin.vision import VisionTool, VisionInput
+        from prometheus.tools.base import ToolExecutionContext
+
+        # Create a tiny valid JPEG (smallest possible)
+        img = tmp_path / "test.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100)
+
+        # Provider that records what it receives
+        calls = []
+
+        class RecordingProvider:
+            async def stream_message(self, request):
+                calls.append(request)
+                # Yield a completion event so the tool gets a response
+                from prometheus.providers.base import ApiMessageCompleteEvent
+                msg = ConversationMessage(
+                    role="assistant", content=[TextBlock(text="A test image")]
+                )
+                from prometheus.engine.usage import UsageSnapshot
+                yield ApiMessageCompleteEvent(
+                    message=msg,
+                    usage=UsageSnapshot(input_tokens=10, output_tokens=5),
+                    stop_reason="stop",
+                )
+
+        tool = VisionTool()
+        ctx = ToolExecutionContext(
+            cwd=tmp_path,
+            metadata={"provider": RecordingProvider()},
+        )
+
+        result = asyncio.run(tool.execute(
+            VisionInput(image_path=str(img), question="What is this?"),
+            ctx,
+        ))
+
+        # The provider was called
+        assert len(calls) == 1
+        # The messages contain the multimodal dict with image_url
+        req = calls[0]
+        assert len(req.messages) == 1
+        msg = req.messages[0]
+        assert isinstance(msg, dict)
+        assert msg["role"] == "user"
+        # Content has both text and image_url blocks
+        content = msg["content"]
+        assert any(b["type"] == "text" for b in content)
+        assert any(b["type"] == "image_url" for b in content)
+        # Tool returned the description
+        assert result.output == "A test image"
+        assert not result.is_error
