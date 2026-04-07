@@ -18,9 +18,48 @@ import httpx
 import yaml
 
 from prometheus.config.paths import get_config_dir
+from prometheus.providers.registry import CLOUD_DEFAULTS, ProviderRegistry
 
 # Config file lives in the repo's config/ directory
 _REPO_CONFIG = Path(__file__).resolve().parents[2] / "config" / "prometheus.yaml"
+
+# Cloud provider model choices: (model_id, label, pricing)
+CLOUD_PROVIDER_MODELS: dict[str, list[tuple[str, str, str]]] = {
+    "openai": [
+        ("gpt-4o", "Best quality", "$2.50/$10 per 1M tokens"),
+        ("gpt-4o-mini", "Fast + cheap", "$0.15/$0.60 per 1M tokens"),
+        ("o3-mini", "Reasoning", "$1.10/$4.40 per 1M tokens"),
+    ],
+    "anthropic": [
+        ("claude-sonnet-4-6", "Best quality", "$3/$15 per 1M tokens"),
+        ("claude-haiku-4-5-20251001", "Fast + cheap", "$0.80/$4 per 1M tokens"),
+    ],
+    "gemini": [
+        ("gemini-2.5-flash", "Fast + cheap", "$0.15/$0.60 per 1M tokens"),
+        ("gemini-2.5-pro", "Best quality", "$1.25/$10 per 1M tokens"),
+    ],
+    "xai": [
+        ("grok-3", "Flagship", "$3/$15 per 1M tokens"),
+        ("grok-3-mini", "Fast + cheap", "$0.30/$0.50 per 1M tokens"),
+    ],
+}
+
+CLOUD_DEFAULT_ENV_VARS: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "xai": "XAI_API_KEY",
+}
+
+# Effective context limits per provider for sane defaults
+PROVIDER_EFFECTIVE_LIMITS: dict[str, int] = {
+    "llama_cpp": 24000,
+    "ollama": 24000,
+    "openai": 64000,
+    "gemini": 64000,
+    "xai": 64000,
+    "anthropic": 100000,
+}
 
 
 def _input(prompt: str, default: str = "") -> str:
@@ -58,6 +97,7 @@ class SetupWizard:
         self._provider: str = "llama_cpp"
         self._base_url: str = "http://localhost:8080"
         self._model_name: str = ""
+        self._api_key_env: str = ""
         self._gateway: str = "cli"
         self._telegram_token: str = ""
         self._telegram_chat_ids: list[int] = []
@@ -74,6 +114,10 @@ class SetupWizard:
     def run(self) -> bool:
         """Run the full wizard. Returns True if setup succeeded."""
         existing = self._load_existing_config()
+
+        # Auto-detect Hermes/OpenClaw before setup
+        if not existing and not self._gateway_only:
+            self._offer_migration()
 
         if existing and not self._gateway_only:
             action = self._ask_rerun()
@@ -169,19 +213,30 @@ class SetupWizard:
 
     def _step_provider(self) -> None:
         choice = _ask_choice(
-            "Where is your LLM running?",
+            "Where is your LLM?",
             [
-                "llama.cpp (local or remote)",
-                "Ollama (local or remote)",
+                "Local — llama.cpp (recommended for sovereignty)",
+                "Local — Ollama",
+                "Cloud — OpenAI (GPT-4o, o3-mini)",
+                "Cloud — Anthropic (Claude Sonnet, Haiku)",
+                "Cloud — Google Gemini (Flash, Pro)",
+                "Cloud — xAI (Grok)",
                 "I don't have one running yet",
             ],
             default=1,
         )
 
-        if choice == 3:
+        if choice == 7:
             self._print_no_model_help()
             sys.exit(0)
 
+        # Cloud providers
+        cloud_map = {3: "openai", 4: "anthropic", 5: "gemini", 6: "xai"}
+        if choice in cloud_map:
+            self._step_cloud_provider(cloud_map[choice])
+            return
+
+        # Local providers
         self._provider = "llama_cpp" if choice == 1 else "ollama"
         default_url = (
             "http://localhost:8080" if choice == 1 else "http://localhost:11434"
@@ -211,6 +266,56 @@ class SetupWizard:
                 print("\nSaving config with this URL — you can fix it later.")
                 self._base_url = url
                 return
+
+    def _step_cloud_provider(self, provider: str) -> None:
+        """Collect cloud provider config: API key, model, smoke test."""
+        import os
+
+        self._provider = provider
+        default_env = CLOUD_DEFAULT_ENV_VARS[provider]
+
+        print(f"\nEnter your API key, or press Enter to use env var ${default_env}:")
+        key_input = _input(f"API key", default_env)
+
+        if key_input == default_env or not key_input:
+            # Use env var
+            self._api_key_env = default_env
+            api_key = os.environ.get(default_env, "")
+            if not api_key:
+                print(f"\n  ! ${default_env} is not set.")
+                print(f"  Set it with: export {default_env}=your-key-here")
+                print(f"  Config will reference ${default_env}.\n")
+        elif len(key_input) > 20:
+            # They pasted a raw key — store as env var reference
+            self._api_key_env = default_env
+            api_key = key_input
+            print(f"\n  For security, add this to your shell profile:")
+            print(f"  export {default_env}={key_input}")
+            print(f"  Config will reference ${default_env}, not store the key.\n")
+            os.environ[default_env] = key_input  # temp set for smoke test
+        else:
+            # Custom env var name
+            self._api_key_env = key_input
+            api_key = os.environ.get(key_input, "")
+
+        # Model selection
+        models = CLOUD_PROVIDER_MODELS[provider]
+        print(f"\nWhich model?")
+        for i, (name, desc, price) in enumerate(models, 1):
+            print(f"  {i}. {name} ({desc}, {price})")
+        raw = _input("Choice", "1")
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(models):
+                self._model_name = models[idx][0]
+            else:
+                self._model_name = models[0][0]
+        except ValueError:
+            self._model_name = models[0][0]
+
+        # Set base_url from defaults (cloud providers don't need user input)
+        defaults = CLOUD_DEFAULTS.get(provider, {})
+        self._base_url = defaults.get("base_url", "")
 
     def _test_provider(self, url: str) -> str | None:
         """Test connection to provider. Returns model name or None on failure."""
@@ -242,18 +347,25 @@ class SetupWizard:
     def _print_no_model_help(self) -> None:
         print(
             """
-No problem. Here's how to get started:
+No problem. Here are your options:
 
-  llama.cpp:
-    git clone https://github.com/ggerganov/llama.cpp.git
-    cd llama.cpp && make LLAMA_CUDA=1 -j$(nproc)
-    ./llama-server -m models/your-model.gguf -c 32768 -ngl 99 --port 8080
+  Local (free, sovereign):
+    llama.cpp:
+      git clone https://github.com/ggerganov/llama.cpp.git
+      cd llama.cpp && make LLAMA_CUDA=1 -j$(nproc)
+      ./llama-server -m models/your-model.gguf -c 32768 -ngl 99 --port 8080
 
-  Ollama:
-    curl -fsSL https://ollama.com/install.sh | sh
-    ollama run qwen3.5:32b
+    Ollama:
+      curl -fsSL https://ollama.com/install.sh | sh
+      ollama run qwen3.5:32b
 
-Run this wizard again after your model is running:
+  Cloud (API key required):
+    export OPENAI_API_KEY=sk-...       # OpenAI
+    export ANTHROPIC_API_KEY=sk-ant-...  # Anthropic
+    export GEMINI_API_KEY=...          # Google Gemini
+    export XAI_API_KEY=...             # xAI Grok
+
+Run this wizard again after you're ready:
   python3 -m prometheus --setup
 """
         )
@@ -460,11 +572,26 @@ Run this wizard again after your model is running:
         if not self._gateway_only:
             model = cfg.setdefault("model", {})
             model["provider"] = self._provider
-            if self._provider == "ollama":
-                model["base_url"] = self._base_url
-                model["fallback_url"] = self._base_url
+
+            if ProviderRegistry.is_cloud(self._provider):
+                # Cloud provider: store env var reference, remove base_url
+                if self._api_key_env:
+                    model["api_key_env"] = self._api_key_env
+                model.pop("base_url", None)
+                model.pop("fallback_url", None)
+                model.pop("fallback_provider", None)
+                # Set effective context limit for cloud
+                context = cfg.setdefault("context", {})
+                context["effective_limit"] = PROVIDER_EFFECTIVE_LIMITS.get(
+                    self._provider, 64000
+                )
             else:
+                # Local provider: store URL
                 model["base_url"] = self._base_url
+                if self._provider == "ollama":
+                    model["fallback_url"] = self._base_url
+                model.pop("api_key_env", None)
+
             if self._model_name:
                 model["model"] = self._model_name
 
@@ -496,9 +623,14 @@ Run this wizard again after your model is running:
         # Print summary of what was written
         model = cfg.get("model", {})
         gw = cfg.get("gateway", {})
-        print(f"  + Model provider: {model.get('provider', '?')} @ {model.get('base_url', '?')}")
+        provider = model.get("provider", "?")
+        if ProviderRegistry.is_cloud(provider):
+            env = model.get("api_key_env", "?")
+            print(f"  + Model provider: {provider} (key: ${env})")
+        else:
+            print(f"  + Model provider: {provider} @ {model.get('base_url', '?')}")
         if model.get("model"):
-            print(f"  + Detected model: {model['model']}")
+            print(f"  + Model: {model['model']}")
         gateways_active: list[str] = []
         if gw.get("telegram_enabled"):
             token = gw.get("telegram_token", "")
@@ -538,29 +670,72 @@ Run this wizard again after your model is running:
 
     def _run_smoke_test(self) -> bool:
         """Send a simple prompt to the model and verify a response."""
+        import os
+        import time
+
         print("\nRunning smoke test...")
         print("  Testing LLM connection...")
 
         try:
-            import time
-
             t0 = time.monotonic()
-            url = f"{self._base_url.rstrip('/')}/v1/chat/completions"
-            payload = {
+
+            headers: dict[str, str] = {"Content-Type": "application/json"}
+            payload: dict[str, Any] = {
                 "model": self._model_name or "local",
                 "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
                 "max_tokens": 32,
                 "stream": False,
             }
-            resp = httpx.post(url, json=payload, timeout=60.0)
-            resp.raise_for_status()
-            elapsed = time.monotonic() - t0
 
-            data = resp.json()
-            choices = data.get("choices", [])
-            text = ""
-            if choices:
-                text = (choices[0].get("message", {}).get("content", "") or "").strip()
+            if self._provider == "anthropic":
+                # Anthropic uses a different API format
+                api_key = os.environ.get(self._api_key_env, "")
+                if not api_key:
+                    print(f"  x ${self._api_key_env} not set — skipping smoke test.")
+                    return True
+                url = "https://api.anthropic.com/v1/messages"
+                headers["x-api-key"] = api_key
+                headers["anthropic-version"] = "2023-06-01"
+                payload = {
+                    "model": self._model_name or "claude-sonnet-4-6",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
+                }
+                resp = httpx.post(url, json=payload, headers=headers, timeout=60.0)
+                resp.raise_for_status()
+                elapsed = time.monotonic() - t0
+                data = resp.json()
+                content = data.get("content", [])
+                text = content[0].get("text", "") if content else ""
+            elif ProviderRegistry.is_cloud(self._provider):
+                # OpenAI-compatible cloud provider
+                api_key = os.environ.get(self._api_key_env, "")
+                if not api_key:
+                    print(f"  x ${self._api_key_env} not set — skipping smoke test.")
+                    return True
+                defaults = CLOUD_DEFAULTS.get(self._provider, {})
+                base = self._base_url or defaults.get("base_url", "")
+                base = base.rstrip("/")
+                if base.endswith("/v1"):
+                    url = f"{base}/chat/completions"
+                else:
+                    url = f"{base}/v1/chat/completions"
+                headers["Authorization"] = f"Bearer {api_key}"
+                resp = httpx.post(url, json=payload, headers=headers, timeout=60.0)
+                resp.raise_for_status()
+                elapsed = time.monotonic() - t0
+                data = resp.json()
+                choices = data.get("choices", [])
+                text = (choices[0].get("message", {}).get("content", "") or "").strip() if choices else ""
+            else:
+                # Local provider
+                url = f"{self._base_url.rstrip('/')}/v1/chat/completions"
+                resp = httpx.post(url, json=payload, headers=headers, timeout=60.0)
+                resp.raise_for_status()
+                elapsed = time.monotonic() - t0
+                data = resp.json()
+                choices = data.get("choices", [])
+                text = (choices[0].get("message", {}).get("content", "") or "").strip() if choices else ""
 
             print(f'  Sending test prompt: "What is 2+2?"')
             print(f"  Response: {text!r}")
@@ -571,7 +746,7 @@ Run this wizard again after your model is running:
             else:
                 print(f"  ~ Smoke test got a response but '4' not found ({elapsed:.1f}s)")
                 print("    The model is reachable — response quality may vary.")
-                return True  # Connection works, that's what matters
+                return True
 
         except Exception as exc:
             print(f"  x Smoke test failed: {exc}")
@@ -635,6 +810,39 @@ Run this wizard again after your model is running:
     # Re-run handling
     # ------------------------------------------------------------------
 
+    def _offer_migration(self) -> None:
+        """Detect Hermes/OpenClaw and offer migration before setup."""
+        from prometheus.cli.migrate import detect_sources, run_migration
+
+        sources = detect_sources()
+        if not sources:
+            return
+
+        print("\n  Existing agent installations detected:\n")
+        for name, path in sources.items():
+            label = "Hermes Agent" if name == "hermes" else "OpenClaw"
+            print(f"    {label}: {path}")
+        print()
+
+        for name, path in sources.items():
+            label = "Hermes Agent" if name == "hermes" else "OpenClaw"
+            resp = _input(
+                f"  Import your {label} data (memories, skills, config)? [Y/n]", "Y"
+            )
+            if resp.lower() in ("y", ""):
+                import argparse
+                args = argparse.Namespace(
+                    source_type=name,
+                    source_path=str(path),
+                    dry_run=False,
+                    overwrite=False,
+                    preset="user-data",
+                    skill_conflict="skip",
+                    yes=True,
+                )
+                run_migration(args)
+                print()
+
     def _ask_rerun(self) -> int:
         """Ask what to do when config already exists. Returns 1-4."""
         return _ask_choice(
@@ -668,6 +876,7 @@ Run this wizard again after your model is running:
         self._provider = model.get("provider", "llama_cpp")
         self._base_url = model.get("base_url", "http://localhost:8080")
         self._model_name = model.get("model", "")
+        self._api_key_env = model.get("api_key_env", "")
 
         gw = cfg.get("gateway", {})
         has_tg = gw.get("telegram_enabled", False)

@@ -101,6 +101,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self.system_prompt = system_prompt
         self.model_name = model_name
         self.model_provider = model_provider
+        self.cost_tracker = None  # Set by daemon if using cloud provider
         self._app: Application | None = None
         self._start_time: float = 0.0
 
@@ -340,6 +341,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # Tools
         lines.append(f"Tools: {len(self.tool_registry.list_tools())}")
+
+        # Cost tracking (cloud providers)
+        if self.cost_tracker is not None:
+            lines.append(self.cost_tracker.report())
 
         # Memory stats
         try:

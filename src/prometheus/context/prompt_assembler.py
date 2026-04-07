@@ -177,25 +177,33 @@ def build_runtime_system_prompt(
         for filename in profile_bootstrap:
             content = _load_bootstrap_file(filename)
             if content:
-                static_sections.append(content)
+                static_sections.append(
+                    f"<!-- Bootstrap: ~/.prometheus/{filename} -->\n{content}"
+                )
     else:
         # Legacy path: individual config toggles
         if bootstrap_cfg.get("load_soul", True):
             soul = _load_bootstrap_file("SOUL.md")
             if soul:
-                static_sections.append(soul)
+                static_sections.append(
+                    f"<!-- Bootstrap: ~/.prometheus/SOUL.md -->\n{soul}"
+                )
 
         if bootstrap_cfg.get("load_agents", True):
             agents = _load_bootstrap_file("AGENTS.md")
             if agents:
-                static_sections.append(agents)
+                static_sections.append(
+                    f"<!-- Bootstrap: ~/.prometheus/AGENTS.md -->\n{agents}"
+                )
 
         # ANATOMY.md — compact infrastructure summary (Layer 1.5)
         anatomy_cfg = config.get("anatomy", {})
         if anatomy_cfg.get("include_in_system_prompt", True):
             anatomy_summary = _load_anatomy_summary()
             if anatomy_summary:
-                static_sections.append(anatomy_summary)
+                static_sections.append(
+                    f"<!-- Bootstrap: ~/.prometheus/ANATOMY.md -->\n{anatomy_summary}"
+                )
 
     # 3-4. Base system prompt + environment info
     custom_prompt = config.get("system_prompt")

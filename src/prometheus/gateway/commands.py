@@ -48,12 +48,17 @@ def cmd_status(
     model_provider: str,
     start_time: float,
     tool_registry: ToolRegistry,
+    cost_tracker: Any = None,
 ) -> str:
     """Return full status text."""
     lines: list[str] = ["Prometheus Status\n"]
 
     lines.append(f"Model: {model_name or '(unknown)'}")
     lines.append(f"Provider: {model_provider or '(unknown)'}")
+
+    # Cloud provider cost info
+    if cost_tracker is not None:
+        lines.append(cost_tracker.report())
 
     if start_time:
         elapsed = int(time.monotonic() - start_time)

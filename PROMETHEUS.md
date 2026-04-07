@@ -3648,3 +3648,244 @@ tests/test_lsp_diagnostics_hook.py     — 11 tests
 | `hooks/__init__.py` (Sprint 2) | `LSPDiagnosticsHook` exported |
 | `scripts/daemon.py` (Sprint 6) | `LSPOrchestrator` created if `lsp.enabled`; `set_lsp_orchestrator()` wires to tool; `LSPDiagnosticsHook` registered as post-result hook; `orchestrator.shutdown_all()` in graceful shutdown |
 | `config/prometheus.yaml` (Sprint 0) | New `lsp:` block controls enablement, auto-diagnostics, delay, and custom servers |
+
+## Sprint 21: Cloud API Providers ✓
+
+Prometheus was locked to local inference (llama.cpp, Ollama). This sprint
+adds OpenAI, Anthropic, Gemini, and xAI as cloud API providers alongside
+existing local providers, plus a provider registry, cost tracking, and
+setup wizard extensions. No new pip dependencies — all use raw `httpx`.
+
+### `prometheus.providers.openai_compat`
+`src/prometheus/providers/openai_compat.py` — novel code
+
+```python
+class OpenAICompatProvider(ModelProvider):
+    """Provider for any OpenAI-compatible chat completions API.
+    Covers: OpenAI, Google Gemini, xAI Grok, vLLM, LiteLLM."""
+
+    def __init__(
+        self, base_url: str, api_key: str, model: str = "",
+        default_max_tokens: int = 4096, timeout: float = 120.0,
+    ) -> None
+
+    async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]
+        # SSE streaming to /v1/chat/completions with Bearer auth
+        # Handles tool_calls delta accumulation, usage extraction
+        # Exponential backoff retry on 429/5xx
+```
+
+### `prometheus.providers.anthropic` — existing (Sprint 1 fallback)
+`src/prometheus/providers/anthropic.py` — already implemented, now wired via registry
+
+```python
+class AnthropicProvider(ModelProvider):
+    def __init__(
+        self, api_key: str | None = None, model: str = "claude-sonnet-4-6",
+        timeout: float = 120.0, prompt_caching: bool = False,
+    ) -> None
+```
+
+### `prometheus.providers.registry`
+`src/prometheus/providers/registry.py` — novel code
+
+```python
+class ProviderRegistry:
+    @staticmethod
+    def create(config: dict) -> ModelProvider
+        # Factory: "openai"|"gemini"|"xai" → OpenAICompatProvider
+        #          "anthropic" → AnthropicProvider
+        #          "llama_cpp" → LlamaCppProvider
+        #          "ollama" → OllamaProvider, "stub" → StubProvider
+        # API keys resolved via config["api_key_env"] → os.environ
+
+    @staticmethod
+    def is_cloud(provider_name: str) -> bool
+        # True for openai, anthropic, gemini, xai
+
+    @staticmethod
+    def list_providers() -> list[str]
+        # All 7 supported provider names
+```
+
+### `prometheus.adapter.formatter.PassthroughFormatter`
+`src/prometheus/adapter/formatter.py` — added to existing file
+
+```python
+class PassthroughFormatter(ModelPromptFormatter):
+    """For cloud API models with native tool calling.
+    format_tools/format_system_prompt return inputs unchanged."""
+```
+
+### `prometheus.telemetry.cost`
+`src/prometheus/telemetry/cost.py` — novel code
+
+```python
+PRICING: dict[str, tuple[float, float]]  # model → (input $/1M, output $/1M)
+    # gpt-4o, gpt-4o-mini, o3-mini, claude-sonnet-4-6, claude-haiku-4-5,
+    # gemini-2.5-flash, gemini-2.5-pro, grok-3, grok-3-mini
+
+class CostTracker:
+    def record(self, model: str, input_tokens: int, output_tokens: int) -> float
+        # Returns cost in USD. Prefix-matches model names for versioned IDs.
+    def report(self) -> str
+        # "Session cost: $0.0342 (14,230 input + 2,891 output tokens)"
+    def to_dict(self) -> dict[str, Any]
+    # Properties: total_cost, total_input_tokens, total_output_tokens, total_tokens
+```
+
+### `prometheus.__main__` — updated
+```python
+def create_adapter(model_cfg: dict) -> ModelAdapter
+    # "anthropic" → AnthropicFormatter, strictness=NONE
+    # "openai"|"gemini"|"xai" → PassthroughFormatter, strictness=NONE
+    # "llama_cpp"|"ollama" + "gemma" in model → GemmaFormatter, strictness=MEDIUM
+    # "llama_cpp"|"ollama" + other model → QwenFormatter, strictness=MEDIUM
+```
+
+### `prometheus.setup_wizard` — updated
+```python
+class SetupWizard:
+    def _step_provider(self) -> None
+        # 7 options: llama.cpp, Ollama, OpenAI, Anthropic, Gemini, xAI, none
+    def _step_cloud_provider(self, provider: str) -> None
+        # Collects API key/env var, model selection with pricing, sets base_url
+```
+
+### `config/prometheus.yaml` — updated
+```yaml
+model:
+  # Commented examples for all 4 cloud providers:
+  # provider: "openai"  / "anthropic" / "gemini" / "xai"
+  # api_key_env: "OPENAI_API_KEY"  # reads from env var, never stored
+  # model: "gpt-4o"
+```
+
+### File tree
+```
+src/prometheus/providers/
+  openai_compat.py       — OpenAICompatProvider (OpenAI, Gemini, xAI)
+  anthropic.py           — AnthropicProvider (existing, now registered)
+  registry.py            — ProviderRegistry factory
+src/prometheus/adapter/
+  formatter.py           — PassthroughFormatter added
+src/prometheus/telemetry/
+  cost.py                — CostTracker + PRICING table
+tests/test_cloud_providers.py  — 37 tests
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 21 connects |
+|---|---|
+| `providers/base.py` (Sprint 1) | `OpenAICompatProvider` implements `ModelProvider` ABC |
+| `providers/stub.py` (Sprint 1) | `OpenAICompatProvider` reuses `_build_openai_messages` and `_parse_assistant_message` |
+| `adapter/__init__.py` (Sprint 3) | `create_adapter()` routes cloud providers to `PassthroughFormatter` with `strictness=NONE` |
+| `scripts/daemon.py` (Sprint 6) | Provider instantiation replaced with `ProviderRegistry.create(model_config)`; `CostTracker` created for cloud providers and attached to Telegram adapter |
+| `gateway/telegram.py` (Sprint 6) | `TelegramAdapter` gains `cost_tracker` attribute; `/status` handler shows session cost when set |
+| `gateway/commands.py` (Sprint 6) | `cmd_status()` gains optional `cost_tracker` parameter |
+| `setup_wizard.py` (Sprint 6) | `_step_provider()` expanded from 3 to 7 options; `_step_cloud_provider()` added; `_apply_wizard_fields()` handles `api_key_env` and provider-specific context limits; smoke test supports Anthropic and OpenAI-compat APIs |
+| `config/prometheus.yaml` (Sprint 0) | Commented examples for all 4 cloud providers added under `model:` |
+
+## Sprint 22: MIGRATE — Hermes/OpenClaw Migration Tool ✓
+
+Users coming from Hermes Agent or OpenClaw have identity files, memories,
+skills, and config they don't want to lose. This sprint adds a CLI migration
+tool that runs pre-agent (no model, no API keys) and a setup wizard
+auto-detection hook.
+
+### `prometheus.cli.migrate`
+`src/prometheus/cli/migrate.py` — novel code
+
+```python
+@dataclass
+class MigrationItem:
+    category: str          # "identity", "memory", "skills", "config", "secrets"
+    source_path: Path
+    dest_path: Path
+    description: str
+    action: str = "copy"   # "copy", "remap", "skip", "manual"
+    status: str = "pending"  # "pending", "done", "skipped", "conflict", "error"
+    conflict: str | None = None
+
+@dataclass
+class MigrationReport:
+    source: str            # "hermes" or "openclaw"
+    source_path: Path
+    timestamp: str
+    items: list[MigrationItem]
+    # Properties: migrated, skipped, errors, manual
+
+@dataclass
+class MigrationOptions:
+    source: str            # "hermes" or "openclaw"
+    source_path: Path
+    dest_path: Path | None = None
+    dry_run: bool = False
+    overwrite: bool = False
+    preset: str = "user-data"      # "full" includes secrets (as manual items)
+    skill_conflict: str = "skip"   # "skip", "overwrite", "rename"
+
+def detect_sources() -> dict[str, Path]
+    # Finds ~/.hermes (config.yaml), ~/.openclaw|.clawdbot|.moldbot (openclaw.json)
+
+class HermesMigrator(_BaseMigrator):
+    def scan(self) -> MigrationReport
+        # Scans: SOUL.md, AGENTS.md, memories/{MEMORY,USER}.md, memories/daily/,
+        #        skills/, config.yaml (remap), cron/, .env (manual)
+    def execute(self) -> MigrationReport
+        # Copies files, remaps config, archives overflow, writes report
+
+class OpenClawMigrator(_BaseMigrator):
+    def scan(self) -> MigrationReport
+        # Finds workspace via openclaw.json agents.*.workspace or ~/clawd/
+        # Scans workspace: SOUL.md, MEMORY.md, USER.md, AGENTS.md, skills/, memory/
+        # Scans config: openclaw.json (remap)
+    def execute(self) -> MigrationReport
+
+def run_migration(args) -> bool
+    # CLI entry point — detect, scan, confirm, execute, report
+```
+
+Key behaviors:
+- Memory overflow: MEMORY.md > 12K chars trimmed (most-recent kept), overflow archived
+- Config remap: Hermes YAML keys mapped to Prometheus YAML keys; provider names mapped
+- Secrets: never auto-copied, only printed as guidance (`action="manual"`)
+- Overwrite: archives original to `~/.prometheus/migration/<source>/<timestamp>/archive/`
+
+### CLI (`__main__.py` — updated)
+```
+python -m prometheus migrate --from hermes
+python -m prometheus migrate --from openclaw
+python -m prometheus migrate --from hermes --dry-run
+python -m prometheus migrate --from openclaw --source ~/.clawdbot
+python -m prometheus migrate --from hermes --overwrite --preset full
+```
+
+Flags: `--from` (required), `--dry-run`, `--source`, `--overwrite`,
+`--preset` (user-data|full), `--skill-conflict` (skip|overwrite|rename), `--yes`
+
+### `prometheus.setup_wizard` — updated
+```python
+class SetupWizard:
+    def _offer_migration(self) -> None
+        # Called at start of run() when no existing config
+        # Auto-detects Hermes/OpenClaw, prompts user, runs migration
+```
+
+### File tree
+```
+src/prometheus/cli/
+  __init__.py
+  migrate.py             — detect_sources, HermesMigrator, OpenClawMigrator
+tests/test_migrate.py    — 30 tests
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 22 connects |
+|---|---|
+| `__main__.py` (Sprint 0) | `migrate` subcommand added to argparse; dispatches to `run_migration()` before any agent/model setup |
+| `setup_wizard.py` (Sprint 6) | `_offer_migration()` called at start of `run()` when no config exists; uses `detect_sources()` + `run_migration()` |
+| `memory/hermes_memory_tool.py` (Sprint 5) | Memory char limits (`_MEMORY_MAX_CHARS=12000`, `_USER_MAX_CHARS=8000`) matched by overflow trimming |
+| `config/prometheus.yaml` (Sprint 0) | Config remap target — Hermes/OpenClaw keys mapped to Prometheus keys |

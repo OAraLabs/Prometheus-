@@ -249,12 +249,27 @@ def create_tool_registry(security_cfg: dict[str, Any], security_gate=None) -> An
 def create_adapter(model_cfg: dict[str, Any]):
     """Create the model adapter layer (Sprint 3)."""
     from prometheus.adapter import ModelAdapter
-    from prometheus.adapter.formatter import QwenFormatter, AnthropicFormatter
+    from prometheus.adapter.formatter import (
+        QwenFormatter,
+        GemmaFormatter,
+        AnthropicFormatter,
+        PassthroughFormatter,
+    )
+    from prometheus.providers.registry import ProviderRegistry
 
     provider_name = model_cfg.get("provider", "llama_cpp")
-    if provider_name in ("llama_cpp", "ollama"):
-        return ModelAdapter(formatter=QwenFormatter(), strictness="MEDIUM")
-    return ModelAdapter(formatter=AnthropicFormatter(), strictness="NONE")
+    model_name = model_cfg.get("model", "")
+
+    # Cloud providers: native tool calling, no adapter work needed
+    if provider_name == "anthropic":
+        return ModelAdapter(formatter=AnthropicFormatter(), strictness="NONE")
+    if ProviderRegistry.is_cloud(provider_name):
+        return ModelAdapter(formatter=PassthroughFormatter(), strictness="NONE")
+
+    # Local providers: pick formatter based on model name
+    if "gemma" in model_name.lower():
+        return ModelAdapter(formatter=GemmaFormatter(), strictness="MEDIUM")
+    return ModelAdapter(formatter=QwenFormatter(), strictness="MEDIUM")
 
 
 async def create_mcp_runtime(config: dict[str, Any], registry: Any) -> Any:
@@ -592,6 +607,39 @@ def main() -> None:
         help="Only start Telegram adapter",
     )
 
+    migrate_parser = subparsers.add_parser(
+        "migrate", help="Import data from Hermes Agent or OpenClaw",
+    )
+    migrate_parser.add_argument(
+        "--from", dest="source_type", required=True,
+        choices=["hermes", "openclaw"],
+        help="Source agent to migrate from",
+    )
+    migrate_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview migration without writing files",
+    )
+    migrate_parser.add_argument(
+        "--source", dest="source_path",
+        help="Custom source directory path",
+    )
+    migrate_parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Overwrite existing Prometheus files (archives originals)",
+    )
+    migrate_parser.add_argument(
+        "--preset", choices=["user-data", "full"], default="user-data",
+        help="Migration preset (default: user-data, excludes secrets)",
+    )
+    migrate_parser.add_argument(
+        "--skill-conflict", choices=["skip", "overwrite", "rename"],
+        default="skip", help="How to handle skill name collisions",
+    )
+    migrate_parser.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip confirmation prompt",
+    )
+
     args = parser.parse_args()
 
     # Logging
@@ -607,6 +655,12 @@ def main() -> None:
         from prometheus.setup_wizard import SetupWizard
         wizard = SetupWizard(gateway_only=args.setup_gateway_only)
         success = wizard.run()
+        sys.exit(0 if success else 1)
+
+    # Migration subcommand — runs pre-agent, no model needed
+    if args.command == "migrate":
+        from prometheus.cli.migrate import run_migration
+        success = run_migration(args)
         sys.exit(0 if success else 1)
 
     # Data reset commands

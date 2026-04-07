@@ -31,6 +31,7 @@ from prometheus.gateway.cron_scheduler import run_scheduler_loop
 from prometheus.gateway.heartbeat import Heartbeat
 from prometheus.gateway.telegram import TelegramAdapter
 from prometheus.providers.llama_cpp import LlamaCppProvider
+from prometheus.providers.registry import ProviderRegistry
 from prometheus.__main__ import (
     create_adapter,
     create_divergence_detector,
@@ -106,19 +107,27 @@ async def run_daemon(args: argparse.Namespace) -> None:
     archive = ArchiveWriter()
     archive.archive_event("daemon_start", {"args": vars(args)})
 
-    # Model provider — use LlamaCppProvider from Sprint 3
-    provider = LlamaCppProvider(
-        base_url=model_config.get("base_url", "http://localhost:8080"),
-    )
+    # Model provider — ProviderRegistry handles all provider types
+    provider = ProviderRegistry.create(model_config)
 
-    # Detect actual loaded model from the server (falls back to config)
+    # Detect actual loaded model from the server (local providers only)
     config_model = model_config.get("model", "qwen3.5-32b")
-    detected = await provider.detect_loaded_model()
-    model_name = detected or config_model
-    if detected:
-        model_config["model"] = detected
+    if hasattr(provider, "detect_loaded_model"):
+        detected = await provider.detect_loaded_model()
+        model_name = detected or config_model
+        if detected:
+            model_config["model"] = detected
+        else:
+            logger.info("Using model name from config: %s", config_model)
     else:
-        logger.info("Using model name from config: %s", config_model)
+        model_name = config_model
+        logger.info("Cloud provider: %s, model: %s", model_config.get("provider"), model_name)
+
+    # Cost tracker for cloud providers
+    cost_tracker = None
+    if ProviderRegistry.is_cloud(model_config.get("provider", "")):
+        from prometheus.telemetry.cost import CostTracker
+        cost_tracker = CostTracker()
 
     # Tool registry — same tools as CLI mode
     registry = build_tool_registry(security_cfg=security_config)
@@ -230,6 +239,8 @@ async def run_daemon(args: argparse.Namespace) -> None:
             model_provider=model_config.get("provider", "llama_cpp"),
             session_manager=session_manager,
         )
+        if cost_tracker is not None:
+            telegram.cost_tracker = cost_tracker
         await telegram.start()
         archive.archive_event("telegram_started")
         logger.info("Telegram adapter started")

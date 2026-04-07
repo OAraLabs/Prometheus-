@@ -63,6 +63,28 @@ class AnthropicFormatter(ModelPromptFormatter):
         return []  # Anthropic API returns structured tool_use blocks directly
 
 
+class PassthroughFormatter(ModelPromptFormatter):
+    """For cloud API models that handle tool formatting natively.
+
+    Used by: OpenAI, Gemini, xAI — all support native function calling.
+    The provider converts to wire format; the formatter does nothing.
+    """
+
+    def format_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return tools
+
+    def format_system_prompt(
+        self,
+        base_prompt: str,
+        tools: list[dict[str, Any]],
+        context: dict[str, Any] | None = None,
+    ) -> str:
+        return base_prompt
+
+    def parse_tool_calls(self, raw_response: str) -> list[ToolUseBlock]:
+        return []  # Cloud APIs return structured tool calls directly
+
+
 # ---------------------------------------------------------------------------
 # QwenFormatter — OpenAI-compatible with explicit examples
 # ---------------------------------------------------------------------------
