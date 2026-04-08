@@ -749,12 +749,12 @@ class TelegramAdapter(BasePlatformAdapter):
             f"Beacon\n"
             f"  REST API:  {link_host}:{api_port}\n"
             f"  WebSocket: ws://{link_host}:{ws_port}\n"
-            f"  Dashboard: {link_host}:3000"
+            f"  Dashboard: {link_host}:{web.get('dashboard_port', 3002)}"
         )
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("Open API", url=f"http://{link_host}:{api_port}/api/status"),
-                InlineKeyboardButton("Open Dashboard", url=f"http://{link_host}:3000"),
+                InlineKeyboardButton("Open Dashboard", url=f"http://{link_host}:{web.get('dashboard_port', 3002)}"),
             ],
         ])
         await self._app.bot.send_message(
