@@ -52,6 +52,8 @@ class AnthropicProvider(ModelProvider):
         provider = AnthropicProvider(prompt_caching=True)      # cache long system prompts
     """
 
+    api_enforced_structure: bool = True
+
     def __init__(
         self,
         api_key: str | None = None,

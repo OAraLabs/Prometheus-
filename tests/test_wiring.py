@@ -2575,20 +2575,22 @@ class TestSprint21CloudProviders:
         assert isinstance(adapter.formatter, AnthropicFormatter)
 
     def test_create_adapter_local_gemma(self):
-        """Gemma 4 has native function_calling → Passthrough/NONE."""
+        """Gemma 4 has native function_calling → tier light, GemmaFormatter."""
         from prometheus.__main__ import create_adapter
-        from prometheus.adapter.formatter import PassthroughFormatter
+        from prometheus.adapter.formatter import GemmaFormatter
 
         adapter = create_adapter({"provider": "llama_cpp", "model": "gemma4-26b"})
-        assert isinstance(adapter.formatter, PassthroughFormatter)
+        assert adapter.tier == "light"
+        assert isinstance(adapter.formatter, GemmaFormatter)
 
     def test_create_adapter_local_qwen(self):
-        """Qwen has native function_calling → Passthrough/NONE."""
+        """Qwen has native function_calling → tier light, QwenFormatter."""
         from prometheus.__main__ import create_adapter
-        from prometheus.adapter.formatter import PassthroughFormatter
+        from prometheus.adapter.formatter import QwenFormatter
 
         adapter = create_adapter({"provider": "llama_cpp", "model": "qwen3.5-32b"})
-        assert isinstance(adapter.formatter, PassthroughFormatter)
+        assert adapter.tier == "light"
+        assert isinstance(adapter.formatter, QwenFormatter)
 
     def test_create_adapter_strictness_none_for_cloud(self):
         """Cloud providers get strictness=NONE — no validation overhead."""

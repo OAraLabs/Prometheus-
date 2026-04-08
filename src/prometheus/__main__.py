@@ -274,13 +274,33 @@ def _has_native_tool_calling(model_name: str) -> bool:
     return False
 
 
-def create_adapter(model_cfg: dict[str, Any], adapter_cfg: dict[str, Any] | None = None):
-    """Create the model adapter layer (Sprint 3).
+def _get_adapter_tier(provider_name: str, model_name: str) -> str:
+    """Determine the adapter tier from provider + model capabilities.
 
-    Decision order:
-    1. Cloud API providers → PassthroughFormatter, NONE
-    2. Local model with native_tool_calling in model_registry → PassthroughFormatter, NONE
-    3. Local model without native → model-specific formatter, MEDIUM
+    Returns "off", "light", or "full".
+    """
+    from prometheus.providers.registry import ProviderRegistry
+
+    # Tier 1: API enforces structure (Anthropic, OpenAI, cloud providers)
+    if provider_name == "anthropic" or ProviderRegistry.is_cloud(provider_name):
+        return "off"
+
+    # Tier 2: Model has native tool calling, but server doesn't guarantee structure
+    if _has_native_tool_calling(model_name):
+        return "light"
+
+    # Tier 3: Full adapter pipeline
+    return "full"
+
+
+def create_adapter(model_cfg: dict[str, Any], adapter_cfg: dict[str, Any] | None = None):
+    """Create the model adapter layer with three tiers.
+
+    Tier "off"   — API enforces structure. Passthrough, no validation.
+    Tier "light" — Model trained for tool calling on local server.
+                   Keep model-specific formatter, GBNF on, validator NONE,
+                   max_retries=1, adaptive strictness on.
+    Tier "full"  — No native tool calling. Full validation + repair.
     """
     from prometheus.adapter import ModelAdapter
     from prometheus.adapter.formatter import (
@@ -289,7 +309,6 @@ def create_adapter(model_cfg: dict[str, Any], adapter_cfg: dict[str, Any] | None
         AnthropicFormatter,
         PassthroughFormatter,
     )
-    from prometheus.providers.registry import ProviderRegistry
 
     provider_name = model_cfg.get("provider", "llama_cpp")
     model_name = model_cfg.get("model", "")
@@ -300,24 +319,29 @@ def create_adapter(model_cfg: dict[str, Any], adapter_cfg: dict[str, Any] | None
         "strictness_window": acfg.get("strictness_window", 100),
     }
 
-    # Cloud providers: native tool calling, no adapter work needed
-    if provider_name == "anthropic":
-        return ModelAdapter(formatter=AnthropicFormatter(), strictness="NONE", **adaptive_kwargs)
-    if ProviderRegistry.is_cloud(provider_name):
-        return ModelAdapter(formatter=PassthroughFormatter(), strictness="NONE", **adaptive_kwargs)
+    tier = _get_adapter_tier(provider_name, model_name)
 
-    # Local providers: check model_registry.yaml for native function_calling
-    if _has_native_tool_calling(model_name):
-        log.info(
-            "Model %s has native function_calling — using PassthroughFormatter/NONE",
-            model_name,
-        )
-        return ModelAdapter(formatter=PassthroughFormatter(), strictness="NONE", **adaptive_kwargs)
+    if tier == "off":
+        formatter = AnthropicFormatter() if provider_name == "anthropic" else PassthroughFormatter()
+        return ModelAdapter(formatter=formatter, tier="off", **adaptive_kwargs)
 
-    # Fallback: model-specific formatter with validation + repair
+    if tier == "light":
+        # Keep model-specific formatter — the model was trained for a format
+        if "gemma" in model_name.lower():
+            formatter = GemmaFormatter()
+        elif "qwen" in model_name.lower():
+            formatter = QwenFormatter()
+        else:
+            formatter = QwenFormatter()  # safe default for tool-calling models
+        log.info("Adapter tier=light for %s (native tool calling, GBNF + light validation)", model_name)
+        return ModelAdapter(formatter=formatter, tier="light", **adaptive_kwargs)
+
+    # tier == "full"
     if "gemma" in model_name.lower():
-        return ModelAdapter(formatter=GemmaFormatter(), strictness="MEDIUM", **adaptive_kwargs)
-    return ModelAdapter(formatter=QwenFormatter(), strictness="MEDIUM", **adaptive_kwargs)
+        formatter = GemmaFormatter()
+    else:
+        formatter = QwenFormatter()
+    return ModelAdapter(formatter=formatter, strictness="MEDIUM", tier="full", **adaptive_kwargs)
 
 
 async def create_mcp_runtime(config: dict[str, Any], registry: Any) -> Any:

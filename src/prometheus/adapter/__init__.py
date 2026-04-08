@@ -50,15 +50,24 @@ __all__ = [
 class ModelAdapter:
     """High-level adapter that wires together all Sprint 3 components.
 
+    Three adapter tiers:
+      - "off"   — API enforces structure (Anthropic, OpenAI). Skip everything.
+      - "light" — Model has native tool calling but server doesn't guarantee
+                  structure (Gemma 4/Qwen on llama.cpp). GBNF on, validator
+                  at NONE, enforcer off, max_retries=1.
+      - "full"  — Model lacks tool calling training. Full adapter pipeline.
+
     Args:
         formatter:   Model-specific prompt formatter.
-                     Defaults to AnthropicFormatter (passthrough).
         strictness:  Validation strictness: "NONE" | "MEDIUM" | "STRICT".
-                     NONE skips all validation (safe for Claude API).
-                     MEDIUM validates + auto-repairs (Qwen, Mistral).
-                     STRICT validates + repairs + coerces aggressively.
         max_retries: Max tool-call retries before giving up.
+        tier:        Adapter tier: "off", "light", or "full". Overrides
+                     strictness/max_retries if set.
     """
+
+    TIER_OFF = "off"
+    TIER_LIGHT = "light"
+    TIER_FULL = "full"
 
     def __init__(
         self,
@@ -68,7 +77,19 @@ class ModelAdapter:
         adaptive_strictness: bool = False,
         strictness_threshold: float = 0.8,
         strictness_window: int = 100,
+        tier: str | None = None,
     ) -> None:
+        # If tier is explicitly set, override strictness and max_retries
+        if tier == self.TIER_OFF:
+            strictness = Strictness.NONE
+            max_retries = 0
+            adaptive_strictness = False
+        elif tier == self.TIER_LIGHT:
+            strictness = Strictness.NONE
+            max_retries = 1
+            adaptive_strictness = True
+
+        self.tier = tier or self.TIER_FULL
         self.formatter = formatter or AnthropicFormatter()
         self.validator = ToolCallValidator(strictness=strictness)
         self.retry = RetryEngine(max_retries=max_retries)
@@ -114,6 +135,9 @@ class ModelAdapter:
         Returns (final_tool_name, final_tool_input, repairs_made).
         Raises ValueError if validation fails and repair also fails.
         """
+        if self.tier == self.TIER_OFF:
+            return tool_name, tool_input, []
+
         # Use per-tool strictness if adaptive mode is on
         if self._adaptive_strictness and tool_name:
             effective = self.get_effective_strictness(tool_name)
@@ -154,6 +178,8 @@ class ModelAdapter:
 
     def generate_grammar(self, tool_registry: Any) -> str | None:
         """Generate GBNF grammar from the current tool registry schemas."""
+        if self.tier == self.TIER_OFF:
+            return None  # API enforces structure, no grammar needed
         if tool_registry is None:
             return None
         schemas = tool_registry.to_api_schema()
@@ -171,6 +197,9 @@ class ModelAdapter:
         tool_registry: Any = None,
     ):
         """Extract tool calls from raw model text (for models that embed JSON in prose)."""
+        # Tier off/light: model outputs structured calls, no text extraction needed
+        if self.tier in (self.TIER_OFF, self.TIER_LIGHT):
+            return []
         return self.enforcer.extract_tool_calls(text, tool_registry)
 
     # ------------------------------------------------------------------
@@ -184,6 +213,8 @@ class ModelAdapter:
         tool_registry: Any,
     ) -> tuple[RetryAction, str]:
         """Decide whether to retry and build the retry prompt."""
+        if self.tier == self.TIER_OFF:
+            return RetryAction.ABORT, f"Adapter off (tier={self.tier}): {error}"
         return self.retry.handle_failure(tool_name, error, tool_registry)
 
     # ------------------------------------------------------------------
@@ -206,7 +237,11 @@ class ModelAdapter:
                 self._bump_tool_strictness(tool_name, rate)
 
     def _bump_tool_strictness(self, tool_name: str, rate: float) -> None:
-        """Increase strictness for a specific tool based on failure rate."""
+        """Increase strictness for a specific tool based on failure rate.
+
+        For tier "light": NONE→MEDIUM escalates the tool to tier "full"
+        behavior (full validation + 3 retries) for that tool only.
+        """
         current = self._tool_strictness.get(tool_name, self._base_strictness)
         if current == Strictness.NONE:
             new = Strictness.MEDIUM
@@ -216,9 +251,12 @@ class ModelAdapter:
             return  # Already at max
         self._tool_strictness[tool_name] = new
         import logging
+        escalation = ""
+        if self.tier == self.TIER_LIGHT and new in (Strictness.MEDIUM, Strictness.STRICT):
+            escalation = " [tier light→full for this tool]"
         logging.getLogger(__name__).info(
-            "Adaptive strictness: %s bumped %s → %s (success rate %.1f%%)",
-            tool_name, current.value, new.value, rate * 100,
+            "Adaptive strictness: %s bumped %s → %s (success rate %.1f%%)%s",
+            tool_name, current.value, new.value, rate * 100, escalation,
         )
 
     def get_effective_strictness(self, tool_name: str) -> Strictness:

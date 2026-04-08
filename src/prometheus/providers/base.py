@@ -52,6 +52,7 @@ class ModelProvider(ABC):
     """
 
     supports_vision: bool = False
+    api_enforced_structure: bool = False
 
     async def detect_vision(self) -> bool:
         """Probe whether the provider supports vision. Override in subclasses."""

@@ -662,7 +662,8 @@ async def _execute_tool_call(
     # Sprint 3: validate + auto-repair the tool call before execution
     retries_used = 0
     repair_log: list[str] = []
-    if context.adapter is not None:
+    _adapter_tier = getattr(context.adapter, "tier", None) if context.adapter else None
+    if context.adapter is not None and _adapter_tier != "off":
         try:
             tool_name, tool_input, repair_log = context.adapter.validate_and_repair(
                 tool_name, tool_input, context.tool_registry

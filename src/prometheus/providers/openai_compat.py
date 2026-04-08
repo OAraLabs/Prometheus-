@@ -53,6 +53,8 @@ class OpenAICompatProvider(ModelProvider):
             ...
     """
 
+    api_enforced_structure: bool = True
+
     def __init__(
         self,
         base_url: str,
