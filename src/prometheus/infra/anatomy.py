@@ -276,36 +276,43 @@ class AnatomyScanner:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{self._llama_url}/v1/models")
                 resp.raise_for_status()
-                models = resp.json().get("data", [])
+                body = resp.json()
+                models = body.get("data", [])
                 if models:
                     model_id = models[0].get("id", "")
                     state.model_name = model_id
                     self._parse_model_id(state, model_id)
+
+                # Check capabilities from /v1/models response
+                for m in body.get("models", models):
+                    caps = m.get("capabilities", [])
+                    if "multimodal" in caps:
+                        state.vision_enabled = True
+                        break
 
                 # Check /props for vision (llama.cpp extension)
                 try:
                     props_resp = await client.get(f"{self._llama_url}/props")
                     if props_resp.status_code == 200:
                         props = props_resp.json()
-                        # llama.cpp /props includes total_slots, chat_template, etc.
                         if props.get("total_slots"):
                             state.inference_features.append("multi_slot")
                 except Exception:
                     pass
 
-                # Check /slots for vision mmproj
-                try:
-                    slots_resp = await client.get(f"{self._llama_url}/slots")
-                    if slots_resp.status_code == 200:
-                        slots_data = slots_resp.json()
-                        # If any slot has has_vision or the model metadata mentions mmproj
-                        if isinstance(slots_data, list):
-                            for slot in slots_data:
-                                if slot.get("has_vision"):
-                                    state.vision_enabled = True
-                                    break
-                except Exception:
-                    pass
+                # Check /slots for vision mmproj (fallback)
+                if not state.vision_enabled:
+                    try:
+                        slots_resp = await client.get(f"{self._llama_url}/slots")
+                        if slots_resp.status_code == 200:
+                            slots_data = slots_resp.json()
+                            if isinstance(slots_data, list):
+                                for slot in slots_data:
+                                    if slot.get("has_vision"):
+                                        state.vision_enabled = True
+                                        break
+                    except Exception:
+                        pass
 
         except Exception:
             log.debug("llama.cpp model detection failed at %s", self._llama_url)
