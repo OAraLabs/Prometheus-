@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 from prometheus.gateway.config import Platform, PlatformConfig
-from prometheus.gateway.commands import cmd_anatomy, cmd_profile
+from prometheus.gateway.commands import cmd_anatomy, cmd_beacon, cmd_profile
 from prometheus.gateway.platform_base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -137,6 +137,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("skills", self._cmd_skills))
         self._app.add_handler(CommandHandler("anatomy", self._cmd_anatomy))
         self._app.add_handler(CommandHandler("profile", self._cmd_profile))
+        self._app.add_handler(CommandHandler("beacon", self._cmd_beacon))
         # Sprint 15b GRAFT: approval queue commands
         self._app.add_handler(CommandHandler("approve", self._cmd_approve))
         self._app.add_handler(CommandHandler("deny", self._cmd_deny))
@@ -172,6 +173,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 BotCommand("skills", "List available skills"),
                 BotCommand("anatomy", "Infrastructure snapshot"),
                 BotCommand("profile", "Show or switch agent profile"),
+                BotCommand("beacon", "Web bridge / dashboard status"),
                 BotCommand("approve", "Approve a pending tool request"),
                 BotCommand("deny", "Deny a pending tool request"),
                 BotCommand("pending", "List pending approval requests"),
@@ -705,6 +707,22 @@ class TelegramAdapter(BasePlatformAdapter):
         if update.effective_chat is None:
             return
         text = cmd_anatomy()
+        await self.send(update.effective_chat.id, text, parse_mode=None)
+
+    async def _cmd_beacon(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /beacon — show web bridge / dashboard status."""
+        if update.effective_chat is None:
+            return
+        # Load config from yaml to check web bridge settings
+        import yaml
+        config_path = Path(__file__).resolve().parents[2] / "config" / "prometheus.yaml"
+        try:
+            cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+        except Exception:
+            cfg = {}
+        text = cmd_beacon(cfg)
         await self.send(update.effective_chat.id, text, parse_mode=None)
 
     async def _cmd_profile(

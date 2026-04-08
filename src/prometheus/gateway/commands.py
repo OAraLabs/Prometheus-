@@ -362,3 +362,27 @@ def cmd_skills() -> str:
 
     lines.append("\nUse the skill tool to load a skill by name.")
     return "\n".join(lines)
+
+
+def cmd_beacon(config: dict) -> str:
+    """Report web bridge / Beacon dashboard status."""
+    import platform as _platform
+
+    web = config.get("web", {})
+    if not web.get("enabled", False):
+        return (
+            "Beacon: not running\n\n"
+            "Enable in config/prometheus.yaml:\n"
+            "  web:\n"
+            "    enabled: true"
+        )
+
+    host = _platform.node()
+    api_port = web.get("api_port", 8005)
+    ws_port = web.get("ws_port", 8010)
+    return (
+        f"Beacon:\n"
+        f"  REST API:  http://{host}:{api_port}\n"
+        f"  WebSocket: ws://{host}:{ws_port}\n"
+        f"  Dashboard: http://{host}:3000"
+    )

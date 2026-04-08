@@ -86,6 +86,11 @@ sentinel:
   idle_threshold_minutes: 15
   dream_interval_minutes: 30
 
+web:
+  enabled: false
+  api_port: 8005
+  ws_port: 8010
+
 lsp:
   enabled: false
 

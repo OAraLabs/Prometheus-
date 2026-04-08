@@ -484,6 +484,53 @@ async def run_daemon(args: argparse.Namespace) -> None:
         except Exception as exc:
             logger.warning("SENTINEL not available: %s", exc)
 
+    # Web bridge (Beacon dashboard backend)
+    web_config = config.get("web", {})
+    if web_config.get("enabled", False):
+        try:
+            from prometheus.web.launcher import launch_web
+            from prometheus.engine.agent_loop import LoopContext
+
+            # Build system prompt if not already available
+            if "system_prompt" not in dir():
+                from prometheus.context.prompt_assembler import build_runtime_system_prompt
+                system_prompt = build_runtime_system_prompt(
+                    cwd=str(Path.cwd()), config=config,
+                )
+
+            loop_context = LoopContext(
+                provider=provider,
+                model=model_name,
+                system_prompt=system_prompt,
+                max_tokens=4096,
+                tool_registry=registry,
+                permission_checker=security_gate,
+                hook_executor=hook_executor,
+                adapter=adapter,
+                telemetry=telemetry,
+                model_router=model_router,
+                divergence_detector=divergence_detector,
+            )
+
+            api_port = web_config.get("api_port", 8005)
+            ws_port = web_config.get("ws_port", 8010)
+            web_task = asyncio.create_task(launch_web(
+                config=config,
+                signal_bus=signal_bus if "signal_bus" in dir() else None,
+                session_mgr=session_manager,
+                telemetry=telemetry,
+                lcm_engine=lcm_engine if "lcm_engine" in dir() else None,
+                agent_loop=agent_loop,
+                approval_queue=approval_queue if "approval_queue" in dir() else None,
+                loop_context=loop_context,
+                api_port=api_port,
+                ws_port=ws_port,
+            ))
+            tasks.append(web_task)
+            logger.info("Web bridge started (REST :%d, WS :%d)", api_port, ws_port)
+        except Exception as exc:
+            logger.warning("Web bridge not available: %s", exc)
+
     logger.info("Prometheus daemon running. Press Ctrl+C to stop.")
 
     # Wait for shutdown

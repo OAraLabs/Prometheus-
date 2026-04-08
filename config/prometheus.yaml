@@ -156,6 +156,12 @@ sentinel:
   auto_fix_wiki: true               # let wiki linter auto-fix safe issues
   synthesis_enabled: true           # enable LLM-powered knowledge synthesis
 
+# Web Bridge (Beacon dashboard backend)
+web:
+  enabled: true
+  api_port: 8005                      # FastAPI REST API
+  ws_port: 8010                       # WebSocket event stream
+
 # Language Server Protocol (Sprint 20 LSP)
 lsp:
   enabled: true
