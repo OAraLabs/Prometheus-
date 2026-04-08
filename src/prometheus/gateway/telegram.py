@@ -712,22 +712,46 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _cmd_beacon(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle /beacon — show web bridge / dashboard status."""
+        """Handle /beacon — show web bridge / dashboard status with clickable buttons."""
         if update.effective_chat is None:
             return
-        # Load config from yaml to check web bridge settings
+        import platform as _platform
         import yaml
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
         config_path = Path(__file__).resolve().parents[3] / "config" / "prometheus.yaml"
         try:
             cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
         except Exception:
             cfg = {}
-        text = cmd_beacon(cfg)
+
+        web = cfg.get("web", {})
+        if not web.get("enabled", False):
+            await self.send(update.effective_chat.id,
+                            "Beacon: not running\n\nEnable in config:\n  web:\n    enabled: true",
+                            parse_mode=None)
+            return
+
+        host = _platform.node()
+        api_port = web.get("api_port", 8005)
+        ws_port = web.get("ws_port", 8010)
+
+        text = (
+            f"Beacon\n"
+            f"  REST API:  {host}:{api_port}\n"
+            f"  WebSocket: ws://{host}:{ws_port}\n"
+            f"  Dashboard: {host}:3000"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Open API", url=f"http://{host}:{api_port}/api/status"),
+                InlineKeyboardButton("Open Dashboard", url=f"http://{host}:3000"),
+            ],
+        ])
         await self._app.bot.send_message(
             chat_id=update.effective_chat.id,
             text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+            reply_markup=keyboard,
         )
 
     async def _cmd_profile(
