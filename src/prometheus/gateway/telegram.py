@@ -717,7 +717,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         # Load config from yaml to check web bridge settings
         import yaml
-        config_path = Path(__file__).resolve().parents[2] / "config" / "prometheus.yaml"
+        config_path = Path(__file__).resolve().parents[3] / "config" / "prometheus.yaml"
         try:
             cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
         except Exception:
