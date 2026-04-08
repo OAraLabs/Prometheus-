@@ -73,10 +73,14 @@ class AnatomyScanner:
         llama_cpp_url: str = "http://localhost:8080",
         ollama_url: str = "http://localhost:11434",
         inference_engine: str = "llama_cpp",
+        ssh_user: str | None = None,
+        ssh_key: str | None = None,
     ) -> None:
         self._llama_url = llama_cpp_url.rstrip("/")
         self._ollama_url = ollama_url.rstrip("/")
         self._engine = inference_engine
+        self._ssh_user = ssh_user
+        self._ssh_key = str(Path(ssh_key).expanduser()) if ssh_key else None
 
     async def scan(self) -> AnatomyState:
         """Full infrastructure scan."""
@@ -218,12 +222,24 @@ class AnatomyScanner:
         host = parsed.hostname or ""
         if not host or host in ("localhost", "127.0.0.1", "::1"):
             return False
+
+        # Build SSH command with optional user and key
+        ssh_target = f"{self._ssh_user}@{host}" if self._ssh_user else host
+        ssh_args = [
+            "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+        ]
+        if self._ssh_key:
+            ssh_args.extend(["-i", self._ssh_key])
+        ssh_args.extend([
+            ssh_target,
+            "nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-                "-o", "BatchMode=yes", host,
-                "nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free",
-                "--format=csv,noheader,nounits",
+                *ssh_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

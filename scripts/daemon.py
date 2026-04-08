@@ -384,6 +384,8 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 llama_cpp_url=model_config.get("base_url", "http://localhost:8080"),
                 ollama_url=model_config.get("fallback_url", "http://localhost:11434"),
                 inference_engine=model_config.get("provider", "llama_cpp"),
+                ssh_user=anatomy_config.get("ssh_user"),
+                ssh_key=anatomy_config.get("ssh_key"),
             )
             anatomy_writer = AnatomyWriter()
             project_store = ProjectConfigStore()

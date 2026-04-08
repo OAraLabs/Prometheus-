@@ -1,19 +1,15 @@
 system:
-  name: "Prometheus"
-  version: "0.1.0"
-
-# Layer 1 Bootstrap — identity files loaded into every system prompt
+  name: Prometheus
+  version: 0.1.0
 bootstrap:
-  load_soul: true       # ~/.prometheus/SOUL.md — identity, personality, behavioral rules
-  load_agents: true     # ~/.prometheus/AGENTS.md — agent registry, spawn rules
-
+  load_soul: true
+  load_agents: true
 model:
-  provider: "llama_cpp"
-  base_url: "http://GPU_HOST:8080"
-  model: "gemma4-26b"
-  fallback_provider: "ollama"
-  fallback_url: "http://GPU_HOST:11434"
-
+  provider: llama_cpp
+  base_url: http://GPU_HOST:8080
+  model: gemma4-26b
+  fallback_provider: ollama
+  fallback_url: http://GPU_HOST:11434
 context:
   effective_limit: 24000
   compression_trigger: 0.75
@@ -21,196 +17,159 @@ context:
   reserved_output: 2000
   fresh_tail_count: 32
   model_overrides:
-    "qwen3.5-32b": { effective_limit: 24000 }
-    "gemma4-26b-moe": { effective_limit: 32000 }
-    "gemma4-31b": { effective_limit: 48000 }
-
+    qwen3.5-32b:
+      effective_limit: 24000
+    gemma4-26b-moe:
+      effective_limit: 32000
+    gemma4-31b:
+      effective_limit: 48000
 security:
-  permission_mode: "default"
-  workspace_root: "~"
+  permission_mode: default
+  workspace_root: '~'
   denied_commands:
-    - "rm -rf /"
-    - "rm -rf ~"
-    - "DROP TABLE"
-    - "mkfs"
+  - rm -rf /
+  - rm -rf ~
+  - DROP TABLE
+  - mkfs
   denied_paths:
-    - "/etc"
-    - "/sys"
-    - "/boot"
-    - "~/.ssh"
-
-  # Sprint 11: Permission audit logging
+  - /etc
+  - /sys
+  - /boot
+  - ~/.ssh
   audit:
     enabled: true
     retention_days: 30
-
-  # Sprint 11: Secret exfiltration detection
   exfiltration:
     enabled: true
-
-  # Sprint 15b GRAFT: Telegram approval queue for LEVEL 1 actions
   approval_queue:
     enabled: true
     timeout_seconds: 300
-
 infrastructure:
-  mini_host: "MINI_HOST"
+  mini_host: MINI_HOST
   mini_port: 8005
-  gpu_host: "GPU_HOST"
+  gpu_host: GPU_HOST
   archive_enabled: true
   telemetry_enabled: true
-
 gateway:
   telegram_enabled: true
-  telegram_token: ""                # Set via PROMETHEUS_TELEGRAM_TOKEN env var
-  allowed_chat_ids: []              # empty = allow all; set to restrict
-  proxy_url: null                   # optional SOCKS5/HTTP proxy for Telegram
-  system_prompt: "You are Prometheus, a sovereign AI agent. You have access to tools for file operations, shell commands, and cron job management. Be concise and helpful."
-  heartbeat_interval: 30            # seconds between health checks
-  cron_enabled: true                # run cron scheduler alongside gateway
-  # Sprint 15 GRAFT: media handling
+  telegram_token: ''
+  allowed_chat_ids: []
+  proxy_url: null
+  system_prompt: You are Prometheus, a sovereign AI agent. You have access to tools
+    for file operations, shell commands, and cron job management. Be concise and helpful.
+  heartbeat_interval: 30
+  cron_enabled: true
   media:
     max_file_size_mb: 20
-    cache_dir: "~/.prometheus/cache/media"
-    allowed_image_types: ["image/jpeg", "image/png", "image/gif", "image/webp"]
-    allowed_audio_types: ["audio/ogg", "audio/mp3", "audio/wav"]
-    allowed_document_types: ["application/pdf", "text/plain", "text/markdown"]
-    sticker_cache_dir: "~/.prometheus/cache/stickers"
+    cache_dir: ~/.prometheus/cache/media
+    allowed_image_types:
+    - image/jpeg
+    - image/png
+    - image/gif
+    - image/webp
+    allowed_audio_types:
+    - audio/ogg
+    - audio/mp3
+    - audio/wav
+    allowed_document_types:
+    - application/pdf
+    - text/plain
+    - text/markdown
+    sticker_cache_dir: ~/.prometheus/cache/stickers
   rate_limits:
     messages_per_minute: 30
     media_downloads_per_minute: 10
-
-# Whisper Speech-to-Text (Sprint 15 GRAFT)
 whisper:
   enabled: true
-  model: "base"                     # tiny, base, small, medium, large
-  device: "auto"                    # cpu, cuda, auto
-  language: "en"
-
-# Model Router Configuration (Sprint 10)
+  model: base
+  device: auto
+  language: en
 model_router:
   enabled: true
   rules:
-    # Route code tasks to primary Qwen (best at structured output)
-    - task_type: "code_generation"
-      provider: "llama_cpp"
-      model: "qwen3.5-32b"
-      min_confidence: 0.5
-
-    # Route quick answers to faster Gemma
-    - task_type: "quick_answer"
-      provider: "ollama"
-      model: "gemma4-26b"
-      min_confidence: 0.6
-
-    # Route reasoning to Qwen (best at complex tasks)
-    - task_type: "reasoning"
-      provider: "llama_cpp"
-      model: "qwen3.5-32b"
-
-    # Route creative to Qwen
-    - task_type: "creative"
-      provider: "llama_cpp"
-      model: "qwen3.5-32b"
-
-    # Route tool-heavy to Qwen (best tool calling)
-    - task_type: "tool_heavy"
-      provider: "llama_cpp"
-      model: "qwen3.5-32b"
-
+  - task_type: code_generation
+    provider: llama_cpp
+    model: qwen3.5-32b
+    min_confidence: 0.5
+  - task_type: quick_answer
+    provider: ollama
+    model: gemma4-26b
+    min_confidence: 0.6
+  - task_type: reasoning
+    provider: llama_cpp
+    model: qwen3.5-32b
+  - task_type: creative
+    provider: llama_cpp
+    model: qwen3.5-32b
+  - task_type: tool_heavy
+    provider: llama_cpp
+    model: qwen3.5-32b
   fallback_chain:
-    - provider: "llama_cpp"
-      base_url: "http://GPU_HOST:8080"
-      model: "qwen3.5-32b"
-    - provider: "ollama"
-      base_url: "http://GPU_HOST:11434"
-      model: "gemma4-26b"
-    - provider: "anthropic"
-      model: "claude-3-haiku"
-
-# Divergence Detection Configuration (Sprint 10)
+  - provider: llama_cpp
+    base_url: http://GPU_HOST:8080
+    model: qwen3.5-32b
+  - provider: ollama
+    base_url: http://GPU_HOST:11434
+    model: gemma4-26b
+  - provider: anthropic
+    model: claude-3-haiku
 divergence:
   enabled: true
-  checkpoint_interval: 5       # Create checkpoint every N tool calls
-  threshold: 0.7               # Score that triggers rollback consideration
-  auto_rollback_trust_level: 3 # Only AUTONOMOUS (3) gets auto-rollback
-  max_rollbacks: 2             # Prevent infinite loops
-  use_llm_eval: false          # Enable LLM-based divergence eval (costs tokens)
-  llm_eval_budget: 500         # Max tokens for LLM eval if enabled
-
+  checkpoint_interval: 5
+  threshold: 0.7
+  auto_rollback_trust_level: 3
+  max_rollbacks: 2
+  use_llm_eval: false
+  llm_eval_budget: 500
 learning:
-  periodic_nudge_interval: 15  # turns
+  periodic_nudge_interval: 15
   auto_skill_creation: true
   memory_md_max_chars: 2200
   user_md_max_chars: 1375
-
 sentinel:
   enabled: true
-  idle_threshold_minutes: 15        # how long before "idle" triggers
-  nudge_cooldown_minutes: 60        # min time between proactive Telegram nudges
-  dream_interval_minutes: 30        # time between dream cycles during idle
-  dream_budget_tokens: 2000         # max LLM tokens per dream cycle
-  stale_threshold_days: 90          # when facts start losing confidence
-  confidence_decay_rate: 0.05       # per-cycle decay for stale facts
-  digest_lookback_hours: 24         # telemetry digest window
-  auto_fix_wiki: true               # let wiki linter auto-fix safe issues
-  synthesis_enabled: true           # enable LLM-powered knowledge synthesis
-
-# Web Bridge (Beacon dashboard backend)
+  idle_threshold_minutes: 15
+  nudge_cooldown_minutes: 60
+  dream_interval_minutes: 30
+  dream_budget_tokens: 2000
+  stale_threshold_days: 90
+  confidence_decay_rate: 0.05
+  digest_lookback_hours: 24
+  auto_fix_wiki: true
+  synthesis_enabled: true
 web:
   enabled: true
-  api_port: 8005                      # FastAPI REST API
-  ws_port: 8010                       # WebSocket event stream
-
-# Language Server Protocol (Sprint 20 LSP)
+  api_port: 8005
+  ws_port: 8010
 lsp:
   enabled: true
   auto_diagnostics: true
   diagnostics_delay_ms: 500
   auto_install: false
   servers: {}
-    # Override or add custom servers:
-    # python:
-    #   command: ["pylsp"]
-    # vue:
-    #   command: ["vue-language-server", "--stdio"]
-    #   extensions: [".vue"]
-    #   root_markers: ["package.json"]
-
-# Agent Profiles (Sprint 19 PROFILES)
 profiles:
-  default: "full"                           # default profile name
-  custom_dir: "~/.prometheus/profiles"      # custom profile YAML directory
-
-# Infrastructure Self-Awareness (Sprint 18 ANATOMY)
+  default: full
+  custom_dir: ~/.prometheus/profiles
 anatomy:
   enabled: true
-  scan_on_startup: true              # run full scan when daemon starts
-  periodic_quick_scan: true          # update VRAM usage periodically via heartbeat
-  quick_scan_interval_seconds: 300   # 5 minutes
-  include_in_system_prompt: true     # load compact summary into static section
-
-# MCP Servers (Sprint 12)
+  scan_on_startup: true
+  periodic_quick_scan: true
+  quick_scan_interval_seconds: 300
+  include_in_system_prompt: true
+  ssh_user: gpu-node
+  ssh_key: ~/.ssh/id_ed25519
 mcp_servers:
-  # Context7 — up-to-date library documentation
   context7:
     command: npx
-    args: ["-y", "@upstash/context7-mcp"]
-    connectionTimeoutMs: 60000        # Context7 can be slow on first start
-
-  # Example: filesystem server (disabled — uncomment to enable)
-  # filesystem:
-  #   command: npx
-  #   args: ["-y", "@anthropic/filesystem-mcp", "/home/will/projects"]
-
-# Evaluation Suite (Sprint 13)
+    args:
+    - -y
+    - '@upstash/context7-mcp'
+    connectionTimeoutMs: 60000
 evals:
-  judge_base_url: "http://GPU_HOST:8080"
-  results_dir: "~/.prometheus/eval_results"
+  judge_base_url: http://GPU_HOST:8080
+  results_dir: ~/.prometheus/eval_results
   skip_network_tasks: true
-
-# Phoenix Tracing (Sprint 13)
 tracing:
-  enabled: false                      # also gated by PROMETHEUS_TRACING=1 env var
-  phoenix_endpoint: "http://127.0.0.1:6006"
-  service_name: "prometheus"
+  enabled: false
+  phoenix_endpoint: http://127.0.0.1:6006
+  service_name: prometheus
