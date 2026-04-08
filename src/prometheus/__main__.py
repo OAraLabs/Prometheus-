@@ -607,6 +607,17 @@ def main() -> None:
         help="Only start Telegram adapter",
     )
 
+    identity_parser = subparsers.add_parser(
+        "identity", help="Manage identity files (SOUL.md, AGENTS.md)",
+    )
+    identity_parser.add_argument(
+        "--show", action="store_true", help="Print current SOUL.md",
+    )
+    identity_parser.add_argument(
+        "--regenerate", action="store_true",
+        help="Regenerate SOUL.md and AGENTS.md interactively",
+    )
+
     migrate_parser = subparsers.add_parser(
         "migrate", help="Import data from Hermes Agent or OpenClaw",
     )
@@ -656,6 +667,23 @@ def main() -> None:
         wizard = SetupWizard(gateway_only=args.setup_gateway_only)
         success = wizard.run()
         sys.exit(0 if success else 1)
+
+    # Identity subcommand — manage SOUL.md / AGENTS.md
+    if args.command == "identity":
+        if args.show:
+            soul = get_config_dir() / "SOUL.md"
+            if soul.exists():
+                print(soul.read_text())
+            else:
+                print("No SOUL.md found. Run: python -m prometheus --setup")
+                sys.exit(1)
+        elif args.regenerate:
+            from prometheus.setup_wizard import SetupWizard
+            wizard = SetupWizard()
+            wizard._setup_identity()
+        else:
+            print("Usage: python -m prometheus identity [--show | --regenerate]")
+        sys.exit(0)
 
     # Migration subcommand — runs pre-agent, no model needed
     if args.command == "migrate":

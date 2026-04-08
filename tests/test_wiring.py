@@ -3110,3 +3110,102 @@ class TestSprint22MigrationWiring:
         wizard = SetupWizard()
         assert hasattr(wizard, "_offer_migration")
         assert callable(wizard._offer_migration)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sprint 23: CLEAN-SLATE + VISION-DETECT wiring
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestCleanSlateWiring:
+    """Identity template → render → file pipeline."""
+
+    @pytest.mark.integration
+    def test_identity_pipeline_end_to_end(self, tmp_path):
+        from prometheus.cli.generate_identity import (
+            detect_hardware, generate_identity_files,
+        )
+        hw = detect_hardware()
+        assert hw["hostname"]
+        assert hw["ram_gb"] > 0
+
+        results = generate_identity_files(
+            owner_name="WiringTest", hardware=hw, dest=tmp_path,
+        )
+        soul = (tmp_path / "SOUL.md").read_text()
+        assert "WiringTest" in soul
+        assert "{{" not in soul
+        assert (tmp_path / "AGENTS.md").is_file()
+        assert (tmp_path / "MEMORY.md").is_file()
+        assert (tmp_path / "USER.md").is_file()
+
+    @pytest.mark.integration
+    def test_memory_preserved_across_regenerate(self, tmp_path):
+        from prometheus.cli.generate_identity import (
+            detect_hardware, generate_identity_files,
+        )
+        hw = detect_hardware()
+        generate_identity_files("First", hw, dest=tmp_path)
+        (tmp_path / "MEMORY.md").write_text("important fact")
+
+        generate_identity_files("Second", hw, dest=tmp_path, overwrite=True)
+        assert (tmp_path / "MEMORY.md").read_text() == "important fact"
+        assert "Second" in (tmp_path / "SOUL.md").read_text()
+
+    @pytest.mark.integration
+    def test_vision_available_wires_through(self):
+        from prometheus.cli.generate_identity import detect_hardware, render_soul_md
+        hw = detect_hardware()
+        assert "confirmed available" in render_soul_md("T", hw, vision_available=True)
+        assert "not available" in render_soul_md("T", hw, vision_available=False)
+
+    @pytest.mark.integration
+    def test_setup_wizard_has_setup_identity(self):
+        from prometheus.setup_wizard import SetupWizard
+        wizard = SetupWizard()
+        assert hasattr(wizard, "_setup_identity")
+        assert callable(wizard._setup_identity)
+
+    @pytest.mark.integration
+    def test_no_personal_data_in_templates(self):
+        from prometheus.cli.generate_identity import TEMPLATES_DIR
+        for name in ("SOUL.md.template", "AGENTS.md.template"):
+            content = (TEMPLATES_DIR / name).read_text()
+            assert "Will" not in content
+            assert "OAra" not in content
+            assert "100.110" not in content
+
+
+class TestVisionDetectWiring:
+    """Provider vision detection → daemon → setup wizard."""
+
+    @pytest.mark.integration
+    def test_provider_has_supports_vision(self):
+        from prometheus.providers.llama_cpp import LlamaCppProvider
+        p = LlamaCppProvider()
+        assert hasattr(p, "supports_vision")
+        assert p.supports_vision is False
+
+    @pytest.mark.integration
+    async def test_detect_vision_callable_and_graceful(self):
+        """detect_vision returns False gracefully when no server running."""
+        from prometheus.providers.llama_cpp import LlamaCppProvider
+        p = LlamaCppProvider(base_url="http://127.0.0.1:1")
+        result = await p.detect_vision()
+        assert result is False
+        assert p.supports_vision is False
+
+    @pytest.mark.integration
+    def test_setup_wizard_has_vision_hint(self):
+        from prometheus.setup_wizard import SetupWizard
+        wizard = SetupWizard()
+        assert hasattr(wizard, "_check_vision_hint")
+        assert callable(wizard._check_vision_hint)
+
+    @pytest.mark.integration
+    async def test_detect_vision_on_base_class(self):
+        """ModelProvider ABC defines detect_vision with default False."""
+        from prometheus.providers.base import ModelProvider
+        assert hasattr(ModelProvider, "detect_vision")
+        assert hasattr(ModelProvider, "supports_vision")
+        assert ModelProvider.supports_vision is False

@@ -64,6 +64,39 @@ class LlamaCppProvider(ModelProvider):
         self._grammar = grammar
         self.detected_model: str | None = None
 
+    async def detect_vision(self) -> bool:
+        """Check if llama.cpp was started with --mmproj.
+
+        The /props endpoint includes a "multimodal" field when a vision
+        projector is loaded. Older versions nest it under
+        "default_generation_settings".
+        """
+        url = f"{self._base_url}/props"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                props = resp.json()
+
+            multimodal = props.get("multimodal", False)
+            if not multimodal:
+                dgs = props.get("default_generation_settings", {})
+                multimodal = dgs.get("multimodal", False)
+
+            self.supports_vision = bool(multimodal)
+            log.info("Vision detection: multimodal=%s (endpoint=%s)",
+                     self.supports_vision, self._base_url)
+            return self.supports_vision
+
+        except (httpx.HTTPError, httpx.ConnectError) as exc:
+            log.warning("Vision detection failed (server unreachable): %s", exc)
+            self.supports_vision = False
+            return False
+        except (KeyError, ValueError) as exc:
+            log.warning("Vision detection failed (bad response): %s", exc)
+            self.supports_vision = False
+            return False
+
     async def detect_loaded_model(self) -> str | None:
         """Query /v1/models to discover the model actually loaded on the server.
 

@@ -123,6 +123,21 @@ async def run_daemon(args: argparse.Namespace) -> None:
         model_name = config_model
         logger.info("Cloud provider: %s, model: %s", model_config.get("provider"), model_name)
 
+    # Vision detection
+    if hasattr(provider, "detect_vision"):
+        has_vision = await provider.detect_vision()
+        if has_vision:
+            logger.info("Vision: enabled (multimodal)")
+        else:
+            logger.info("Vision: not available")
+            vision_capable = ("gemma", "llava", "qwen-vl", "pixtral", "minicpm-v")
+            if any(v in model_name.lower() for v in vision_capable):
+                logger.info(
+                    "Hint: %s supports vision. Restart llama.cpp with "
+                    "--mmproj to enable image analysis.",
+                    model_name,
+                )
+
     # Cost tracker for cloud providers
     cost_tracker = None
     if ProviderRegistry.is_cloud(model_config.get("provider", "")):

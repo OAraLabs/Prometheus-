@@ -51,6 +51,12 @@ class ModelProvider(ABC):
     OllamaProvider, etc.
     """
 
+    supports_vision: bool = False
+
+    async def detect_vision(self) -> bool:
+        """Probe whether the provider supports vision. Override in subclasses."""
+        return False
+
     @abstractmethod
     async def stream_message(
         self, request: ApiMessageRequest

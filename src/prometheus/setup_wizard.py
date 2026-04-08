@@ -136,6 +136,10 @@ class SetupWizard:
 
         self._print_banner()
 
+        # Identity setup — generate SOUL.md, AGENTS.md from templates
+        if not self._gateway_only:
+            self._setup_identity()
+
         if not self._gateway_only:
             if not self._check_prerequisites():
                 return False
@@ -152,6 +156,7 @@ class SetupWizard:
         passed = True
         if not self._gateway_only:
             passed = self._run_smoke_test()
+            self._check_vision_hint()
 
         self._print_summary(passed)
         return passed
@@ -754,6 +759,90 @@ Run this wizard again after you're ready:
             print("  Config was saved. Fix the issue and test manually:")
             print('    python3 -m prometheus --once "What is 2+2?"')
             return False
+
+    # ------------------------------------------------------------------
+    # Identity generation (CLEAN-SLATE)
+    # ------------------------------------------------------------------
+
+    def _setup_identity(self) -> None:
+        """Generate identity files if they don't exist yet."""
+        from prometheus.cli.generate_identity import detect_hardware, generate_identity_files
+
+        soul_path = get_config_dir() / "SOUL.md"
+        if soul_path.exists():
+            print(f"\n  Identity files already exist at {get_config_dir()}/")
+            response = _input("  Regenerate identity? [y/N]", "n")
+            if response.lower() != "y":
+                return
+
+        print("\n  Let's set up your Prometheus identity.\n")
+
+        owner_name = _input("  Your name", "User")
+        owner_desc = _input("  Brief description (e.g., 'engineer, builds robots') [optional]", "")
+
+        print("\n  Detecting hardware...")
+        hardware = detect_hardware()
+        print(f"    Hostname: {hardware['hostname']}")
+        print(f"    OS:       {hardware['os']} {hardware['arch']}")
+        if hardware.get("gpu"):
+            print(f"    GPU:      {hardware['gpu']}")
+        else:
+            print("    GPU:      not detected")
+
+        print("\n  Hardware layout:")
+        layout = _ask_choice("  How is your hardware set up?", [
+            "Single machine (everything runs here)",
+            "Split setup (brain + GPU on separate machines)",
+        ], default=1)
+
+        brain_name = None
+        gpu_name = None
+        hardware_layout = "single"
+        if layout == 2:
+            brain_name = _input("  Name for brain/storage machine", "Brain")
+            gpu_name = _input("  Name for GPU/inference machine", "GPU")
+            hardware_layout = "split"
+
+        print("\n  Generating identity files...")
+        results = generate_identity_files(
+            owner_name=owner_name,
+            hardware=hardware,
+            hardware_layout=hardware_layout,
+            gpu_machine_name=gpu_name,
+            brain_machine_name=brain_name,
+            owner_description=owner_desc,
+            overwrite=True,
+        )
+
+        for filename, status in results.items():
+            print(f"    {filename}: {status}")
+        print()
+
+    # ------------------------------------------------------------------
+    # Vision hint (VISION-DETECT)
+    # ------------------------------------------------------------------
+
+    def _check_vision_hint(self) -> None:
+        """After smoke test, check if the provider supports vision."""
+        if self._provider != "llama_cpp":
+            return
+        try:
+            from prometheus.providers.llama_cpp import LlamaCppProvider
+            provider = LlamaCppProvider(base_url=self._base_url)
+            has_vision = asyncio.run(provider.detect_vision())
+            if has_vision:
+                print("  Vision: enabled (multimodal)")
+            else:
+                print("  Vision: not available")
+                model = (self._model_name or "").lower()
+                vision_capable = ("gemma", "llava", "qwen-vl", "pixtral", "minicpm-v")
+                if any(v in model for v in vision_capable):
+                    print(
+                        f"  Hint: {self._model_name} supports vision. "
+                        "Restart llama.cpp with --mmproj to enable."
+                    )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Step 6: Summary

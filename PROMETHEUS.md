@@ -3889,3 +3889,77 @@ tests/test_migrate.py    — 30 tests
 | `setup_wizard.py` (Sprint 6) | `_offer_migration()` called at start of `run()` when no config exists; uses `detect_sources()` + `run_migration()` |
 | `memory/hermes_memory_tool.py` (Sprint 5) | Memory char limits (`_MEMORY_MAX_CHARS=12000`, `_USER_MAX_CHARS=8000`) matched by overflow trimming |
 | `config/prometheus.yaml` (Sprint 0) | Config remap target — Hermes/OpenClaw keys mapped to Prometheus keys |
+
+---
+
+## Sprint 23: CLEAN-SLATE + VISION-DETECT
+
+### CLEAN-SLATE — identity templates for shareable repo
+
+```python
+# src/prometheus/cli/generate_identity.py
+
+def detect_hardware() -> dict
+    # → {hostname, os, arch, cpu, ram_gb, gpu, has_gpu}
+
+def render_soul_md(owner_name, hardware, hardware_layout="single",
+                   gpu_machine_name=None, brain_machine_name=None,
+                   owner_description="", vision_available=None) -> str
+    # Fills {{OWNER_NAME}}, {{HARDWARE_SECTION}}, {{VISION_LINE}}, etc.
+
+def render_agents_md() -> str
+
+def generate_identity_files(owner_name, hardware, ..., dest=None) -> dict[str, str]
+    # Creates SOUL.md, AGENTS.md; creates (never overwrites) MEMORY.md, USER.md
+
+# setup_wizard.py additions
+class SetupWizard:
+    def _setup_identity(self) -> None    # interactive: name, desc, layout → generate
+```
+
+### VISION-DETECT — detect vision at startup, graceful photo fallback
+
+```python
+# providers/base.py addition
+class ModelProvider(ABC):
+    supports_vision: bool = False
+    async def detect_vision(self) -> bool   # default False, override in subclasses
+
+# providers/llama_cpp.py addition
+class LlamaCppProvider(ModelProvider):
+    async def detect_vision(self) -> bool
+        # GET /props → checks multimodal flag (top-level + nested)
+        # Graceful on connection error — returns False, never crashes
+
+# setup_wizard.py addition
+class SetupWizard:
+    def _check_vision_hint(self) -> None    # probes provider after smoke test
+
+# __main__.py addition
+identity_parser  # subcommand: identity --show | --regenerate
+```
+
+### File tree
+```
+templates/
+  SOUL.md.template           — {{OWNER_NAME}}, {{HARDWARE_SECTION}}, etc.
+  AGENTS.md.template         — generic, no placeholders
+config/
+  prometheus.yaml.default    — reference config, zero secrets
+src/prometheus/cli/
+  generate_identity.py       — hardware detect + template render + file gen
+tests/
+  test_clean_slate.py        — 18 tests
+  test_vision_detect.py      — 7 tests
+  test_wiring.py             — +9 integration tests (CleanSlate + VisionDetect classes)
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 23 connects |
+|---|---|
+| `providers/base.py` (Sprint 1) | `supports_vision: bool` + `detect_vision()` added to `ModelProvider` ABC |
+| `providers/llama_cpp.py` (Sprint 1) | `detect_vision()` checks `/props` endpoint for multimodal flag |
+| `setup_wizard.py` (Sprint 6) | `_setup_identity()` before provider step; `_check_vision_hint()` after smoke test |
+| `__main__.py` (Sprint 0) | `identity` subcommand with `--show` and `--regenerate` flags |
+| `scripts/daemon.py` (Sprint 6) | Calls `detect_vision()` after `detect_loaded_model()`, logs hint for vision-capable models |
