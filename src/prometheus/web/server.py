@@ -62,6 +62,21 @@ def create_app(
     app.state.current_provider = config.get("model", {}).get("provider", "unknown")
     app.state.active_profile = config.get("profiles", {}).get("default", "full")
 
+    # ── Root ────────────────────────────────────────────────────────
+
+    @app.get("/")
+    async def root():
+        return {
+            "name": "Prometheus Mission Control",
+            "version": "0.1.0",
+            "endpoints": [
+                "/api/status", "/api/sessions", "/api/telemetry",
+                "/api/cron", "/api/approvals", "/api/chat",
+                "/api/config", "/api/skills", "/api/profiles",
+                "/api/wiki/stats", "/api/sentinel",
+            ],
+        }
+
     # ── Status ──────────────────────────────────────────────────────
 
     @app.get("/api/status")

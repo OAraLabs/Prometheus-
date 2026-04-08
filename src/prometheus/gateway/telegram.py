@@ -723,7 +723,7 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             cfg = {}
         text = cmd_beacon(cfg)
-        await self.send(update.effective_chat.id, text, parse_mode=None)
+        await self.send(update.effective_chat.id, text, parse_mode="HTML")
 
     async def _cmd_profile(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
