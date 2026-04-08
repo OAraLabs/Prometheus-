@@ -98,7 +98,7 @@ Markdown skill files in `skills/` that teach the agent patterns — from code re
 
 - **SOUL.md** — persistent identity loaded into every prompt. Survives `/reset`. Generated from templates at setup — no hardcoded names.
 - **AGENTS.md** — agent registry with specializations for subagent spawning
-- **ANATOMY.md** — live infrastructure snapshot: hardware, GPU VRAM, loaded model + quantization, Tailscale peers, disk usage, Mermaid architecture diagrams. Updated at startup and periodically via heartbeat.
+- **ANATOMY.md** — live infrastructure snapshot with Mermaid architecture diagrams. AnatomyScanner detects hardware, GPU VRAM, loaded model + quantization, Tailscale peers, disk usage. Supports named project configurations (daily-driver, multi-model, A/B eval) with VRAM requirement checks. Updated at startup and periodically via heartbeat. The agent queries its own infrastructure via the anatomy tool (scan, status, projects, switch, diagram, history).
 - **MEMORY.md + USER.md** — the agent learns who you are over time (bounded: 12K + 8K chars)
 - **Agent Profiles** — switch between `full`, `coder`, `research`, `assistant`, `minimal` via `/profile` to optimize your context budget
 
@@ -207,7 +207,7 @@ Connect via Tailscale, WireGuard, or any network. Prometheus talks HTTP — loca
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    INTERFACE LAYER                        │
-│  Telegram │ Slack │ CLI │ Web UI (planned)               │
+│  Telegram │ Slack │ CLI │ Beacon (Web UI)                │
 └────────────────────────┬────────────────────────────────┘
                          │
 ┌────────────────────────┴────────────────────────────────┐
@@ -286,6 +286,7 @@ profile:
 | `/skills` | Loaded skills |
 | `/profile` | Switch agent profiles |
 | `/anatomy` | Infrastructure snapshot |
+| `/beacon` | Web dashboard status, start/stop/restart |
 | `/approve` / `/deny` / `/pending` | Manage approval queue |
 
 ---
@@ -397,7 +398,7 @@ All evaluation runs locally — the LLM judge uses constrained decoding on your 
 - [x] Infrastructure self-awareness (AnatomyScanner + ANATOMY.md)
 - [x] Migration tool (Hermes + OpenClaw)
 - [x] Phoenix/OpenTelemetry tracing
-- [ ] Web UI for setup and monitoring
+- [x] Web UI for setup and monitoring (Beacon dashboard)
 - [ ] Fine-tuning flywheel (LoRA on collected traces)
 
 ---
