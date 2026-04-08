@@ -205,6 +205,24 @@ async def run_daemon(args: argparse.Namespace) -> None:
         except Exception as exc:
             logger.warning("LSP not available: %s", exc)
 
+    # Helper: regenerate GBNF grammar after tool set changes
+    def _update_grammar() -> None:
+        if (
+            model_config.get("provider", "llama_cpp") == "llama_cpp"
+            and model_config.get("grammar_enforcement", True)
+            and hasattr(provider, "set_grammar")
+            and adapter is not None
+        ):
+            grammar = adapter.generate_grammar(registry)
+            if grammar:
+                provider.set_grammar(grammar)
+                logger.info(
+                    "GBNF grammar updated (%d tool schemas)",
+                    len(registry.list_tools()),
+                )
+
+    _update_grammar()
+
     # Agent loop
     agent_loop = AgentLoop(
         provider=provider,
@@ -217,6 +235,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         model_router=model_router,
         divergence_detector=divergence_detector,
         post_result_hooks=post_result_hooks or None,
+        max_tool_iterations=model_config.get("max_tool_iterations", 25),
     )
 
     # Shared session manager for all gateways
@@ -258,6 +277,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
             model_name=model_name,
             model_provider=model_config.get("provider", "llama_cpp"),
             session_manager=session_manager,
+            prometheus_config=config,
         )
         if cost_tracker is not None:
             telegram.cost_tracker = cost_tracker
@@ -396,6 +416,33 @@ async def run_daemon(args: argparse.Namespace) -> None:
                 anatomy_writer.write(state, project_store.summaries())
                 logger.info("Infrastructure scan complete: %s, model=%s",
                             state.hostname, state.model_name)
+
+                # Doctor startup check — log warnings/errors from diagnostics
+                doctor_cfg = config.get("doctor", {})
+                if doctor_cfg.get("startup_check", True):
+                    try:
+                        from prometheus.infra.doctor import Doctor
+                        doctor = Doctor(config)
+                        report = await doctor.diagnose(state)
+                        for check in report.checks:
+                            if check.status == "error":
+                                logger.error("Doctor: %s — %s", check.name, check.message)
+                                if check.fix:
+                                    logger.error("  Fix: %s", check.fix.strip().split("\n")[0])
+                            elif check.status == "warning":
+                                logger.warning("Doctor: %s — %s", check.name, check.message)
+                                if check.fix:
+                                    logger.warning("  Fix: %s", check.fix.strip().split("\n")[0])
+                        if report.has_errors:
+                            logger.error("Doctor: %d error(s) found at startup. Run /doctor for details.",
+                                         sum(1 for c in report.checks if c.status == "error"))
+                        elif report.has_warnings:
+                            logger.warning("Doctor: %d warning(s) at startup. Run /doctor for details.",
+                                           sum(1 for c in report.checks if c.status == "warning"))
+                        else:
+                            logger.info("Doctor: all checks passed")
+                    except Exception as exc:
+                        logger.debug("Doctor startup check skipped: %s", exc)
         except Exception as exc:
             logger.warning("Anatomy system not available: %s", exc)
 
@@ -488,6 +535,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
             registry.register(WikiLintTool())
 
             logger.info("SENTINEL proactive subsystem started")
+            _update_grammar()  # Regenerate grammar to include SENTINEL tools
         except Exception as exc:
             logger.warning("SENTINEL not available: %s", exc)
 

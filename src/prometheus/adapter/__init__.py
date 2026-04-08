@@ -118,6 +118,19 @@ class ModelAdapter:
         )
 
     # ------------------------------------------------------------------
+    # Grammar generation (GBNF for llama.cpp constrained decoding)
+    # ------------------------------------------------------------------
+
+    def generate_grammar(self, tool_registry: Any) -> str | None:
+        """Generate GBNF grammar from the current tool registry schemas."""
+        if tool_registry is None:
+            return None
+        schemas = tool_registry.to_api_schema()
+        if not schemas:
+            return None
+        return self.enforcer.generate_grammar(schemas)
+
+    # ------------------------------------------------------------------
     # Text-based tool call extraction
     # ------------------------------------------------------------------
 

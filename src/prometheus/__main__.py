@@ -266,7 +266,10 @@ def create_adapter(model_cfg: dict[str, Any]):
     if ProviderRegistry.is_cloud(provider_name):
         return ModelAdapter(formatter=PassthroughFormatter(), strictness="NONE")
 
-    # Local providers: pick formatter based on model name
+    # Local providers: pick formatter based on model name.
+    # Gemma 4: MEDIUM enables validation + auto-repair; empty tool names are
+    # caught by the validator's early-return check, and GBNF grammar enforcement
+    # prevents them from occurring in the first place.
     if "gemma" in model_name.lower():
         return ModelAdapter(formatter=GemmaFormatter(), strictness="MEDIUM")
     return ModelAdapter(formatter=QwenFormatter(), strictness="MEDIUM")
@@ -788,6 +791,7 @@ def main() -> None:
         telemetry=telemetry,
         model_router=model_router,
         divergence_detector=divergence_detector,
+        max_tool_iterations=config.get("model", {}).get("max_tool_iterations", 25),
     )
 
     # Generate session ID
@@ -799,6 +803,19 @@ def main() -> None:
         mcp_runtime = None
         if config.get("mcp_servers"):
             mcp_runtime = await create_mcp_runtime(config, registry)
+
+        # Wire GBNF grammar for llama.cpp constrained decoding
+        model_cfg = config.get("model", {})
+        if (
+            model_cfg.get("provider", "llama_cpp") == "llama_cpp"
+            and model_cfg.get("grammar_enforcement", True)
+            and hasattr(provider, "set_grammar")
+            and adapter is not None
+        ):
+            grammar = adapter.generate_grammar(registry)
+            if grammar:
+                provider.set_grammar(grammar)
+                log.info("GBNF grammar enforcement enabled for tool calls")
 
         try:
             if args.once:

@@ -140,6 +140,17 @@ class ToolCallValidator:
         if self.strictness == Strictness.NONE:
             return ValidationResult(valid=True)
 
+        # 0. Reject empty/whitespace tool names immediately
+        if not tool_name or not tool_name.strip():
+            return ValidationResult(
+                valid=False,
+                error=(
+                    "Model produced empty tool name — "
+                    "GBNF grammar enforcement may not be active"
+                ),
+                error_type="unknown_tool",
+            )
+
         # 1. Tool name must exist
         tool = tool_registry.get(tool_name)
         if tool is None:
@@ -204,6 +215,15 @@ class ToolCallValidator:
         """
         repairs: list[str] = []
         repaired_name = tool_name
+
+        # --- 0. Empty tool names cannot be fuzzy-matched ---
+        if not tool_name or not tool_name.strip():
+            return RepairResult(
+                repaired=False,
+                tool_name=tool_name,
+                tool_input={} if not isinstance(tool_input, dict) else tool_input,
+                error="Empty tool name cannot be repaired — enable grammar enforcement",
+            )
 
         # --- 1. Fuzzy tool name ---
         tool = tool_registry.get(tool_name)

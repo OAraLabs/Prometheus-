@@ -15,6 +15,8 @@ model:
   provider: "llama_cpp"             # llama_cpp, ollama, openai, anthropic, gemini, xai
   base_url: "http://localhost:8080" # Inference server URL
   model: ""                         # Auto-detected from server if blank
+  grammar_enforcement: true             # GBNF constrained decoding for llama.cpp tool calls
+  max_tool_iterations: 25               # Max tool calls per user message before hard stop
   fallback_provider: "ollama"
   fallback_url: "http://localhost:11434"
 

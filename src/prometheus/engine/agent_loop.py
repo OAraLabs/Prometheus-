@@ -60,6 +60,67 @@ class RunResult:
     turns: int = 0
 
 
+class _IterationReason:
+    """Constants for why the agent loop continued on each iteration."""
+    TOOL_SUCCESS = "tool_success"
+    TOOL_ERROR_RETRY = "tool_error_retry"
+    GRAMMAR_REPAIR = "grammar_repair"
+    CIRCUIT_BREAKER_TRIP = "circuit_breaker_trip"
+    MAX_ITERATIONS_HIT = "max_iterations_hit"
+    MODEL_FALLBACK = "model_fallback"
+
+
+@dataclass
+class _CircuitBreaker:
+    """Detect repeated tool-call failures and break the loop.
+
+    Two thresholds:
+      - max_identical: consecutive IDENTICAL errors (same tool+error) → stop
+      - max_any: consecutive errors of ANY kind in a single turn → hard stop
+    """
+
+    max_identical: int = 3
+    max_any: int = 5
+    _last_error_key: str = ""
+    _identical_count: int = 0
+    _any_error_count: int = 0
+
+    def record_error(self, tool_name: str, error_msg: str) -> str | None:
+        """Record an error. Returns a trip reason string, or None if OK."""
+        error_key = f"{tool_name}:{error_msg[:120]}"
+        self._any_error_count += 1
+
+        if error_key == self._last_error_key:
+            self._identical_count += 1
+        else:
+            self._last_error_key = error_key
+            self._identical_count = 1
+
+        if self._identical_count >= self.max_identical:
+            return (
+                f"{self._identical_count} consecutive identical errors "
+                f"({self._last_error_key[:200]})"
+            )
+        if self._any_error_count >= self.max_any:
+            return (
+                f"{self._any_error_count} consecutive errors of mixed types "
+                f"(last: {self._last_error_key[:200]})"
+            )
+        return None
+
+    def record_success(self) -> None:
+        """Reset all counters on successful tool execution."""
+        self._last_error_key = ""
+        self._identical_count = 0
+        self._any_error_count = 0
+
+    @property
+    def is_formatting_error(self) -> bool:
+        """True if the last trip was likely a tool-call formatting issue."""
+        key = self._last_error_key.lower()
+        return any(s in key for s in ("empty tool name", "unknown tool: ''", "malformed"))
+
+
 @dataclass
 class LoopContext:
     """Context shared across a loop run."""
@@ -75,6 +136,7 @@ class LoopContext:
     telemetry: object | None = None           # ToolCallTelemetry — wired in Sprint 3
     cwd: Path = field(default_factory=Path.cwd)
     max_turns: int = 200
+    max_tool_iterations: int = 25
     permission_prompt: PermissionPrompt | None = None
     ask_user_prompt: AskUserPrompt | None = None
     tool_metadata: dict[str, object] | None = None
@@ -120,6 +182,9 @@ async def run_loop(
         active_system_prompt, active_tools = context.adapter.format_request(
             context.system_prompt, tool_schema
         )
+
+    circuit_breaker = _CircuitBreaker(max_identical=3, max_any=5)
+    tool_iteration = 0
 
     for turn in range(context.max_turns):
         final_message: ConversationMessage | None = None
@@ -168,7 +233,66 @@ async def run_loop(
             return
 
         tool_calls = final_message.tool_uses
+        tool_iteration += len(tool_calls)
+
+        # --- Guard: max_tool_iterations ---
+        if tool_iteration > context.max_tool_iterations:
+            _log_iteration(context, _IterationReason.MAX_ITERATIONS_HIT, turn, tool_iteration)
+            error_msg = _make_assistant_msg(
+                f"Tool iteration limit reached ({tool_iteration}/{context.max_tool_iterations}). "
+                f"Stopping to prevent runaway loops."
+            )
+            messages.append(error_msg)
+            yield AssistantTurnComplete(message=error_msg, usage=usage), usage
+            return
+
         tool_results = await _dispatch_tool_calls(context, tool_calls)
+
+        # --- Circuit breaker ---
+        all_errors = all(r.is_error for r in tool_results)
+        if all_errors:
+            # Build composite key from all tool results in this dispatch
+            trip_reasons = []
+            for tc, r in zip(tool_calls, tool_results):
+                reason = circuit_breaker.record_error(tc.name, r.content)
+                if reason:
+                    trip_reasons.append(reason)
+
+            if trip_reasons:
+                trip_msg = trip_reasons[0]
+                _log_iteration(context, _IterationReason.CIRCUIT_BREAKER_TRIP, turn, tool_iteration, trip_msg)
+
+                # Try model fallback for formatting errors before giving up
+                if circuit_breaker.is_formatting_error and context.model_router is not None:
+                    fallback = _try_model_fallback(context)
+                    if fallback is not None:
+                        fallback_provider, fallback_model = fallback
+                        _log_iteration(context, _IterationReason.MODEL_FALLBACK, turn, tool_iteration,
+                                       f"{context.model} → {fallback_model}")
+                        context.provider = fallback_provider
+                        context.model = fallback_model
+                        circuit_breaker.record_success()
+                        # Re-format for the new model's adapter if needed
+                        if context.adapter is not None and hasattr(context.adapter, "format_request"):
+                            active_system_prompt, active_tools = context.adapter.format_request(
+                                context.system_prompt, tool_schema
+                            )
+                        # Feed error results back so the fallback model sees them
+                        messages.append(ConversationMessage(role="user", content=tool_results))
+                        continue
+
+                error_msg = _make_assistant_msg(
+                    f"Circuit breaker tripped: {trip_msg}. "
+                    f"The model cannot produce valid tool calls for this request."
+                )
+                messages.append(error_msg)
+                yield AssistantTurnComplete(message=error_msg, usage=usage), usage
+                return
+            else:
+                _log_iteration(context, _IterationReason.TOOL_ERROR_RETRY, turn, tool_iteration)
+        else:
+            circuit_breaker.record_success()
+            _log_iteration(context, _IterationReason.TOOL_SUCCESS, turn, tool_iteration)
 
         for tc, result in zip(tool_calls, tool_results):
             yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
@@ -208,6 +332,66 @@ async def run_loop(
                         )
 
     raise RuntimeError(f"Exceeded maximum turn limit ({context.max_turns})")
+
+
+# ---------------------------------------------------------------------------
+# Helpers for run_loop
+# ---------------------------------------------------------------------------
+
+def _make_assistant_msg(text: str) -> ConversationMessage:
+    """Build a synthetic assistant message."""
+    from prometheus.engine.messages import TextBlock
+    return ConversationMessage(role="assistant", content=[TextBlock(text=text)])
+
+
+def _log_iteration(
+    context: LoopContext,
+    reason: str,
+    turn: int,
+    tool_iteration: int,
+    detail: str = "",
+) -> None:
+    """Log why the agent loop continued (or stopped) on this iteration."""
+    log.debug("loop turn=%d iter=%d reason=%s %s", turn, tool_iteration, reason, detail)
+    if context.telemetry is not None:
+        context.telemetry.record(
+            model=context.model,
+            tool_name="_loop_transition",
+            success=(reason == _IterationReason.TOOL_SUCCESS),
+            error_type=reason if reason != _IterationReason.TOOL_SUCCESS else None,
+            error_detail=detail or None,
+        )
+
+
+def _try_model_fallback(context: LoopContext) -> tuple | None:
+    """Attempt to switch to a fallback provider for tool-call formatting errors.
+
+    Returns (new_provider, new_model) or None if no fallback is available.
+    """
+    if context.model_router is None or not hasattr(context.model_router, "get_fallback"):
+        return None
+
+    # Determine current provider name from config or model_router defaults
+    current_provider = getattr(context.provider, "provider_name", None) or "llama_cpp"
+    fallback_cfg = context.model_router.get_fallback(current_provider)
+    if fallback_cfg is None:
+        return None
+
+    try:
+        from prometheus.providers.registry import ProviderRegistry
+        new_provider = ProviderRegistry.create({
+            "provider": fallback_cfg.provider,
+            "base_url": fallback_cfg.base_url,
+            "model": fallback_cfg.model,
+        })
+        log.warning(
+            "Model fallback: %s → %s/%s (tool formatting errors)",
+            current_provider, fallback_cfg.provider, fallback_cfg.model,
+        )
+        return new_provider, fallback_cfg.model
+    except Exception:
+        log.warning("Failed to create fallback provider %s", fallback_cfg.provider, exc_info=True)
+        return None
 
 
 async def _dispatch_tool_calls(
@@ -521,6 +705,7 @@ class AgentLoop:
         model: str = "qwen3.5-32b",
         max_tokens: int = 4096,
         max_turns: int = 200,
+        max_tool_iterations: int = 25,
         tool_registry=None,
         hook_executor=None,
         permission_checker=None,
@@ -535,6 +720,7 @@ class AgentLoop:
         self._model = model
         self._max_tokens = max_tokens
         self._max_turns = max_turns
+        self._max_tool_iterations = max_tool_iterations
         self._tool_registry = tool_registry
         self._hook_executor = hook_executor
         self._permission_checker = permission_checker
@@ -582,6 +768,7 @@ class AgentLoop:
             system_prompt=system_prompt,
             max_tokens=self._max_tokens,
             max_turns=self._max_turns,
+            max_tool_iterations=self._max_tool_iterations,
             tool_registry=self._tool_registry,
             hook_executor=self._hook_executor,
             permission_checker=self._permission_checker,
