@@ -191,8 +191,9 @@ class LlamaCppProvider(ModelProvider):
             ]
             payload["tool_choice"] = "auto"
 
-        # Inject GBNF grammar if available (llama.cpp extension)
-        if self._grammar:
+        # Inject GBNF grammar only when tools aren't in the payload — with --jinja,
+        # the server handles tool calling natively and grammar conflicts with it
+        if self._grammar and "tools" not in payload:
             payload["grammar"] = self._grammar
 
         url = f"{self._base_url}/v1/chat/completions"

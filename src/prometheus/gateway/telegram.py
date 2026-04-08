@@ -82,6 +82,17 @@ def chunk_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[str]:
     return chunks
 
 
+def strip_markdown(text: str) -> str:
+    """Strip markdown formatting from text, preserving code blocks and content."""
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)       # **bold** → bold
+    text = re.sub(r'\*(.+?)\*', r'\1', text)            # *italic* → italic
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)  # ## heading → heading
+    text = re.sub(r'^\s*[\*\-]\s+', '• ', text, flags=re.MULTILINE)  # - item → • item
+    text = re.sub(r'`{3}[\s\S]*?`{3}', lambda m: m.group(0), text)   # preserve code blocks
+    text = re.sub(r'`(.+?)`', r'\1', text)              # `code` → code
+    return text.strip()
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """Telegram bot adapter — receives messages, routes to AgentLoop."""
 
@@ -731,7 +742,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await self.send(
             event.chat_id,
-            response_text,
+            strip_markdown(response_text),
             reply_to=event.message_id,
         )
 

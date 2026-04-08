@@ -116,9 +116,6 @@ class OllamaProvider(ModelProvider):
         if self._force_json:
             payload["format"] = "json"
 
-        if self._grammar:
-            payload["grammar"] = self._grammar
-
         if request.tools:
             payload["tools"] = [
                 {
@@ -135,6 +132,10 @@ class OllamaProvider(ModelProvider):
                 }
                 for t in request.tools
             ]
+        elif self._grammar:
+            # Only send grammar when tools aren't in the payload — with --jinja,
+            # the server handles tool calling natively and grammar conflicts with it
+            payload["grammar"] = self._grammar
 
         url = f"{self._base_url}/v1/chat/completions"
         log.debug("POST %s model=%s messages=%d", url, request.model, len(messages))
