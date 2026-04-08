@@ -433,11 +433,11 @@ class TestAnatomySummaryInPrompt:
 
 
 class TestCmdAnatomy:
-    def test_cmd_anatomy_not_initialized(self) -> None:
+    async def test_cmd_anatomy_not_initialized(self) -> None:
         import prometheus.tools.builtin.anatomy as mod
         old = mod._scanner
         mod._scanner = None
         from prometheus.gateway.commands import cmd_anatomy
-        text = cmd_anatomy()
+        text = await cmd_anatomy()
         assert "not initialized" in text.lower()
         mod._scanner = old

@@ -273,7 +273,7 @@ def cmd_profile(arg: str = "", current: str = "full") -> str:
     return "\n".join(lines)
 
 
-def cmd_anatomy() -> str:
+async def cmd_anatomy() -> str:
     """Return infrastructure summary text."""
     try:
         from prometheus.tools.builtin.anatomy import _scanner, _writer, _project_store
@@ -283,7 +283,6 @@ def cmd_anatomy() -> str:
     if _scanner is None or _writer is None:
         return "Anatomy not initialized. Is the daemon running with anatomy enabled?"
 
-    import asyncio
     from prometheus.infra.anatomy import AnatomyScanner
     from prometheus.infra.anatomy_writer import AnatomyWriter
 
@@ -291,15 +290,9 @@ def cmd_anatomy() -> str:
     writer: AnatomyWriter = _writer  # type: ignore[assignment]
 
     try:
-        state = asyncio.get_event_loop().run_until_complete(scanner.quick_scan())
-    except RuntimeError:
-        # Already in an async context — use a new loop
-        try:
-            loop = asyncio.new_event_loop()
-            state = loop.run_until_complete(scanner.quick_scan())
-            loop.close()
-        except Exception as exc:
-            return f"Anatomy scan failed: {exc}"
+        state = await scanner.quick_scan()
+    except Exception as exc:
+        return f"Anatomy scan failed: {exc}"
 
     lines: list[str] = ["Prometheus Anatomy\n"]
 

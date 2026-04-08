@@ -706,7 +706,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle /anatomy command — show infrastructure summary."""
         if update.effective_chat is None:
             return
-        text = cmd_anatomy()
+        text = await cmd_anatomy()
         await self.send(update.effective_chat.id, text, parse_mode=None)
 
     async def _cmd_beacon(
