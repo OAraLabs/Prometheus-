@@ -31,7 +31,7 @@ def bootstrap_dir(tmp_path: Path):
 def memory_dir(tmp_path: Path):
     """Create a temporary config dir with MEMORY.md and USER.md."""
     memory = tmp_path / "MEMORY.md"
-    memory.write_text("Will prefers concise responses\nProject Prometheus is a local agent harness", encoding="utf-8")
+    memory.write_text("Alice prefers concise responses\nProject Prometheus is a local agent harness", encoding="utf-8")
 
     user = tmp_path / "USER.md"
     user.write_text("Senior engineer building AI infrastructure", encoding="utf-8")

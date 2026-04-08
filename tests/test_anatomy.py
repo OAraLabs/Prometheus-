@@ -24,7 +24,7 @@ from prometheus.infra.project_configs import (
 
 def _sample_state(**overrides) -> AnatomyState:
     defaults = dict(
-        hostname="gpu-node",
+        hostname="test-gpu",
         platform="Linux",
         cpu="AMD Ryzen 9 7950X",
         ram_total_gb=64.0,
@@ -37,14 +37,14 @@ def _sample_state(**overrides) -> AnatomyState:
         model_file="gemma-4-26B-A4B-it-Q4_K_XL.gguf",
         model_quantization="Q4_K_XL",
         inference_engine="llama_cpp",
-        inference_url="http://GPU_HOST:8080",
+        inference_url="http://192.0.2.1:8080",
         inference_features=["streaming"],
         vision_enabled=True,
         whisper_model="base",
-        tailscale_ip="GPU_HOST",
+        tailscale_ip="192.0.2.1",
         tailscale_peers=[
-            {"name": "Brain-Node", "ip": "MINI_HOST", "online": True},
-            {"name": "GPU-Node", "ip": "GPU_HOST", "online": True},
+            {"name": "test-brain", "ip": "192.0.2.2", "online": True},
+            {"name": "test-gpu", "ip": "192.0.2.1", "online": True},
         ],
         disk_total_gb=500.0,
         disk_free_gb=220.0,
@@ -110,7 +110,7 @@ class TestAnatomyScanner:
 
     def test_gpu_remote_fallback_via_ssh(self) -> None:
         scanner = AnatomyScanner(
-            llama_cpp_url="http://GPU_HOST:8080",
+            llama_cpp_url="http://192.0.2.1:8080",
             inference_engine="llama_cpp",
         )
         state = AnatomyState()
@@ -234,16 +234,16 @@ class TestAnatomyScanner:
         state = AnatomyState()
 
         ts_json = json.dumps({
-            "TailscaleIPs": ["MINI_HOST"],
+            "TailscaleIPs": ["192.0.2.2"],
             "Peer": {
                 "node1": {
-                    "HostName": "GPU-Node",
-                    "TailscaleIPs": ["GPU_HOST"],
+                    "HostName": "test-gpu",
+                    "TailscaleIPs": ["192.0.2.1"],
                     "Online": True,
                 },
                 "node2": {
                     "HostName": "phone",
-                    "TailscaleIPs": ["100.99.88.77"],
+                    "TailscaleIPs": ["198.51.100.1"],
                     "Online": False,
                 },
             },
@@ -257,10 +257,10 @@ class TestAnatomyScanner:
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             asyncio.run(scanner._detect_tailscale(state))
 
-        assert state.tailscale_ip == "MINI_HOST"
+        assert state.tailscale_ip == "192.0.2.2"
         assert len(state.tailscale_peers) == 2
-        assert state.tailscale_peers[0]["name"] == "GPU-Node"
-        assert state.tailscale_peers[0]["ip"] == "GPU_HOST"
+        assert state.tailscale_peers[0]["name"] == "test-gpu"
+        assert state.tailscale_peers[0]["ip"] == "192.0.2.1"
         assert state.tailscale_peers[0]["online"] is True
         assert state.tailscale_peers[1]["online"] is False
 
@@ -558,9 +558,9 @@ class TestCmdAnatomy:
         mock_scanner = MagicMock()
 
         state = _sample_state(
-            hostname="Brain-Node",
+            hostname="test-brain",
             platform="Linux",
-            inference_url="http://GPU_HOST:8080",
+            inference_url="http://192.0.2.1:8080",
         )
         mock_scanner.scan = AsyncMock(return_value=state)
         mock_writer = MagicMock()
@@ -574,13 +574,13 @@ class TestCmdAnatomy:
             mod._scanner, mod._writer, mod._project_store = old_s, old_w, old_p
 
         assert "Prometheus Anatomy" in text
-        assert "Brain-Node" in text
+        assert "test-brain" in text
         assert "remote inference" in text
         assert "NVIDIA RTX 4090" in text
         assert "GPU:" in text
         assert "VRAM:" in text
         assert "Tailscale:" in text
-        assert "GPU-Node" in text or "Brain-Node" in text
+        assert "test-gpu" in text or "test-brain" in text
         assert "Disk:" in text
         assert "Model:" in text
 
@@ -597,7 +597,7 @@ class TestCmdAnatomy:
             gpu_vram_total_mb=None,
             gpu_vram_used_mb=None,
             gpu_vram_free_mb=None,
-            inference_url="http://GPU_HOST:8080",
+            inference_url="http://192.0.2.1:8080",
         )
         mock_scanner.scan = AsyncMock(return_value=state)
         mod._scanner = mock_scanner

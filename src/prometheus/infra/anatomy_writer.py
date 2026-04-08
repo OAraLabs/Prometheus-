@@ -66,13 +66,13 @@ class AnatomyWriter:
         """Generate Mermaid diagram of current architecture."""
         lines = ["graph LR"]
 
-        lines.append('    User["Telegram"] --> Mini["Brain-Node<br/>Daemon + Storage"]')
+        lines.append('    User["Telegram"] --> Mini["Brain Node<br/>Daemon + Storage"]')
 
         if state.gpu_name:
             gpu_label = state.gpu_name.replace("NVIDIA ", "")
             model_label = _short_model(state.model_name) if state.model_name else "model"
             lines.append(
-                f'    Mini -->|"Tailscale"| GPU["GPU-Node<br/>{model_label}"]'
+                f'    Mini -->|"Tailscale"| GPU["GPU Node<br/>{model_label}"]'
             )
             engine = state.inference_engine.replace("_", ".")
             port = state.inference_url.rsplit(":", 1)[-1].rstrip("/") if ":" in state.inference_url else "8080"

@@ -102,7 +102,7 @@ def main() -> None:
 
     # Judge — use evals config or fall back to model endpoint
     judge_url = evals_cfg.get(
-        "judge_base_url", model_cfg.get("base_url", "http://GPU_HOST:8080")
+        "judge_base_url", model_cfg.get("base_url", "http://localhost:8080")
     )
 
     # Health check judge endpoint

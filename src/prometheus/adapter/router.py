@@ -201,7 +201,7 @@ class ModelRouter:
         model_cfg = config.get("model", {})
         self.default_provider = model_cfg.get("provider", "llama_cpp")
         self.default_model = model_cfg.get("model", "qwen3.5-32b")
-        self.default_base_url = model_cfg.get("base_url", "http://GPU_HOST:8080")
+        self.default_base_url = model_cfg.get("base_url", "http://localhost:8080")
 
     def _parse_rules(self, rules_config: list) -> list[RoutingRule]:
         """Parse routing rules from config."""

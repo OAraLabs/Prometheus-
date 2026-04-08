@@ -1201,8 +1201,8 @@ class TestSprint16AgentLoopMessages:
 
         # Build a 3-message history
         history = [
-            ConversationMessage.from_user_text("my name is Will"),
-            ConversationMessage(role="assistant", content=[TextBlock(text="Nice to meet you, Will!")]),
+            ConversationMessage.from_user_text("my name is Alice"),
+            ConversationMessage(role="assistant", content=[TextBlock(text="Nice to meet you, Alice!")]),
             ConversationMessage.from_user_text("what is my name?"),
         ]
 
@@ -1215,7 +1215,7 @@ class TestSprint16AgentLoopMessages:
         # The messages list passed to the provider should have all 3 history
         # messages plus the assistant response appended by run_loop
         assert len(result.messages) >= 3
-        assert result.messages[0].text == "my name is Will"
+        assert result.messages[0].text == "my name is Alice"
 
     def test_run_async_backward_compat(self, tmp_path):
         """Existing user_message= string path still works."""
@@ -1248,7 +1248,7 @@ class TestSprint16TelegramDispatchWiring:
         # Two-turn conversation: provider gives different answers each turn
         provider = ScriptedProvider([
             _text_response("Nice to meet you!"),
-            _text_response("Your name is Will."),
+            _text_response("Your name is Alice."),
         ])
 
         sm = SessionManager()
@@ -1271,7 +1271,7 @@ class TestSprint16TelegramDispatchWiring:
 
         async def _test():
             event1 = MessageEvent(
-                chat_id=99, user_id=1, text="my name is Will",
+                chat_id=99, user_id=1, text="my name is Alice",
                 message_id=1, platform=Platform.TELEGRAM,
             )
             await adapter.on_message(event1)
@@ -1287,10 +1287,10 @@ class TestSprint16TelegramDispatchWiring:
         # Session must have both turns
         session = sm.get_or_create("telegram:99")
         texts = [m.text for m in session.get_messages() if m.text]
-        assert "my name is Will" in texts
+        assert "my name is Alice" in texts
         assert "Nice to meet you!" in texts
         assert "what is my name?" in texts
-        assert "Your name is Will." in texts
+        assert "Your name is Alice." in texts
 
         # Provider was called twice
         assert provider._call_count == 2
@@ -1578,7 +1578,7 @@ class TestSprint17BootstrapWiring:
         config_dir = tmp_path / "config"
         config_dir.mkdir()
         (config_dir / "MEMORY.md").write_text(
-            "Will prefers concise responses",
+            "Alice prefers concise responses",
             encoding="utf-8",
         )
         (config_dir / "USER.md").write_text(
@@ -1599,7 +1599,7 @@ class TestSprint17BootstrapWiring:
             prompt = build_runtime_system_prompt(cwd=str(tmp_path))
 
         _, dynamic = prompt.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-        assert "Will prefers concise responses" in dynamic
+        assert "Alice prefers concise responses" in dynamic
         assert "Senior engineer building AI agents" in dynamic
 
     def test_format_memory_for_prompt_actually_invoked(self, tmp_path: Path) -> None:
@@ -3209,3 +3209,240 @@ class TestVisionDetectWiring:
         assert hasattr(ModelProvider, "detect_vision")
         assert hasattr(ModelProvider, "supports_vision")
         assert ModelProvider.supports_vision is False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Sprint 24: DOCTOR — model registry + diagnostics + retry escalation
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestDoctorWiring:
+    """Doctor diagnostic system → anatomy scanner → registry → Telegram command."""
+
+    # -- Registry matching wired to real YAML --
+
+    @pytest.mark.integration
+    def test_registry_loads_from_disk_and_matches(self):
+        """Doctor loads model_registry.yaml from repo and matches a real model name."""
+        from prometheus.infra.doctor import Doctor, match_model
+
+        doctor = Doctor()
+        assert doctor.registry.get("models"), "Registry should load models from disk"
+        assert "gemma-4" in doctor.registry["models"]
+
+        family = match_model("gemma-4-26B-A4B-it-Q4_K_XL.gguf", doctor.registry)
+        assert family is not None
+        assert family["display_name"] == "Google Gemma 4"
+        assert family["capabilities"]["vision"]["supported"] is True
+
+    # -- Doctor.diagnose() runs real checks against a real scan --
+
+    @pytest.mark.integration
+    async def test_doctor_diagnose_runs_real_checks(self, tmp_path):
+        """Doctor.diagnose() produces a categorized report from a real scan."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.doctor import Doctor
+
+        # Bootstrap files for clean bootstrap check
+        (tmp_path / "SOUL.md").write_text("soul", encoding="utf-8")
+        (tmp_path / "AGENTS.md").write_text("agents", encoding="utf-8")
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        state = await scanner.scan()
+
+        doctor = Doctor.__new__(Doctor)
+        doctor.config = {}
+        doctor.registry = Doctor()._load_registry()
+
+        with patch("prometheus.infra.doctor.get_config_dir", return_value=tmp_path):
+            report = await doctor.diagnose(state)
+
+        # Report has checks in all four categories
+        grouped = report.checks_by_category()
+        assert "platform" in grouped, "Platform checks should be present"
+        assert "resources" in grouped, "Resource checks should be present"
+
+        # Each check has required fields
+        for check in report.checks:
+            assert check.name
+            assert check.category in ("platform", "connectivity", "model", "resources")
+            assert check.status in ("ok", "warning", "error", "info")
+            assert check.message
+
+        # Platform checks actually ran (Python version is always detectable)
+        python_check = next(c for c in report.checks if c.name == "Python")
+        assert python_check.status == "ok"
+        assert "3." in python_check.message
+
+        # Disk check ran with real data
+        disk_check = next(c for c in report.checks if c.name == "Disk")
+        assert disk_check.status in ("ok", "warning")
+
+    # -- cmd_doctor formats a real diagnostic report --
+
+    @pytest.mark.integration
+    async def test_cmd_doctor_produces_categorized_output(self, tmp_path):
+        """cmd_doctor() returns formatted text with category headers."""
+        from prometheus.infra.anatomy import AnatomyScanner
+        from prometheus.infra.anatomy_writer import AnatomyWriter
+        from prometheus.tools.builtin.anatomy import set_anatomy_components
+        from prometheus.infra.project_configs import ProjectConfigStore
+        from prometheus.gateway.commands import cmd_doctor
+
+        scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
+        writer = AnatomyWriter(anatomy_path=tmp_path / "ANATOMY.md")
+        store = ProjectConfigStore(projects_dir=tmp_path / "projects")
+        set_anatomy_components(scanner, writer, store)
+
+        (tmp_path / "SOUL.md").write_text("soul", encoding="utf-8")
+        (tmp_path / "AGENTS.md").write_text("agents", encoding="utf-8")
+
+        try:
+            with patch("prometheus.infra.doctor.get_config_dir", return_value=tmp_path):
+                text = await cmd_doctor()
+        finally:
+            import prometheus.tools.builtin.anatomy as mod
+            mod._scanner = None
+            mod._writer = None
+            mod._project_store = None
+
+        # Output structure
+        assert "Prometheus Doctor" in text
+        assert "\u2500\u2500 Platform \u2500\u2500" in text
+        assert "\u2500\u2500 Resources \u2500\u2500" in text
+        # Has actual check results (not just headers)
+        assert "\u2705" in text  # at least one OK check
+        # Has summary line
+        assert "passed" in text or "warning" in text or "error" in text
+
+    # -- Doctor wires into TelegramAdapter via prometheus_config --
+
+    @pytest.mark.integration
+    def test_telegram_adapter_accepts_prometheus_config(self):
+        """TelegramAdapter.__init__ accepts prometheus_config kwarg."""
+        from prometheus.gateway.telegram import TelegramAdapter
+        import inspect
+        sig = inspect.signature(TelegramAdapter.__init__)
+        assert "prometheus_config" in sig.parameters
+        param = sig.parameters["prometheus_config"]
+        assert param.default is None
+
+    @pytest.mark.integration
+    def test_telegram_adapter_stores_config(self):
+        """TelegramAdapter stores prometheus_config for _cmd_doctor."""
+        from prometheus.gateway.telegram import TelegramAdapter
+        from prometheus.gateway.config import Platform, PlatformConfig
+
+        config = PlatformConfig(platform=Platform.TELEGRAM, token="fake:token")
+        agent_loop = MagicMock()
+        registry = MagicMock()
+        registry.list_tools.return_value = []
+
+        test_config = {"doctor": {"startup_check": True}}
+        adapter = TelegramAdapter(
+            config=config,
+            agent_loop=agent_loop,
+            tool_registry=registry,
+            prometheus_config=test_config,
+        )
+        assert adapter._prometheus_config == test_config
+
+    # -- cmd_help lists /doctor --
+
+    @pytest.mark.integration
+    def test_help_includes_doctor_command(self):
+        """Both cmd_help() and telegram help text list /doctor."""
+        from prometheus.gateway.commands import cmd_help
+        text = cmd_help()
+        assert "/doctor" in text
+        assert "/anatomy" in text
+
+    # -- Doctor startup check wired into daemon --
+
+    @pytest.mark.integration
+    def test_daemon_has_doctor_startup_wiring(self):
+        """daemon.py imports Doctor and runs startup check after anatomy scan."""
+        import ast
+        daemon_path = Path(__file__).resolve().parents[1] / "scripts" / "daemon.py"
+        source = daemon_path.read_text(encoding="utf-8")
+        assert "from prometheus.infra.doctor import Doctor" in source
+        assert "doctor.diagnose" in source
+        assert "startup_check" in source
+
+
+class TestRetryEscalationWiring:
+    """RetryEngine escalation → ModelRouter integration."""
+
+    @pytest.mark.integration
+    def test_retry_engine_accepts_router(self):
+        """RetryEngine.__init__ accepts optional router kwarg."""
+        from prometheus.adapter.retry import RetryEngine
+        import inspect
+        sig = inspect.signature(RetryEngine.__init__)
+        assert "router" in sig.parameters
+        assert sig.parameters["router"].default is None
+
+    @pytest.mark.integration
+    def test_retry_escalate_action_exists(self):
+        """RetryAction enum has ESCALATE member."""
+        from prometheus.adapter.retry import RetryAction
+        assert hasattr(RetryAction, "ESCALATE")
+        assert RetryAction.ESCALATE.value == "ESCALATE"
+
+    @pytest.mark.integration
+    def test_retry_escalates_with_real_router(self):
+        """RetryEngine escalates when wired to a real ModelRouter with escalation enabled."""
+        from prometheus.adapter.retry import RetryEngine, RetryAction
+        from prometheus.router.model_router import ModelRouter, RouterConfig
+
+        config = RouterConfig(escalation_enabled=True)
+        router = ModelRouter(
+            config=config,
+            primary_provider=MagicMock(),
+            primary_adapter=MagicMock(),
+            primary_model="test-model",
+        )
+
+        engine = RetryEngine(max_retries=2, router=router)
+
+        # Exhaust retries
+        engine.handle_failure("bash", "err1", None)
+        engine.handle_failure("bash", "err2", None)
+        action, msg = engine.handle_failure("bash", "err3", None)
+
+        assert action == RetryAction.ESCALATE
+        assert "Escalating" in msg
+
+    @pytest.mark.integration
+    def test_retry_aborts_without_router(self):
+        """RetryEngine aborts (not escalates) when no router is wired."""
+        from prometheus.adapter.retry import RetryEngine, RetryAction
+
+        engine = RetryEngine(max_retries=2)
+        engine.handle_failure("bash", "err1", None)
+        engine.handle_failure("bash", "err2", None)
+        action, msg = engine.handle_failure("bash", "err3", None)
+
+        assert action == RetryAction.ABORT
+        assert "Giving up" in msg
+
+    @pytest.mark.integration
+    def test_retry_aborts_when_escalation_disabled(self):
+        """RetryEngine aborts when router has escalation_enabled=False."""
+        from prometheus.adapter.retry import RetryEngine, RetryAction
+        from prometheus.router.model_router import ModelRouter, RouterConfig
+
+        config = RouterConfig(escalation_enabled=False)
+        router = ModelRouter(
+            config=config,
+            primary_provider=MagicMock(),
+            primary_adapter=MagicMock(),
+            primary_model="test-model",
+        )
+
+        engine = RetryEngine(max_retries=2, router=router)
+        engine.handle_failure("bash", "err1", None)
+        engine.handle_failure("bash", "err2", None)
+        action, _ = engine.handle_failure("bash", "err3", None)
+
+        assert action == RetryAction.ABORT

@@ -90,7 +90,7 @@ class PrometheusJudge:
 
     def __init__(
         self,
-        base_url: str = "http://GPU_HOST:8080",
+        base_url: str = "http://localhost:8080",
         model: str | None = None,
         timeout: float = 120.0,
     ) -> None:

@@ -8,8 +8,13 @@ Thanks for your interest in contributing! Here's how to get started.
 git clone https://github.com/whieber1/Prometheus-.git
 cd Prometheus-
 pip install -e ".[dev]"
-uv run pytest tests/ -v  # make sure everything passes
+git config core.hooksPath .githooks   # enable pre-commit secret scanning
+uv run pytest tests/ -v               # make sure everything passes
 ```
+
+> **Note:** Git does not auto-enable hooks from cloned repos (security policy).
+> The `git config core.hooksPath .githooks` step activates the pre-commit hook
+> that blocks accidental commits of secrets, private IPs, and infrastructure data.
 
 ## Running Tests
 
