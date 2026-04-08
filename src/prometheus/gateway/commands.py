@@ -380,13 +380,12 @@ def cmd_beacon(config: dict) -> str:
     host = _platform.node()
     api_port = web.get("api_port", 8005)
     ws_port = web.get("ws_port", 8010)
-    # Use HTML for clickable links in Telegram
     api_url = f"http://{host}:{api_port}"
     ws_url = f"ws://{host}:{ws_port}"
     dash_url = f"http://{host}:3000"
     return (
-        f"<b>Beacon</b>\n"
-        f'  REST API:  <a href="{api_url}/api/status">{api_url}</a>\n'
+        f"<b>Beacon</b>\n\n"
+        f'  <a href="{api_url}/api/status">Open REST API</a>  ({host}:{api_port})\n'
         f"  WebSocket: <code>{ws_url}</code>\n"
-        f'  Dashboard: <a href="{dash_url}">{dash_url}</a>'
+        f'  <a href="{dash_url}">Open Dashboard</a>  ({host}:3000)'
     )
