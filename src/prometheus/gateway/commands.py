@@ -287,40 +287,82 @@ async def cmd_anatomy() -> str:
     from prometheus.infra.anatomy_writer import AnatomyWriter
 
     scanner: AnatomyScanner = _scanner  # type: ignore[assignment]
-    writer: AnatomyWriter = _writer  # type: ignore[assignment]
 
     try:
-        state = await scanner.quick_scan()
+        state = await scanner.scan()
     except Exception as exc:
         return f"Anatomy scan failed: {exc}"
 
-    lines: list[str] = ["Prometheus Anatomy\n"]
+    from urllib.parse import urlparse
 
-    lines.append(f"Host: {state.hostname} ({state.platform})")
+    # Determine if inference is remote
+    parsed_url = urlparse(state.inference_url)
+    inf_host = parsed_url.hostname or ""
+    is_remote = inf_host not in ("", "localhost", "127.0.0.1", "::1")
+
+    lines: list[str] = ["\U0001f527 Prometheus Anatomy\n"]
+
+    # Host line
+    host_line = f"Host: {state.hostname} ({state.platform})"
+    if is_remote:
+        host_line += f" + {inf_host} (remote inference)"
+    lines.append(host_line)
+
     if state.cpu:
-        lines.append(f"CPU: {state.cpu[:50]}")
+        lines.append(f"CPU: {state.cpu[:60]}")
     if state.ram_total_gb:
-        lines.append(f"RAM: {state.ram_available_gb:.1f}GB free / {state.ram_total_gb:.0f}GB")
+        lines.append(f"RAM: {state.ram_available_gb:.1f} GB free / {state.ram_total_gb:.0f} GB")
 
-    if state.gpu_name:
-        lines.append(f"\nGPU: {state.gpu_name}")
-        if state.gpu_vram_total_mb:
-            used = state.gpu_vram_used_mb or 0
-            free = state.gpu_vram_free_mb or 0
-            total = state.gpu_vram_total_mb
-            lines.append(f"VRAM: {used}MB / {total}MB ({free}MB free)")
-
+    # Model
     if state.model_name:
         lines.append(f"\nModel: {state.model_name}")
         if state.model_quantization:
             lines.append(f"Quant: {state.model_quantization}")
-    lines.append(f"Engine: {state.inference_engine} @ {state.inference_url}")
+    engine_label = state.inference_engine.replace("_", ".")
+    lines.append(f"Engine: {engine_label} @ {state.inference_url}")
     lines.append(f"Vision: {'enabled' if state.vision_enabled else 'disabled'}")
+
+    # GPU
+    if state.gpu_name:
+        gpu_label = state.gpu_name
+        if is_remote:
+            gpu_label += " (remote)"
+        lines.append(f"\nGPU: {gpu_label}")
+        if state.gpu_vram_total_mb:
+            used_gb = (state.gpu_vram_used_mb or 0) / 1024
+            free_gb = (state.gpu_vram_free_mb or 0) / 1024
+            total_gb = state.gpu_vram_total_mb / 1024
+            lines.append(f"VRAM: {used_gb:.1f} / {total_gb:.1f} GB ({free_gb:.1f} GB free)")
+    elif is_remote:
+        lines.append("\nGPU: remote (stats unavailable)")
+
+    # Tailscale
+    if state.tailscale_ip:
+        online_count = sum(
+            1 for p in state.tailscale_peers
+            if isinstance(p, dict) and p.get("online")
+        )
+        lines.append(f"\nTailscale: {len(state.tailscale_peers)} peers ({online_count} online)")
+        for peer in state.tailscale_peers:
+            if isinstance(peer, dict):
+                icon = "\u2705" if peer.get("online") else "\u274c"
+                lines.append(f"  {peer['name']}: {peer.get('ip', '?')} {icon}")
+            else:
+                lines.append(f"  {peer}")
+
+    # Disk
+    if state.disk_total_gb:
+        lines.append(f"\nDisk: {state.disk_free_gb} GB free / {state.disk_total_gb} GB")
+        if state.prometheus_data_size_mb:
+            lines.append(f"Prometheus data: {state.prometheus_data_size_mb:.0f} MB")
+
+    # Uptime
+    uptime_str = _read_uptime()
+    if uptime_str:
+        lines.append(f"\nUptime: {uptime_str}")
 
     if state.whisper_model:
         lines.append(f"Whisper: {state.whisper_model}")
-    if state.tailscale_ip:
-        lines.append(f"Tailscale: {state.tailscale_ip} ({len(state.tailscale_peers)} peers)")
 
     # Active project
     if _project_store is not None:
@@ -328,9 +370,28 @@ async def cmd_anatomy() -> str:
         store: ProjectConfigStore = _project_store  # type: ignore[assignment]
         active = store.get_active()
         if active:
-            lines.append(f"\nConfig: {active.name} ({active.description})")
+            lines.append(f"Config: {active.name} ({active.description})")
 
     return "\n".join(lines)
+
+
+def _read_uptime() -> str | None:
+    """Read daemon start time and return human-readable uptime."""
+    import time
+    from prometheus.config.paths import get_config_dir
+    uptime_path = get_config_dir() / ".daemon_started"
+    try:
+        started = float(uptime_path.read_text().strip())
+        elapsed = time.time() - started
+        if elapsed < 0:
+            return None
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        return f"{minutes}m"
+    except Exception:
+        return None
 
 
 def cmd_skills() -> str:

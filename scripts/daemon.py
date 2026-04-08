@@ -107,6 +107,11 @@ async def run_daemon(args: argparse.Namespace) -> None:
     archive = ArchiveWriter()
     archive.archive_event("daemon_start", {"args": vars(args)})
 
+    # Write daemon start time for uptime tracking
+    import time as _time
+    uptime_path = Path(get_config_dir()) / ".daemon_started"
+    uptime_path.write_text(str(_time.time()), encoding="utf-8")
+
     # Model provider — ProviderRegistry handles all provider types
     provider = ProviderRegistry.create(model_config)
 

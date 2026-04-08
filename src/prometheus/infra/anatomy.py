@@ -54,7 +54,7 @@ class AnatomyState:
 
     # Connectivity
     tailscale_ip: str | None = None
-    tailscale_peers: list[str] = field(default_factory=list)
+    tailscale_peers: list[dict] = field(default_factory=list)  # [{name, ip, online}]
 
     # Storage
     disk_total_gb: float = 0.0
@@ -186,6 +186,14 @@ class AnatomyScanner:
             state.prometheus_data_size_mb = round(total / (1024**2), 1)
 
     async def _detect_gpu(self, state: AnatomyState) -> None:
+        # Try local nvidia-smi first
+        if await self._detect_gpu_local(state):
+            return
+        # Fall back to remote nvidia-smi via SSH on the inference host
+        await self._detect_gpu_remote(state)
+
+    async def _detect_gpu_local(self, state: AnatomyState) -> bool:
+        """Try local nvidia-smi. Returns True if successful."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "nvidia-smi",
@@ -195,15 +203,51 @@ class AnatomyScanner:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            line = stdout.decode().strip().split("\n")[0]
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 4:
-                state.gpu_name = parts[0]
-                state.gpu_vram_total_mb = int(float(parts[1]))
-                state.gpu_vram_used_mb = int(float(parts[2]))
-                state.gpu_vram_free_mb = int(float(parts[3]))
+            if proc.returncode != 0:
+                return False
+            return self._parse_nvidia_smi(state, stdout.decode())
         except Exception:
-            log.debug("GPU detection failed (nvidia-smi not available or no GPU)")
+            log.debug("Local GPU detection failed (nvidia-smi not available)")
+            return False
+
+    async def _detect_gpu_remote(self, state: AnatomyState) -> bool:
+        """Try nvidia-smi on the remote inference host via SSH."""
+        from urllib.parse import urlparse
+        url = self._llama_url if self._engine == "llama_cpp" else self._ollama_url
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+        if not host or host in ("localhost", "127.0.0.1", "::1"):
+            return False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+                "-o", "BatchMode=yes", host,
+                "nvidia-smi", "--query-gpu=name,memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+            if proc.returncode != 0:
+                log.debug("Remote GPU detection via SSH failed (rc=%d)", proc.returncode)
+                return False
+            return self._parse_nvidia_smi(state, stdout.decode())
+        except Exception:
+            log.debug("Remote GPU detection failed for host %s", host)
+            return False
+
+    @staticmethod
+    def _parse_nvidia_smi(state: AnatomyState, output: str) -> bool:
+        """Parse nvidia-smi CSV output into state. Returns True if successful."""
+        line = output.strip().split("\n")[0]
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 4:
+            state.gpu_name = parts[0]
+            state.gpu_vram_total_mb = int(float(parts[1]))
+            state.gpu_vram_used_mb = int(float(parts[2]))
+            state.gpu_vram_free_mb = int(float(parts[3]))
+            return True
+        return False
 
     async def _detect_model(self, state: AnatomyState) -> None:
         if self._engine == "llama_cpp":
@@ -312,8 +356,12 @@ class AnatomyScanner:
             peers = data.get("Peer", {})
             for peer_info in peers.values():
                 name = peer_info.get("HostName", "")
-                if name:
-                    state.tailscale_peers.append(name)
+                if not name:
+                    continue
+                peer_ips = peer_info.get("TailscaleIPs", [])
+                ip = peer_ips[0] if peer_ips else ""
+                online = peer_info.get("Online", False)
+                state.tailscale_peers.append({"name": name, "ip": ip, "online": online})
         except Exception:
             log.debug("Tailscale detection failed")
 

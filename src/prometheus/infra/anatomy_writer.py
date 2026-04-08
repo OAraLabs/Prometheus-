@@ -194,6 +194,12 @@ class AnatomyWriter:
         if state.tailscale_ip:
             peer_count = len(state.tailscale_peers)
             lines.append(f"- Tailscale: {state.tailscale_ip} ({peer_count} peers)")
+            for peer in state.tailscale_peers:
+                if isinstance(peer, dict):
+                    status = "online" if peer.get("online") else "offline"
+                    lines.append(f"  - {peer['name']}: {peer.get('ip', '?')} ({status})")
+                else:
+                    lines.append(f"  - {peer}")
 
         # Storage
         if state.disk_total_gb:

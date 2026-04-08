@@ -42,7 +42,10 @@ def _sample_state(**overrides) -> AnatomyState:
         vision_enabled=True,
         whisper_model="base",
         tailscale_ip="GPU_HOST",
-        tailscale_peers=["Brain-Node", "GPU-Node"],
+        tailscale_peers=[
+            {"name": "Brain-Node", "ip": "MINI_HOST", "online": True},
+            {"name": "GPU-Node", "ip": "GPU_HOST", "online": True},
+        ],
         disk_total_gb=500.0,
         disk_free_gb=220.0,
         prometheus_data_size_mb=42.5,
@@ -95,6 +98,7 @@ class TestAnatomyScanner:
         mock_proc.communicate = AsyncMock(
             return_value=(b"NVIDIA RTX 4090, 24576, 18432, 6144\n", b"")
         )
+        mock_proc.returncode = 0
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             asyncio.run(scanner._detect_gpu(state))
@@ -103,6 +107,64 @@ class TestAnatomyScanner:
         assert state.gpu_vram_total_mb == 24576
         assert state.gpu_vram_used_mb == 18432
         assert state.gpu_vram_free_mb == 6144
+
+    def test_gpu_remote_fallback_via_ssh(self) -> None:
+        scanner = AnatomyScanner(
+            llama_cpp_url="http://GPU_HOST:8080",
+            inference_engine="llama_cpp",
+        )
+        state = AnatomyState()
+
+        # Local nvidia-smi fails
+        local_proc = AsyncMock()
+        local_proc.communicate = AsyncMock(return_value=(b"", b"not found"))
+        local_proc.returncode = 1
+
+        # Remote SSH nvidia-smi succeeds
+        remote_proc = AsyncMock()
+        remote_proc.communicate = AsyncMock(
+            return_value=(b"NVIDIA RTX 4090, 24576, 18432, 6144\n", b"")
+        )
+        remote_proc.returncode = 0
+
+        call_count = 0
+        async def mock_exec(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return local_proc  # first call: local nvidia-smi
+            return remote_proc  # second call: ssh nvidia-smi
+
+        with patch("asyncio.create_subprocess_exec", side_effect=mock_exec):
+            asyncio.run(scanner._detect_gpu(state))
+
+        assert state.gpu_name == "NVIDIA RTX 4090"
+        assert state.gpu_vram_total_mb == 24576
+
+    def test_gpu_remote_skipped_for_localhost(self) -> None:
+        scanner = AnatomyScanner(
+            llama_cpp_url="http://127.0.0.1:8080",
+            inference_engine="llama_cpp",
+        )
+        state = AnatomyState()
+
+        with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
+            asyncio.run(scanner._detect_gpu(state))
+
+        # Should not attempt SSH for localhost — gpu stays None
+        assert state.gpu_name is None
+
+    def test_parse_nvidia_smi(self) -> None:
+        state = AnatomyState()
+        ok = AnatomyScanner._parse_nvidia_smi(state, "NVIDIA RTX 4090, 24576, 18432, 6144\n")
+        assert ok is True
+        assert state.gpu_name == "NVIDIA RTX 4090"
+        assert state.gpu_vram_free_mb == 6144
+
+        state2 = AnatomyState()
+        ok2 = AnatomyScanner._parse_nvidia_smi(state2, "bad output")
+        assert ok2 is False
+        assert state2.gpu_name is None
 
     def test_model_detection_handles_server_down(self) -> None:
         scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
@@ -166,6 +228,51 @@ class TestAnatomyScanner:
         with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
             asyncio.run(scanner._detect_tailscale(state))
         assert state.tailscale_ip is None
+
+    def test_tailscale_detection_parses_peers(self) -> None:
+        scanner = AnatomyScanner()
+        state = AnatomyState()
+
+        ts_json = json.dumps({
+            "TailscaleIPs": ["MINI_HOST"],
+            "Peer": {
+                "node1": {
+                    "HostName": "GPU-Node",
+                    "TailscaleIPs": ["GPU_HOST"],
+                    "Online": True,
+                },
+                "node2": {
+                    "HostName": "phone",
+                    "TailscaleIPs": ["100.99.88.77"],
+                    "Online": False,
+                },
+            },
+        })
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(
+            return_value=(ts_json.encode(), b"")
+        )
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            asyncio.run(scanner._detect_tailscale(state))
+
+        assert state.tailscale_ip == "MINI_HOST"
+        assert len(state.tailscale_peers) == 2
+        assert state.tailscale_peers[0]["name"] == "GPU-Node"
+        assert state.tailscale_peers[0]["ip"] == "GPU_HOST"
+        assert state.tailscale_peers[0]["online"] is True
+        assert state.tailscale_peers[1]["online"] is False
+
+    def test_disk_detection(self) -> None:
+        from collections import namedtuple
+        DiskUsage = namedtuple("usage", ["total", "used", "free"])
+        scanner = AnatomyScanner()
+        state = AnatomyState()
+        with patch("prometheus.infra.anatomy.shutil.disk_usage", return_value=DiskUsage(500 * 1024**3, 280 * 1024**3, 220 * 1024**3)):
+            scanner._detect_disk(state)
+        assert state.disk_total_gb == 500.0
+        assert state.disk_free_gb == 220.0
 
     def test_full_scan_returns_state(self) -> None:
         scanner = AnatomyScanner(llama_cpp_url="http://127.0.0.1:99999")
@@ -441,3 +548,121 @@ class TestCmdAnatomy:
         text = await cmd_anatomy()
         assert "not initialized" in text.lower()
         mod._scanner = old
+
+    async def test_cmd_anatomy_full_output(self) -> None:
+        """Verify the formatted output includes all expected sections."""
+        import prometheus.tools.builtin.anatomy as mod
+        from prometheus.gateway.commands import cmd_anatomy
+
+        old_s, old_w, old_p = mod._scanner, mod._writer, mod._project_store
+        mock_scanner = MagicMock()
+
+        state = _sample_state(
+            hostname="Brain-Node",
+            platform="Linux",
+            inference_url="http://GPU_HOST:8080",
+        )
+        mock_scanner.scan = AsyncMock(return_value=state)
+        mock_writer = MagicMock()
+        mod._scanner = mock_scanner
+        mod._writer = mock_writer
+        mod._project_store = None
+
+        try:
+            text = await cmd_anatomy()
+        finally:
+            mod._scanner, mod._writer, mod._project_store = old_s, old_w, old_p
+
+        assert "Prometheus Anatomy" in text
+        assert "Brain-Node" in text
+        assert "remote inference" in text
+        assert "NVIDIA RTX 4090" in text
+        assert "GPU:" in text
+        assert "VRAM:" in text
+        assert "Tailscale:" in text
+        assert "GPU-Node" in text or "Brain-Node" in text
+        assert "Disk:" in text
+        assert "Model:" in text
+
+    async def test_cmd_anatomy_graceful_gpu_unavailable(self) -> None:
+        """When GPU detection fails, should show 'remote (stats unavailable)'."""
+        import prometheus.tools.builtin.anatomy as mod
+        from prometheus.gateway.commands import cmd_anatomy
+
+        old_s, old_w, old_p = mod._scanner, mod._writer, mod._project_store
+        mock_scanner = MagicMock()
+
+        state = _sample_state(
+            gpu_name=None,
+            gpu_vram_total_mb=None,
+            gpu_vram_used_mb=None,
+            gpu_vram_free_mb=None,
+            inference_url="http://GPU_HOST:8080",
+        )
+        mock_scanner.scan = AsyncMock(return_value=state)
+        mod._scanner = mock_scanner
+        mod._writer = MagicMock()
+        mod._project_store = None
+
+        try:
+            text = await cmd_anatomy()
+        finally:
+            mod._scanner, mod._writer, mod._project_store = old_s, old_w, old_p
+
+        assert "remote (stats unavailable)" in text
+
+    async def test_cmd_anatomy_no_tailscale(self) -> None:
+        """When Tailscale is not available, skip that section."""
+        import prometheus.tools.builtin.anatomy as mod
+        from prometheus.gateway.commands import cmd_anatomy
+
+        old_s, old_w, old_p = mod._scanner, mod._writer, mod._project_store
+        mock_scanner = MagicMock()
+
+        state = _sample_state(
+            tailscale_ip=None,
+            tailscale_peers=[],
+            inference_url="http://127.0.0.1:8080",
+        )
+        mock_scanner.scan = AsyncMock(return_value=state)
+        mod._scanner = mock_scanner
+        mod._writer = MagicMock()
+        mod._project_store = None
+
+        try:
+            text = await cmd_anatomy()
+        finally:
+            mod._scanner, mod._writer, mod._project_store = old_s, old_w, old_p
+
+        assert "Tailscale" not in text
+
+
+class TestUptime:
+    def test_read_uptime(self, tmp_path: Path) -> None:
+        import time
+        from prometheus.gateway.commands import _read_uptime
+
+        uptime_file = tmp_path / ".daemon_started"
+        uptime_file.write_text(str(time.time() - 8100), encoding="utf-8")
+
+        with patch("prometheus.config.paths.get_config_dir", return_value=tmp_path):
+            result = _read_uptime()
+        assert result == "2h 15m"
+
+    def test_read_uptime_minutes_only(self, tmp_path: Path) -> None:
+        import time
+        from prometheus.gateway.commands import _read_uptime
+
+        uptime_file = tmp_path / ".daemon_started"
+        uptime_file.write_text(str(time.time() - 300), encoding="utf-8")
+
+        with patch("prometheus.config.paths.get_config_dir", return_value=tmp_path):
+            result = _read_uptime()
+        assert result == "5m"
+
+    def test_read_uptime_missing_file(self, tmp_path: Path) -> None:
+        from prometheus.gateway.commands import _read_uptime
+
+        with patch("prometheus.config.paths.get_config_dir", return_value=tmp_path):
+            result = _read_uptime()
+        assert result is None
