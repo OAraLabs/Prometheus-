@@ -11,11 +11,12 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,7 +36,14 @@ def create_app(
 ) -> FastAPI:
     """Create the FastAPI application with all routes."""
 
-    app = FastAPI(title="Prometheus Mission Control", version="0.1.0")
+    _api_token = config.get("web", {}).get("api_token") or os.environ.get("PROMETHEUS_API_TOKEN", "")
+    app = FastAPI(
+        title="Prometheus Mission Control",
+        version="0.1.0",
+        docs_url=None if _api_token else "/docs",
+        redoc_url=None if _api_token else "/redoc",
+        openapi_url=None if _api_token else "/openapi.json",
+    )
     _start_time = time.time()
 
     # CORS for dev (next dev on different port)
@@ -45,6 +53,16 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # ── Bearer token auth on /api/* routes ──────────────────────────
+
+    @app.middleware("http")
+    async def _check_bearer_token(request: Request, call_next):
+        if _api_token and request.url.path.startswith("/api/"):
+            auth = request.headers.get("authorization", "")
+            if auth != f"Bearer {_api_token}":
+                return JSONResponse(status_code=401, content={"error": "unauthorized — set Authorization: Bearer <token>"})
+        return await call_next(request)
 
     # Store references for route handlers
     app.state.config = config

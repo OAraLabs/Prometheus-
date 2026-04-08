@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 from prometheus.gateway.config import Platform, PlatformConfig
-from prometheus.gateway.commands import cmd_anatomy, cmd_beacon, cmd_profile
+from prometheus.gateway.commands import cmd_anatomy, cmd_beacon, cmd_doctor, cmd_profile
 from prometheus.gateway.platform_base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -94,6 +94,7 @@ class TelegramAdapter(BasePlatformAdapter):
         model_name: str = "",
         model_provider: str = "",
         session_manager: SessionManager | None = None,
+        prometheus_config: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(config)
         self.agent_loop = agent_loop
@@ -104,6 +105,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self.cost_tracker = None  # Set by daemon if using cloud provider
         self._app: Application | None = None
         self._start_time: float = 0.0
+        self._prometheus_config: dict[str, Any] = prometheus_config or {}
 
         if session_manager is None:
             from prometheus.engine.session import SessionManager as _SM
@@ -136,6 +138,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("context", self._cmd_context))
         self._app.add_handler(CommandHandler("skills", self._cmd_skills))
         self._app.add_handler(CommandHandler("anatomy", self._cmd_anatomy))
+        self._app.add_handler(CommandHandler("doctor", self._cmd_doctor))
         self._app.add_handler(CommandHandler("profile", self._cmd_profile))
         self._app.add_handler(CommandHandler("beacon", self._cmd_beacon))
         # Sprint 15b GRAFT: approval queue commands
@@ -172,6 +175,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 BotCommand("context", "Context window usage"),
                 BotCommand("skills", "List available skills"),
                 BotCommand("anatomy", "Infrastructure snapshot"),
+                BotCommand("doctor", "Diagnostic health check"),
                 BotCommand("profile", "Show or switch agent profile"),
                 BotCommand("beacon", "Web bridge / dashboard status"),
                 BotCommand("approve", "Approve a pending tool request"),
@@ -287,6 +291,8 @@ class TelegramAdapter(BasePlatformAdapter):
             "Commands:\n"
             "/status    — Model, uptime, tools, memory, SENTINEL\n"
             "/model     — Current model name and provider\n"
+            "/anatomy   — Hardware, GPU, VRAM, infrastructure\n"
+            "/doctor    — Diagnostic health check against model registry\n"
             "/wiki      — Wiki stats and recent entries\n"
             "/sentinel  — SENTINEL subsystem status\n"
             "/benchmark — Run a quick smoke test\n"
@@ -709,6 +715,15 @@ class TelegramAdapter(BasePlatformAdapter):
         text = await cmd_anatomy()
         await self.send(update.effective_chat.id, text, parse_mode=None)
 
+    async def _cmd_doctor(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /doctor command — run diagnostic health check."""
+        if update.effective_chat is None:
+            return
+        text = await cmd_doctor(self._prometheus_config)
+        await self.send(update.effective_chat.id, text, parse_mode=None)
+
     async def _cmd_beacon(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -753,7 +768,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("Open API", url=f"http://{link_host}:{api_port}/api/status"),
+                InlineKeyboardButton("Open API", url=f"http://{link_host}:{api_port}/docs"),
                 InlineKeyboardButton("Open Dashboard", url=f"http://{link_host}:{web.get('dashboard_port', 3002)}"),
             ],
         ])
