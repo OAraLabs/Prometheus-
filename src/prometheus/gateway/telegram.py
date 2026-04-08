@@ -163,12 +163,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 BotCommand("status", "Model, uptime, tools, SENTINEL state"),
                 BotCommand("help", "List commands and capabilities"),
                 BotCommand("reset", "Clear conversation context"),
+                BotCommand("clear", "Clear conversation context"),
                 BotCommand("model", "Show current model and provider"),
                 BotCommand("wiki", "Wiki stats and recent entries"),
                 BotCommand("sentinel", "SENTINEL subsystem status"),
                 BotCommand("benchmark", "Run a quick smoke test"),
                 BotCommand("context", "Context window usage"),
                 BotCommand("skills", "List available skills"),
+                BotCommand("anatomy", "Infrastructure snapshot"),
+                BotCommand("profile", "Show or switch agent profile"),
+                BotCommand("approve", "Approve a pending tool request"),
+                BotCommand("deny", "Deny a pending tool request"),
+                BotCommand("pending", "List pending approval requests"),
             ])
         except Exception as exc:
             logger.warning("Failed to register command menu: %s", exc)
