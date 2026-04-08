@@ -2575,20 +2575,20 @@ class TestSprint21CloudProviders:
         assert isinstance(adapter.formatter, AnthropicFormatter)
 
     def test_create_adapter_local_gemma(self):
-        """create_adapter picks GemmaFormatter for gemma models on llama_cpp."""
+        """Gemma 4 has native function_calling → Passthrough/NONE."""
         from prometheus.__main__ import create_adapter
-        from prometheus.adapter.formatter import GemmaFormatter
+        from prometheus.adapter.formatter import PassthroughFormatter
 
         adapter = create_adapter({"provider": "llama_cpp", "model": "gemma4-26b"})
-        assert isinstance(adapter.formatter, GemmaFormatter)
+        assert isinstance(adapter.formatter, PassthroughFormatter)
 
     def test_create_adapter_local_qwen(self):
-        """create_adapter picks QwenFormatter for non-gemma models on llama_cpp."""
+        """Qwen has native function_calling → Passthrough/NONE."""
         from prometheus.__main__ import create_adapter
-        from prometheus.adapter.formatter import QwenFormatter
+        from prometheus.adapter.formatter import PassthroughFormatter
 
         adapter = create_adapter({"provider": "llama_cpp", "model": "qwen3.5-32b"})
-        assert isinstance(adapter.formatter, QwenFormatter)
+        assert isinstance(adapter.formatter, PassthroughFormatter)
 
     def test_create_adapter_strictness_none_for_cloud(self):
         """Cloud providers get strictness=NONE — no validation overhead."""
@@ -2599,13 +2599,13 @@ class TestSprint21CloudProviders:
             adapter = create_adapter({"provider": provider})
             assert adapter.validator.strictness == Strictness.NONE, f"{provider} should be NONE"
 
-    def test_create_adapter_strictness_medium_for_local(self):
-        """Local providers get strictness=MEDIUM — validation + repair."""
+    def test_create_adapter_strictness_none_for_native_tool_calling(self):
+        """Models with native function_calling get strictness=NONE."""
         from prometheus.__main__ import create_adapter
         from prometheus.adapter.validator import Strictness
 
         adapter = create_adapter({"provider": "llama_cpp", "model": "qwen3.5-32b"})
-        assert adapter.validator.strictness == Strictness.MEDIUM
+        assert adapter.validator.strictness == Strictness.NONE
 
     # -- PassthroughFormatter does not alter prompts or tools -----------
 

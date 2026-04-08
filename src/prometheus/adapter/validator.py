@@ -17,6 +17,35 @@ from typing import Any
 from pydantic import ValidationError
 
 
+def _build_structured_error(
+    error: str,
+    tool_name: str,
+    tool_registry: Any,
+    error_type: str,
+) -> str:
+    """Build a rich error message with context to help the model self-correct."""
+    lines: list[str] = [f"Tool call failed: {error}"]
+
+    # Available tool names
+    tools = tool_registry.list_tools() if tool_registry else []
+    if tools:
+        names = ", ".join(t.name for t in tools)
+        lines.append(f"Available tools: {names}")
+
+    # Expected format
+    lines.append('Expected format: {"name": "tool_name", "arguments": {...}}')
+
+    # Example from the first tool that has example_call set
+    for t in tools:
+        ex = getattr(t, "example_call", None)
+        if ex is not None:
+            example = json.dumps({"name": t.name, "arguments": ex})
+            lines.append(f"Example: {example}")
+            break
+
+    return "\n".join(lines)
+
+
 class Strictness(str, Enum):
     NONE = "NONE"
     MEDIUM = "MEDIUM"
@@ -144,9 +173,11 @@ class ToolCallValidator:
         if not tool_name or not tool_name.strip():
             return ValidationResult(
                 valid=False,
-                error=(
-                    "Model produced empty tool name — "
-                    "GBNF grammar enforcement may not be active"
+                error=_build_structured_error(
+                    "Model produced empty tool name — GBNF grammar enforcement may not be active",
+                    tool_name,
+                    tool_registry,
+                    "unknown_tool",
                 ),
                 error_type="unknown_tool",
             )
@@ -156,7 +187,12 @@ class ToolCallValidator:
         if tool is None:
             return ValidationResult(
                 valid=False,
-                error=f"Unknown tool: {tool_name!r}",
+                error=_build_structured_error(
+                    f"Unknown tool: {tool_name!r}",
+                    tool_name,
+                    tool_registry,
+                    "unknown_tool",
+                ),
                 error_type="unknown_tool",
             )
 
@@ -239,7 +275,12 @@ class ToolCallValidator:
                 repaired=False,
                 tool_name=repaired_name,
                 tool_input={} if not isinstance(tool_input, dict) else tool_input,
-                error=f"Could not find a matching tool for {tool_name!r}",
+                error=_build_structured_error(
+                    f"Could not find a matching tool for {tool_name!r}",
+                    tool_name,
+                    tool_registry,
+                    "unknown_tool",
+                ),
             )
 
         # --- 2. Extract JSON if input is a string ---
@@ -306,7 +347,12 @@ class ToolCallValidator:
                 tool_name=repaired_name,
                 tool_input=tool_input,
                 repairs_made=repairs,
-                error=str(exc),
+                error=_build_structured_error(
+                    str(exc),
+                    repaired_name,
+                    tool_registry,
+                    "invalid_json",
+                ),
             )
 
     def _fuzzy_match_tool_name(

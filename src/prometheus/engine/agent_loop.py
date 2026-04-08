@@ -145,6 +145,13 @@ class LoopContext:
     divergence_detector: object | None = None
     # Sprint 20: LSP post-result hooks (modify tool result after execution)
     post_result_hooks: list[object] | None = None
+    # Tool Calling Middle Layer sprint
+    tool_loader: object | None = None     # DynamicToolLoader for deferred loading
+    tool_results_turn_budget: int = 8000  # max tokens across ALL results per turn
+    microcompact_after_turns: int = 3     # compact tool results older than N turns
+    microcompact_keep_chars: int = 200    # chars to keep per compacted result
+    microcompact_keep_chars_no_lcm: int = 500  # chars if LCM hasn't ingested
+    lcm_engine: object | None = None      # LCMEngine for microcompaction checks
 
 
 async def run_loop(
@@ -157,7 +164,9 @@ async def run_loop(
     the assistant returns a response with no tool_uses, or after max_turns.
     """
     tool_schema: list[dict] = []
-    if context.tool_registry is not None and hasattr(context.tool_registry, "to_api_schema"):
+    if context.tool_loader is not None and hasattr(context.tool_loader, "active_schemas"):
+        tool_schema = context.tool_loader.active_schemas()
+    elif context.tool_registry is not None and hasattr(context.tool_registry, "to_api_schema"):
         tool_schema = context.tool_registry.to_api_schema()
 
     # Sprint 10/15: route the first user message through ModelRouter
@@ -187,6 +196,10 @@ async def run_loop(
     tool_iteration = 0
 
     for turn in range(context.max_turns):
+        # MicroCompaction: compact old tool results (free, no LLM calls)
+        if turn > 0 and context.microcompact_after_turns > 0:
+            _microcompact_old_results(context, messages, turn)
+
         final_message: ConversationMessage | None = None
         usage = UsageSnapshot()
 
@@ -294,6 +307,10 @@ async def run_loop(
             circuit_breaker.record_success()
             _log_iteration(context, _IterationReason.TOOL_SUCCESS, turn, tool_iteration)
 
+        # Cross-result token budget: proportional truncation across all results
+        if context.tool_results_turn_budget > 0:
+            tool_results = _apply_cross_result_budget(context, tool_calls, tool_results)
+
         for tc, result in zip(tool_calls, tool_results):
             yield ToolExecutionStarted(tool_name=tc.name, tool_input=tc.input), None
             yield ToolExecutionCompleted(
@@ -392,6 +409,132 @@ def _try_model_fallback(context: LoopContext) -> tuple | None:
     except Exception:
         log.warning("Failed to create fallback provider %s", fallback_cfg.provider, exc_info=True)
         return None
+
+
+def _apply_cross_result_budget(
+    context: LoopContext,
+    tool_calls: list,
+    tool_results: list[ToolResultBlock],
+) -> list[ToolResultBlock]:
+    """Enforce a total token budget across all tool results in a single turn.
+
+    Runs AFTER individual per-result truncation but BEFORE injection into
+    conversation history. Prioritizes mutating tool results over read-only.
+    """
+    from prometheus.context.token_estimation import estimate_tokens
+
+    budget = context.tool_results_turn_budget
+    if budget <= 0:
+        return tool_results
+
+    # Calculate total tokens
+    result_tokens = [(r, estimate_tokens(r.content)) for r in tool_results]
+    total = sum(t for _, t in result_tokens)
+    if total <= budget:
+        return tool_results
+
+    # Classify read-only vs mutating for priority
+    ro_indices: list[int] = []
+    mut_indices: list[int] = []
+    for i, tc in enumerate(tool_calls):
+        tool = context.tool_registry.get(tc.name) if context.tool_registry else None
+        if tool is not None and _is_tool_read_only(tool, tc.input):
+            ro_indices.append(i)
+        else:
+            mut_indices.append(i)
+
+    # Truncate read-only results first, then mutating if still over budget
+    new_results = list(tool_results)
+    remaining = total
+
+    for idx_group in (ro_indices, mut_indices):
+        if remaining <= budget:
+            break
+        for i in idx_group:
+            if remaining <= budget:
+                break
+            r, tokens = result_tokens[i]
+            if r.is_error or tokens == 0:
+                continue
+            # Proportionally reduce this result
+            share = max(100, int(budget * tokens / total))
+            char_limit = share * 4  # estimate_tokens uses chars/4
+            if len(r.content) > char_limit:
+                trimmed = r.content[:char_limit] + \
+                    "\n[truncated — use lcm_expand or re-read for full content]"
+                new_results[i] = ToolResultBlock(
+                    tool_use_id=r.tool_use_id,
+                    content=trimmed,
+                    is_error=r.is_error,
+                )
+                remaining -= (tokens - estimate_tokens(trimmed))
+
+    log.debug("Cross-result budget: %d → %d tokens (budget %d)", total, remaining, budget)
+    return new_results
+
+
+def _microcompact_old_results(
+    context: LoopContext,
+    messages: list[ConversationMessage],
+    current_turn: int,
+) -> None:
+    """Compact old tool result messages in-place to save context tokens.
+
+    Runs BEFORE LCM compaction and compression — it's free (no LLM calls).
+    Only touches ToolResultBlock content in messages older than N turns.
+    """
+    if current_turn < context.microcompact_after_turns:
+        return
+
+    from prometheus.engine.messages import ToolResultBlock as TRB
+
+    # Count user messages from the end to identify the "fresh" window
+    user_msg_count = 0
+    fresh_boundary = len(messages)
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if hasattr(msg, "role") and msg.role == "user":
+            user_msg_count += 1
+            if user_msg_count >= context.microcompact_after_turns:
+                fresh_boundary = i
+                break
+
+    compacted = 0
+    for i in range(fresh_boundary):
+        msg = messages[i]
+        if not hasattr(msg, "content") or not isinstance(msg.content, list):
+            continue
+        for j, block in enumerate(msg.content):
+            if not isinstance(block, TRB):
+                continue
+            if block.is_error:
+                continue
+            content = block.content
+            if "[content pruned" in content or "[microcompacted]" in content:
+                continue  # Already compacted by compression.py or us
+            if len(content) <= context.microcompact_keep_chars:
+                continue
+
+            # Check LCM ingestion for keep_chars decision
+            keep_chars = context.microcompact_keep_chars
+            if context.lcm_engine is not None and hasattr(context.lcm_engine, "is_ingested"):
+                if not context.lcm_engine.is_ingested(getattr(block, "tool_use_id", "")):
+                    keep_chars = context.microcompact_keep_chars_no_lcm
+            elif context.lcm_engine is None:
+                keep_chars = context.microcompact_keep_chars_no_lcm
+
+            # Extract tool name from the block or content
+            first_line = content.split("\n", 1)[0][:80]
+            summary = content[:keep_chars]
+            msg.content[j] = TRB(
+                tool_use_id=block.tool_use_id,
+                content=f"[microcompacted] {first_line}...\n{summary}",
+                is_error=False,
+            )
+            compacted += 1
+
+    if compacted:
+        log.debug("Microcompacted %d old tool results (turn %d)", compacted, current_turn)
 
 
 async def _dispatch_tool_calls(
@@ -562,6 +705,21 @@ async def _execute_tool_call(
             is_error=True,
         )
 
+    # Lucky guess: tool is registered but wasn't in the active prompt schema
+    if context.tool_loader is not None and hasattr(context.tool_loader, "_deferred_enabled"):
+        if context.tool_loader._deferred_enabled:
+            loaded_names = {s["name"] for s in context.tool_loader.active_schemas()}
+            if tool_name not in loaded_names:
+                log.info("Lucky guess: model called deferred tool %s", tool_name)
+                if context.telemetry is not None:
+                    context.telemetry.record(
+                        model=context.model,
+                        tool_name=tool_name,
+                        success=True,
+                        error_type="lucky_guess",
+                        error_detail=f"Tool {tool_name} called without being in prompt schema",
+                    )
+
     try:
         parsed_input = tool.input_model.model_validate(tool_input)
     except Exception as exc:
@@ -715,6 +873,7 @@ class AgentLoop:
         model_router: object | None = None,
         divergence_detector: object | None = None,
         post_result_hooks: list[object] | None = None,
+        tool_loader: object | None = None,
     ) -> None:
         self._provider = provider
         self._model = model
@@ -734,6 +893,8 @@ class AgentLoop:
         self._divergence_detector = divergence_detector
         # Sprint 20: LSP post-result hooks
         self._post_result_hooks = post_result_hooks
+        # Tool Calling Middle Layer
+        self._tool_loader = tool_loader
 
     def set_post_task_hook(self, hook: Callable) -> None:
         """Register a callback invoked after each completed task.
@@ -778,6 +939,7 @@ class AgentLoop:
             model_router=self._model_router,
             divergence_detector=self._divergence_detector,
             post_result_hooks=self._post_result_hooks,
+            tool_loader=self._tool_loader,
         )
 
         last_text = ""

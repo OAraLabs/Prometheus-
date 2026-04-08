@@ -26,6 +26,7 @@ prometheus/
   mcp/          MCP integration — tool servers + Context7 (Sprint 12) ✓
   evals/        DeepEval evaluation suite + G-Eval metrics (Sprint 13) ✓
   tracing/      Phoenix/OpenTelemetry trace visualization (Sprint 13) ✓
+  infra/        AnatomyScanner + Doctor diagnostics (Sprint 18, 24) ✓
 ```
 
 ## Key Conventions
@@ -2568,7 +2569,7 @@ class JudgeVerdict:
     raw_response: str
 
 class PrometheusJudge:
-    def __init__(self, base_url="http://GPU_HOST:8080", model=None, timeout=120.0)
+    def __init__(self, base_url="http://100.110.140.39:8080", model=None, timeout=120.0)
 
     # Constrained JSON scoring (primary — used by metrics, Sprint 14)
     async def evaluate(task_input, agent_output, expected_behavior, tool_trace=None) -> JudgeVerdict
@@ -3228,8 +3229,8 @@ was passed, giving the model no indication a photo existed.
 ### Infrastructure: llama-server vision on 4090
 
 ```
-~/.config/systemd/user/llama-server.service  (on gpu-node)
-  --mmproj /home/gpu-node/models/mmproj-BF16.gguf   # Gemma 4 vision projector
+~/.config/systemd/user/llama-server.service  (on oara-4090)
+  --mmproj /home/oara-4090/models/mmproj-BF16.gguf   # Gemma 4 vision projector
   --ubatch-size 2048 --batch-size 2048                # required for image tokens
 ```
 
@@ -3963,3 +3964,245 @@ tests/
 | `setup_wizard.py` (Sprint 6) | `_setup_identity()` before provider step; `_check_vision_hint()` after smoke test |
 | `__main__.py` (Sprint 0) | `identity` subcommand with `--show` and `--regenerate` flags |
 | `scripts/daemon.py` (Sprint 6) | Calls `detect_vision()` after `detect_loaded_model()`, logs hint for vision-capable models |
+
+---
+
+## Sprint 24: DOCTOR — Model Registry + Diagnostics
+
+### Model Registry
+
+```yaml
+# config/model_registry.yaml
+# Maps model families → capabilities + match patterns
+# 9 families: gemma-4, gemma-3, qwen-3, qwen-2.5, llama-3, mistral, deepseek, phi, command-r
+
+models:
+  gemma-4:
+    display_name: "Google Gemma 4"
+    match_patterns: ["gemma-4", "gemma_4", "gemma4"]
+    capabilities:
+      vision:    { supported: true,  requires: "mmproj", setup_hint: "..." }
+      function_calling: { supported: true }
+      streaming: { supported: true }
+    context_sizes: [8192, 32768, 131072]
+```
+
+```python
+# src/prometheus/infra/doctor.py
+
+def match_model(model_name: str, registry: dict) -> dict | None
+    # Case-insensitive substring match against match_patterns
+    # Returns the matched family dict or None
+```
+
+### Doctor class
+
+```python
+# src/prometheus/infra/doctor.py
+
+@dataclass
+class DiagnosticCheck:
+    name: str          # "Vision", "GPU", "Python"
+    category: str      # "platform" | "connectivity" | "model" | "resources"
+    status: str        # "ok" | "warning" | "error" | "info"
+    message: str       # Human-readable result
+    fix: str | None    # Actionable remediation (for warnings/errors)
+
+@dataclass
+class DiagnosticReport:
+    model_name: str | None
+    model_family: str | None
+    checks: list[DiagnosticCheck]
+    timestamp: str
+    CATEGORY_ORDER = ["platform", "connectivity", "model", "resources"]
+
+    @property has_warnings -> bool
+    @property has_errors -> bool
+    def checks_by_category() -> dict[str, list[DiagnosticCheck]]
+
+class Doctor:
+    def __init__(self, config: dict | None = None)
+        # Loads model_registry.yaml from config dir
+    async def diagnose(self, state: AnatomyState) -> DiagnosticReport
+        # Runs all checks grouped by category:
+        #   Platform:     python_version, uv, config_valid, data_dir, bootstrap_files, dependencies
+        #   Connectivity: inference, telegram_token, tailscale
+        #   Model:        model_loaded, vision, function_calling
+        #   Resources:    gpu, disk, whisper
+```
+
+### /doctor command
+
+```python
+# src/prometheus/gateway/commands.py
+
+async def cmd_doctor(config: dict | None = None) -> str
+    # Scans via AnatomyScanner, runs Doctor.diagnose(), formats report
+    # Output grouped by category with section headers:
+    #   -- Platform --
+    #   -- Connectivity --
+    #   -- Model --
+    #   -- Resources --
+    # Status icons: ok, warning, error, info
+    # Fix instructions shown for warnings/errors
+    # Summary line: error count / warning count / all passed
+```
+
+### RetryEngine escalation fix
+
+```python
+# src/prometheus/adapter/retry.py
+
+class RetryAction(str, Enum):
+    RETRY = "RETRY"
+    ABORT = "ABORT"
+    ESCALATE = "ESCALATE"   # NEW — escalate to stronger model via router
+
+class RetryEngine:
+    def __init__(self, max_retries: int = 3, router: Any = None)
+        # router: optional ModelRouter; if provided and escalation_enabled,
+        # returns ESCALATE instead of ABORT when retries exhausted
+```
+
+### File tree
+```
+config/
+  model_registry.yaml          — 9 model families, capabilities, match patterns
+  prometheus.yaml               — +doctor: section (startup_check, registry_file)
+src/prometheus/infra/
+  doctor.py                    — Doctor class, DiagnosticCheck/Report, match_model()
+src/prometheus/gateway/
+  commands.py                  — +cmd_doctor() formatter, +/doctor in cmd_help()
+  telegram.py                  — +_cmd_doctor handler, +prometheus_config param, +BotCommand("doctor")
+src/prometheus/adapter/
+  retry.py                     — +RetryAction.ESCALATE, +router kwarg
+scripts/
+  daemon.py                   — +prometheus_config passthrough, +startup doctor check
+tests/
+  test_doctor.py               — 59 tests (registry matching, all checks, categories, formatting)
+  test_wiring.py               — +integration tests (DoctorWiring class)
+```
+
+### Wiring into existing modules
+
+| Existing module | How Sprint 24 connects |
+|---|---|
+| `infra/anatomy.py` (Sprint 18) | Doctor.diagnose() takes AnatomyState from scanner.scan() |
+| `gateway/telegram.py` (Sprint 6) | +`prometheus_config` constructor param, `_cmd_doctor` handler, BotCommand menu |
+| `gateway/commands.py` (Sprint 6) | +`cmd_doctor()`, `/doctor` added to `cmd_help()` listing |
+| `scripts/daemon.py` (Sprint 6) | Passes full config to TelegramAdapter; runs startup doctor check after anatomy scan |
+| `adapter/retry.py` (Sprint 3) | +`ESCALATE` action, +`router` kwarg — escalates to stronger model when retries exhausted |
+| `config/prometheus.yaml` (Sprint 0) | +`doctor:` section with `startup_check` and `registry_file` |
+
+---
+
+## Sprint 25: Tool Calling Middle Layer
+
+### Feature 1: Deferred Tool Loading + ToolSearchTool
+
+```python
+# src/prometheus/tools/tool_search.py
+class ToolSearchTool(BaseTool):
+    name = "tool_search"
+    # search: fuzzy match query against names + descriptions (top 5)
+    # select: exact name lookup, return full schema
+    input_model = ToolSearchInput  # query: str, action: "search" | "select"
+    def set_registry(registry: ToolRegistry) -> None  # inject after construction
+```
+
+```yaml
+# config/prometheus.yaml
+tools:
+  deferred_loading:
+    enabled: false          # all schemas in prompt by default
+    always_loaded: [bash, read_file, write_file, edit_file, grep, glob, tool_search]
+    mcp_always_deferred: true
+    search_mcp: true
+```
+
+- `DynamicToolLoader` extended with `deferred_config` — delegates to `always_loaded` when enabled, falls back to keyword matching when disabled
+- Wired into `LoopContext.tool_loader` → `run_loop()` uses it for `tool_schema`
+- Lucky guess telemetry: if model calls a deferred tool, it executes + logs `error_type="lucky_guess"`
+
+### Feature 2: Cross-Result Token Budget
+
+```yaml
+context:
+  tool_results_turn_budget: 8000  # total budget for ALL results in one turn
+```
+
+- `_apply_cross_result_budget()` in `agent_loop.py` — runs after per-result truncation, before conversation injection
+- Proportionally truncates results to fit budget; read-only tools truncated first, mutating tools preserved
+
+### Feature 3: Tool Result MicroCompaction
+
+```yaml
+context:
+  microcompact_after_turns: 3
+  microcompact_keep_chars: 200
+  microcompact_keep_chars_no_lcm: 500  # if LCM hasn't ingested
+```
+
+- `_microcompact_old_results()` in `agent_loop.py` — runs at start of each turn, before LCM/compression
+- Replaces old ToolResultBlock content with `[microcompacted] {first_line}...\n{summary}`
+- Skips error results, already-pruned results, and results in the fresh window
+
+### Feature 4: Telemetry Dashboard
+
+```python
+# src/prometheus/telemetry/dashboard.py
+class ToolDashboard:
+    def get_stats(hours: int = 24) -> dict
+    # Returns: success_rate_by_tool, most_called, avg_latency_by_tool,
+    #          circuit_breaker_trips, lucky_guesses, adapter_repairs
+```
+
+- `/tools` Telegram command calls `ToolDashboard.get_stats()` and formats for chat
+- Presentation-agnostic: returns dict, can be served via Beacon `/api/tools/stats`
+
+### Feature 5: Adaptive Per-Tool Strictness
+
+```yaml
+adapter:
+  adaptive_strictness: true
+  strictness_window: 100
+  strictness_threshold: 0.8
+```
+
+- `ModelAdapter` tracks per-tool success history in `_tool_call_history`
+- When success rate drops below threshold (10+ calls), bumps strictness: NONE→MEDIUM→STRICT
+- Precedence: manual override > adaptive > cloud auto-config > model default
+- `set_tool_strictness()` for manual per-tool overrides
+
+### Feature 6: Structured Error Feedback
+
+```python
+# Added to BaseTool:
+example_call: dict[str, Any] | None = None
+# Populated on 6 core tools (bash, file_read, file_write, file_edit, grep, glob)
+```
+
+- `_build_structured_error()` in `validator.py` — includes: what failed, available tools, expected format, example call
+- Called from `validate()` and `repair()` failure paths
+
+### Adapter: Model Capability-Based Configuration
+
+`create_adapter()` now checks `model_registry.yaml` capabilities:
+- `function_calling.supported: true` + `requires: null` → PassthroughFormatter/NONE (server handles it)
+- Fallback: model-specific formatter + MEDIUM strictness
+- Gemma 4, Qwen on llama.cpp → skip adapter (native tool calling)
+
+### Wiring Summary
+
+| Existing module | How this sprint connects |
+|---|---|
+| `engine/agent_loop.py` | +`tool_loader`, +`_apply_cross_result_budget()`, +`_microcompact_old_results()`, +lucky_guess telemetry |
+| `adapter/__init__.py` | +`adaptive_strictness`, +`record_tool_call()`, +`get_effective_strictness()`, +`set_tool_strictness()` |
+| `adapter/validator.py` | +`_build_structured_error()` — structured errors with examples |
+| `tools/base.py` | +`example_call` class attribute on BaseTool |
+| `context/dynamic_tools.py` | +`deferred_config`, +`_deferred_schemas()`, +`deferred_count` |
+| `tools/tool_search.py` (new) | ToolSearchTool — fuzzy search + exact select against registry |
+| `telemetry/dashboard.py` (new) | ToolDashboard — structured stats from telemetry SQLite |
+| `gateway/telegram.py` | +`/tools` command handler |
+| `__main__.py` | +`_has_native_tool_calling()` — model_registry.yaml capability check |
+| `config/prometheus.yaml` | +`tools.deferred_loading`, +`adapter`, +`context.tool_results_turn_budget`, +microcompact settings |

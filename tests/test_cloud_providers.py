@@ -283,17 +283,19 @@ class TestCreateAdapter:
         adapter = create_adapter({"provider": "xai"})
         assert isinstance(adapter.formatter, PassthroughFormatter)
 
-    def test_llama_cpp_gemma_gets_gemma_formatter(self):
+    def test_llama_cpp_gemma_native_tool_calling(self):
+        """Gemma 4 has native function_calling in model_registry → Passthrough/NONE."""
         from prometheus.__main__ import create_adapter
-        from prometheus.adapter.formatter import GemmaFormatter
+        from prometheus.adapter.formatter import PassthroughFormatter
         adapter = create_adapter({"provider": "llama_cpp", "model": "gemma4-26b"})
-        assert isinstance(adapter.formatter, GemmaFormatter)
+        assert isinstance(adapter.formatter, PassthroughFormatter)
 
-    def test_llama_cpp_qwen_gets_qwen_formatter(self):
+    def test_llama_cpp_qwen_native_tool_calling(self):
+        """Qwen has native function_calling in model_registry → Passthrough/NONE."""
         from prometheus.__main__ import create_adapter
-        from prometheus.adapter.formatter import QwenFormatter
+        from prometheus.adapter.formatter import PassthroughFormatter
         adapter = create_adapter({"provider": "llama_cpp", "model": "qwen3.5-32b"})
-        assert isinstance(adapter.formatter, QwenFormatter)
+        assert isinstance(adapter.formatter, PassthroughFormatter)
 
     def test_cloud_provider_strictness_none(self):
         from prometheus.__main__ import create_adapter

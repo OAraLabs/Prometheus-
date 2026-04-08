@@ -40,6 +40,7 @@ class BaseTool(ABC):
     name: str
     description: str
     input_model: type[BaseModel]
+    example_call: dict[str, Any] | None = None  # Static example for error feedback
 
     @abstractmethod
     async def execute(self, arguments: BaseModel, context: ToolExecutionContext) -> ToolResult:

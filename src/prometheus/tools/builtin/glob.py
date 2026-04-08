@@ -28,6 +28,7 @@ class GlobTool(BaseTool):
     name = "glob"
     description = "List files matching a glob pattern."
     input_model = GlobToolInput
+    example_call = {"pattern": "**/*.py"}
 
     def is_read_only(self, arguments: GlobToolInput) -> bool:
         del arguments

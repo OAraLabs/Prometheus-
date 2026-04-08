@@ -65,11 +65,20 @@ class ModelAdapter:
         formatter: ModelPromptFormatter | None = None,
         strictness: str | Strictness = Strictness.NONE,
         max_retries: int = 3,
+        adaptive_strictness: bool = False,
+        strictness_threshold: float = 0.8,
+        strictness_window: int = 100,
     ) -> None:
         self.formatter = formatter or AnthropicFormatter()
         self.validator = ToolCallValidator(strictness=strictness)
         self.retry = RetryEngine(max_retries=max_retries)
         self.enforcer = StructuredOutputEnforcer()
+        self._base_strictness = Strictness(strictness) if isinstance(strictness, str) else strictness
+        self._adaptive_strictness = adaptive_strictness
+        self._strictness_threshold = strictness_threshold
+        self._strictness_window = strictness_window
+        self._tool_strictness: dict[str, Strictness] = {}  # per-tool overrides
+        self._tool_call_history: dict[str, list[bool]] = {}  # per-tool success history
 
     # ------------------------------------------------------------------
     # Formatting
@@ -105,14 +114,36 @@ class ModelAdapter:
         Returns (final_tool_name, final_tool_input, repairs_made).
         Raises ValueError if validation fails and repair also fails.
         """
+        # Use per-tool strictness if adaptive mode is on
+        if self._adaptive_strictness and tool_name:
+            effective = self.get_effective_strictness(tool_name)
+            if effective != self._base_strictness:
+                orig_strictness = self.validator.strictness
+                self.validator.strictness = effective
+                try:
+                    return self._do_validate_and_repair(tool_name, tool_input, tool_registry)
+                finally:
+                    self.validator.strictness = orig_strictness
+        return self._do_validate_and_repair(tool_name, tool_input, tool_registry)
+
+    def _do_validate_and_repair(
+        self,
+        tool_name: str,
+        tool_input: Any,
+        tool_registry: Any,
+    ) -> tuple[str, dict[str, Any], list[str]]:
+        """Internal validate + repair logic."""
         result = self.validator.validate(tool_name, tool_input, tool_registry)
         if result.valid:
+            self.record_tool_call(tool_name, success=True)
             return tool_name, tool_input, []
 
         repair = self.validator.repair(tool_name, tool_input, result.error, tool_registry)
         if repair.repaired:
+            self.record_tool_call(tool_name, success=True)
             return repair.tool_name, repair.tool_input, repair.repairs_made
 
+        self.record_tool_call(tool_name, success=False)
         raise ValueError(
             f"Tool call validation failed and could not be repaired: {result.error}"
         )
@@ -154,3 +185,49 @@ class ModelAdapter:
     ) -> tuple[RetryAction, str]:
         """Decide whether to retry and build the retry prompt."""
         return self.retry.handle_failure(tool_name, error, tool_registry)
+
+    # ------------------------------------------------------------------
+    # Adaptive per-tool strictness
+    # ------------------------------------------------------------------
+
+    def record_tool_call(self, tool_name: str, success: bool) -> None:
+        """Record a tool call outcome for adaptive strictness tuning."""
+        if not self._adaptive_strictness:
+            return
+        history = self._tool_call_history.setdefault(tool_name, [])
+        history.append(success)
+        # Keep only the last N calls
+        if len(history) > self._strictness_window:
+            self._tool_call_history[tool_name] = history[-self._strictness_window:]
+        # Check if strictness needs bumping
+        if len(history) >= 10:  # need at least 10 calls to judge
+            rate = sum(history) / len(history)
+            if rate < self._strictness_threshold:
+                self._bump_tool_strictness(tool_name, rate)
+
+    def _bump_tool_strictness(self, tool_name: str, rate: float) -> None:
+        """Increase strictness for a specific tool based on failure rate."""
+        current = self._tool_strictness.get(tool_name, self._base_strictness)
+        if current == Strictness.NONE:
+            new = Strictness.MEDIUM
+        elif current == Strictness.MEDIUM:
+            new = Strictness.STRICT
+        else:
+            return  # Already at max
+        self._tool_strictness[tool_name] = new
+        import logging
+        logging.getLogger(__name__).info(
+            "Adaptive strictness: %s bumped %s → %s (success rate %.1f%%)",
+            tool_name, current.value, new.value, rate * 100,
+        )
+
+    def get_effective_strictness(self, tool_name: str) -> Strictness:
+        """Get the effective strictness for a tool.
+
+        Priority: manual per-tool override > adaptive > base model default.
+        """
+        return self._tool_strictness.get(tool_name, self._base_strictness)
+
+    def set_tool_strictness(self, tool_name: str, strictness: Strictness) -> None:
+        """Manually override strictness for a specific tool."""
+        self._tool_strictness[tool_name] = strictness

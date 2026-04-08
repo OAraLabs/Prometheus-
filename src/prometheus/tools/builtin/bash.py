@@ -39,6 +39,7 @@ class BashTool(BaseTool):
     name = "bash"
     description = "Run a shell command in the local repository."
     input_model = BashToolInput
+    example_call = {"command": "ls -la"}
 
     def __init__(
         self,

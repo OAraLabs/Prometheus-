@@ -188,6 +188,12 @@ def create_tool_registry(security_cfg: dict[str, Any], security_gate=None) -> An
     ]:
         registry.register(tool)
 
+    # ToolSearchTool — always loaded, enables deferred tool loading
+    from prometheus.tools.tool_search import ToolSearchTool
+    ts = ToolSearchTool()
+    ts.set_registry(registry)
+    registry.register(ts)
+
     # Sprint 11: Audit query tool (requires audit logger from security gate)
     if security_gate and hasattr(security_gate, '_audit') and security_gate._audit:
         registry.register(AuditQueryTool(security_gate._audit))
@@ -246,8 +252,36 @@ def create_tool_registry(security_cfg: dict[str, Any], security_gate=None) -> An
 # Adapter + Security
 # ---------------------------------------------------------------------------
 
-def create_adapter(model_cfg: dict[str, Any]):
-    """Create the model adapter layer (Sprint 3)."""
+def _has_native_tool_calling(model_name: str) -> bool:
+    """Check model_registry.yaml for native function_calling capability."""
+    import yaml
+    from pathlib import Path
+
+    registry_path = Path(__file__).resolve().parents[2] / "config" / "model_registry.yaml"
+    if not registry_path.exists():
+        return False
+    try:
+        data = yaml.safe_load(registry_path.read_text())
+        models = data.get("models", {})
+        name_lower = model_name.lower()
+        for _key, meta in models.items():
+            patterns = meta.get("match_patterns", [])
+            if any(p.lower() in name_lower for p in patterns):
+                fc = meta.get("capabilities", {}).get("function_calling", {})
+                return fc.get("supported", False) and fc.get("requires") is None
+    except Exception:
+        pass
+    return False
+
+
+def create_adapter(model_cfg: dict[str, Any], adapter_cfg: dict[str, Any] | None = None):
+    """Create the model adapter layer (Sprint 3).
+
+    Decision order:
+    1. Cloud API providers → PassthroughFormatter, NONE
+    2. Local model with native_tool_calling in model_registry → PassthroughFormatter, NONE
+    3. Local model without native → model-specific formatter, MEDIUM
+    """
     from prometheus.adapter import ModelAdapter
     from prometheus.adapter.formatter import (
         QwenFormatter,
@@ -259,20 +293,31 @@ def create_adapter(model_cfg: dict[str, Any]):
 
     provider_name = model_cfg.get("provider", "llama_cpp")
     model_name = model_cfg.get("model", "")
+    acfg = adapter_cfg or {}
+    adaptive_kwargs = {
+        "adaptive_strictness": acfg.get("adaptive_strictness", False),
+        "strictness_threshold": acfg.get("strictness_threshold", 0.8),
+        "strictness_window": acfg.get("strictness_window", 100),
+    }
 
     # Cloud providers: native tool calling, no adapter work needed
     if provider_name == "anthropic":
-        return ModelAdapter(formatter=AnthropicFormatter(), strictness="NONE")
+        return ModelAdapter(formatter=AnthropicFormatter(), strictness="NONE", **adaptive_kwargs)
     if ProviderRegistry.is_cloud(provider_name):
-        return ModelAdapter(formatter=PassthroughFormatter(), strictness="NONE")
+        return ModelAdapter(formatter=PassthroughFormatter(), strictness="NONE", **adaptive_kwargs)
 
-    # Local providers: pick formatter based on model name.
-    # Gemma 4: MEDIUM enables validation + auto-repair; empty tool names are
-    # caught by the validator's early-return check, and GBNF grammar enforcement
-    # prevents them from occurring in the first place.
+    # Local providers: check model_registry.yaml for native function_calling
+    if _has_native_tool_calling(model_name):
+        log.info(
+            "Model %s has native function_calling — using PassthroughFormatter/NONE",
+            model_name,
+        )
+        return ModelAdapter(formatter=PassthroughFormatter(), strictness="NONE", **adaptive_kwargs)
+
+    # Fallback: model-specific formatter with validation + repair
     if "gemma" in model_name.lower():
-        return ModelAdapter(formatter=GemmaFormatter(), strictness="MEDIUM")
-    return ModelAdapter(formatter=QwenFormatter(), strictness="MEDIUM")
+        return ModelAdapter(formatter=GemmaFormatter(), strictness="MEDIUM", **adaptive_kwargs)
+    return ModelAdapter(formatter=QwenFormatter(), strictness="MEDIUM", **adaptive_kwargs)
 
 
 async def create_mcp_runtime(config: dict[str, Any], registry: Any) -> Any:
@@ -745,7 +790,7 @@ def main() -> None:
 
     security_gate = create_security_gate(security_cfg)
     registry = create_tool_registry(security_cfg, security_gate=security_gate)
-    adapter = create_adapter(model_cfg)
+    adapter = create_adapter(model_cfg, config.get("adapter"))
     lcm_engine = create_lcm_engine(provider)
     system_prompt = build_system_prompt(config)
 
@@ -757,6 +802,10 @@ def main() -> None:
             telemetry = ToolCallTelemetry()
         except Exception:
             pass
+
+    # DynamicToolLoader — deferred loading support
+    from prometheus.context.dynamic_tools import DynamicToolLoader
+    tool_loader = DynamicToolLoader(registry, config.get("tools", {}).get("deferred_loading"))
 
     # Sprint 10: Model Router + Divergence Detector
     model_router = create_model_router(config)
@@ -779,6 +828,7 @@ def main() -> None:
     except Exception:
         pass
 
+    ctx_cfg = config.get("context", {})
     context = LoopContext(
         provider=provider,
         model=model_name,
@@ -792,6 +842,11 @@ def main() -> None:
         model_router=model_router,
         divergence_detector=divergence_detector,
         max_tool_iterations=config.get("model", {}).get("max_tool_iterations", 25),
+        tool_results_turn_budget=ctx_cfg.get("tool_results_turn_budget", 8000),
+        microcompact_after_turns=ctx_cfg.get("microcompact_after_turns", 3),
+        microcompact_keep_chars=ctx_cfg.get("microcompact_keep_chars", 200),
+        microcompact_keep_chars_no_lcm=ctx_cfg.get("microcompact_keep_chars_no_lcm", 500),
+        tool_loader=tool_loader,
     )
 
     # Generate session ID

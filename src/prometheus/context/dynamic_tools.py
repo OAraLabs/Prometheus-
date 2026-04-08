@@ -75,10 +75,20 @@ class DynamicToolLoader:
 
     Args:
         registry: Populated ToolRegistry (all available tools).
+        deferred_config: Optional config dict from tools.deferred_loading.
     """
 
-    def __init__(self, registry: ToolRegistry) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        deferred_config: dict[str, Any] | None = None,
+    ) -> None:
         self._registry = registry
+        self._deferred = deferred_config or {}
+        self._deferred_enabled = self._deferred.get("enabled", False)
+        self._always_loaded: frozenset[str] = frozenset(
+            self._deferred.get("always_loaded", [])
+        ) if self._deferred_enabled else frozenset()
 
     def active_schemas(
         self,
@@ -96,6 +106,10 @@ class DynamicToolLoader:
         Returns:
             List of tool schemas in Anthropic API format.
         """
+        # Deferred loading: only include always_loaded tools in the prompt
+        if self._deferred_enabled:
+            return self._deferred_schemas()
+
         if task_description is None:
             return self._registry.to_api_schema()
 
@@ -132,6 +146,23 @@ class DynamicToolLoader:
         if tool is None:
             return None
         return tool.to_api_schema()
+
+    def _deferred_schemas(self) -> list[dict[str, Any]]:
+        """Return only schemas for always_loaded tools (deferred mode)."""
+        schemas = []
+        for tool in self._registry.list_tools():
+            if tool.name in self._always_loaded:
+                schemas.append(tool.to_api_schema())
+        return schemas
+
+    @property
+    def deferred_count(self) -> int:
+        """Number of tools deferred (not in prompt) when deferred loading is on."""
+        if not self._deferred_enabled:
+            return 0
+        total = len(self._registry.list_tools())
+        loaded = len(self._always_loaded)
+        return max(0, total - loaded)
 
     def all_schemas(self) -> list[dict[str, Any]]:
         """Return schemas for every registered tool."""

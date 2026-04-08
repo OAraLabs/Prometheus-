@@ -28,6 +28,7 @@ class FileWriteTool(BaseTool):
     name = "write_file"
     description = "Create or overwrite a text file in the local repository."
     input_model = FileWriteToolInput
+    example_call = {"file_path": "/path/to/file", "content": "file contents"}
 
     async def execute(
         self,

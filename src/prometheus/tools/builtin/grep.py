@@ -31,6 +31,7 @@ class GrepTool(BaseTool):
     name = "grep"
     description = "Search file contents with a regular expression."
     input_model = GrepToolInput
+    example_call = {"pattern": "TODO", "path": "."}
 
     def is_read_only(self, arguments: GrepToolInput) -> bool:
         del arguments

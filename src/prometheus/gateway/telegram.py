@@ -141,6 +141,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("doctor", self._cmd_doctor))
         self._app.add_handler(CommandHandler("profile", self._cmd_profile))
         self._app.add_handler(CommandHandler("beacon", self._cmd_beacon))
+        self._app.add_handler(CommandHandler("tools", self._cmd_tools))
         # Sprint 15b GRAFT: approval queue commands
         self._app.add_handler(CommandHandler("approve", self._cmd_approve))
         self._app.add_handler(CommandHandler("deny", self._cmd_deny))
@@ -394,6 +395,38 @@ class TelegramAdapter(BasePlatformAdapter):
             lines.append("\nSENTINEL: unavailable")
 
         await self.send(update.effective_chat.id, "\n".join(lines), parse_mode=None)
+
+    async def _cmd_tools(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /tools command — tool call telemetry dashboard."""
+        if update.effective_chat is None:
+            return
+        try:
+            from prometheus.telemetry.dashboard import ToolDashboard
+            dashboard = ToolDashboard()
+            stats = dashboard.get_stats(hours=24)
+
+            lines = ["Tool Call Stats (24h)\n"]
+            lines.append(f"Total calls: {stats['total_calls']}")
+            lines.append(f"Success rate: {stats['overall_success_rate']:.0%}")
+
+            if stats["most_called"]:
+                lines.append("\nMost called:")
+                for name, count in stats["most_called"][:5]:
+                    rate = stats["success_rate_by_tool"].get(name, 0)
+                    lines.append(f"  {name}: {count} calls ({rate:.0%} ok)")
+
+            if stats["circuit_breaker_trips"]:
+                lines.append(f"\nCircuit breaker trips: {stats['circuit_breaker_trips']}")
+            if stats["adapter_repairs"]:
+                lines.append(f"Adapter repairs: {stats['adapter_repairs']}")
+            if stats["lucky_guesses"]:
+                lines.append(f"Lucky guesses (deferred): {stats['lucky_guesses']}")
+
+            await self.send(update.effective_chat.id, "\n".join(lines), parse_mode=None)
+        except Exception as exc:
+            await self.send(update.effective_chat.id, f"Tool stats unavailable: {exc}", parse_mode=None)
 
     async def _cmd_wiki(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

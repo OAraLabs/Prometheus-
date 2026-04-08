@@ -152,9 +152,13 @@ async def run_daemon(args: argparse.Namespace) -> None:
     # Tool registry — same tools as CLI mode
     registry = build_tool_registry(security_cfg=security_config)
 
+    # DynamicToolLoader — deferred loading support
+    from prometheus.context.dynamic_tools import DynamicToolLoader
+    tool_loader = DynamicToolLoader(registry, config.get("tools", {}).get("deferred_loading"))
+
     # Sprint 15 wiring fix: daemon was missing adapter, security_gate,
     # model_router, and divergence_detector — all were built but not connected.
-    adapter = create_adapter(model_config)
+    adapter = create_adapter(model_config, config.get("adapter"))
     security_gate = create_security_gate(security_config)
     model_router = create_model_router(config)
     divergence_detector = create_divergence_detector(config)
@@ -235,6 +239,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
         divergence_detector=divergence_detector,
         post_result_hooks=post_result_hooks or None,
         max_tool_iterations=model_config.get("max_tool_iterations", 25),
+        tool_loader=tool_loader,
     )
 
     # Shared session manager for all gateways

@@ -24,8 +24,24 @@ context:
   effective_limit: 24000
   compression_trigger: 0.75
   tool_result_max: 4000
+  tool_results_turn_budget: 8000            # max tokens across all results per turn
   reserved_output: 2000
   fresh_tail_count: 32
+  microcompact_after_turns: 3               # compact tool results older than N turns
+  microcompact_keep_chars: 200
+  microcompact_keep_chars_no_lcm: 500
+
+tools:
+  deferred_loading:
+    enabled: false                          # all tool schemas in prompt by default
+    always_loaded: [bash, read_file, write_file, edit_file, grep, glob, tool_search]
+    mcp_always_deferred: true
+    search_mcp: true
+
+adapter:
+  adaptive_strictness: false                # auto-tune per-tool strictness from telemetry
+  strictness_window: 100
+  strictness_threshold: 0.8
 
 security:
   permission_mode: "default"

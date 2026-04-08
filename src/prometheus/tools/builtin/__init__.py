@@ -30,6 +30,7 @@ from prometheus.tools.builtin.web_search import WebSearchTool
 from prometheus.tools.builtin.wiki_compile import WikiCompileTool
 from prometheus.tools.builtin.wiki_lint_tool import WikiLintTool
 from prometheus.tools.builtin.wiki_query import WikiQueryTool
+from prometheus.tools.tool_search import ToolSearchTool
 
 __all__ = [
     "AgentTool",
@@ -62,4 +63,5 @@ __all__ = [
     "WikiCompileTool",
     "WikiLintTool",
     "WikiQueryTool",
+    "ToolSearchTool",
 ]
