@@ -736,16 +736,25 @@ class TelegramAdapter(BasePlatformAdapter):
         api_port = web.get("api_port", 8005)
         ws_port = web.get("ws_port", 8010)
 
+        # Resolve a routable IP for inline button URLs (Telegram rejects bare hostnames)
+        try:
+            import subprocess
+            ip = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
+            link_host = ip.stdout.strip() if ip.returncode == 0 and ip.stdout.strip() else host
+        except Exception:
+            import socket
+            link_host = socket.gethostbyname(host)
+
         text = (
             f"Beacon\n"
-            f"  REST API:  {host}:{api_port}\n"
-            f"  WebSocket: ws://{host}:{ws_port}\n"
-            f"  Dashboard: {host}:3000"
+            f"  REST API:  {link_host}:{api_port}\n"
+            f"  WebSocket: ws://{link_host}:{ws_port}\n"
+            f"  Dashboard: {link_host}:3000"
         )
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("Open API", url=f"http://{host}:{api_port}/api/status"),
-                InlineKeyboardButton("Open Dashboard", url=f"http://{host}:3000"),
+                InlineKeyboardButton("Open API", url=f"http://{link_host}:{api_port}/api/status"),
+                InlineKeyboardButton("Open Dashboard", url=f"http://{link_host}:3000"),
             ],
         ])
         await self._app.bot.send_message(
