@@ -54,10 +54,16 @@ class OllamaProvider(ModelProvider):
         base_url: str = "http://localhost:11434",
         timeout: float = 120.0,
         force_json: bool = False,
+        grammar: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._force_json = force_json
+        self._grammar = grammar
+
+    def set_grammar(self, grammar: str | None) -> None:
+        """Set GBNF grammar for constrained decoding (llama.cpp extension)."""
+        self._grammar = grammar
 
     async def stream_message(
         self, request: ApiMessageRequest
@@ -109,6 +115,9 @@ class OllamaProvider(ModelProvider):
 
         if self._force_json:
             payload["format"] = "json"
+
+        if self._grammar:
+            payload["grammar"] = self._grammar
 
         if request.tools:
             payload["tools"] = [

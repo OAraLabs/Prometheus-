@@ -807,8 +807,7 @@ def main() -> None:
         # Wire GBNF grammar for llama.cpp constrained decoding
         model_cfg = config.get("model", {})
         if (
-            model_cfg.get("provider", "llama_cpp") == "llama_cpp"
-            and model_cfg.get("grammar_enforcement", True)
+            model_cfg.get("grammar_enforcement", True)
             and hasattr(provider, "set_grammar")
             and adapter is not None
         ):

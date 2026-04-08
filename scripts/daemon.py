@@ -208,8 +208,7 @@ async def run_daemon(args: argparse.Namespace) -> None:
     # Helper: regenerate GBNF grammar after tool set changes
     def _update_grammar() -> None:
         if (
-            model_config.get("provider", "llama_cpp") == "llama_cpp"
-            and model_config.get("grammar_enforcement", True)
+            model_config.get("grammar_enforcement", True)
             and hasattr(provider, "set_grammar")
             and adapter is not None
         ):
