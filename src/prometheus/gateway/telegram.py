@@ -199,6 +199,73 @@ class TelegramAdapter(BasePlatformAdapter):
 
         logger.info("Telegram adapter started (polling)")
 
+        # Send startup greeting to create session + signal readiness
+        await self._send_startup_greeting()
+
+    def _last_chat_id_path(self) -> str:
+        """Path to persist the last active Telegram chat ID across restarts."""
+        from prometheus.config import get_config_dir
+        return str(get_config_dir() / "last_telegram_chat_id")
+
+    def _save_chat_id(self, chat_id: int) -> None:
+        """Persist chat ID so startup greeting works after restart."""
+        try:
+            import os
+            path = self._last_chat_id_path()
+            with open(path, "w") as f:
+                f.write(str(chat_id))
+        except Exception:
+            pass
+
+    def _load_chat_id(self) -> int | None:
+        """Load persisted chat ID from last session."""
+        try:
+            with open(self._last_chat_id_path()) as f:
+                return int(f.read().strip())
+        except Exception:
+            return None
+
+    async def _send_startup_greeting(self) -> None:
+        """Send a short greeting on daemon start to create the Telegram session
+        and signal to the user (in Telegram + Beacon) that Prometheus is online."""
+        import random
+        greetings = [
+            "Online and ready. What can I help with?",
+            "Systems up. What are we working on?",
+            "Back online — ready when you are.",
+            "Prometheus is live. What's on the agenda?",
+            "Daemon restarted. All systems nominal — fire away.",
+        ]
+        msg = random.choice(greetings)
+
+        # Find chat ID: persisted file → session manager → config
+        chat_id: int | None = self._load_chat_id()
+
+        if not chat_id and self.session_mgr:
+            for key in list(self.session_mgr._sessions.keys()):
+                if key.startswith("telegram:"):
+                    try:
+                        chat_id = int(key.split(":", 1)[1])
+                        break
+                    except (ValueError, IndexError):
+                        pass
+
+        if not chat_id and self.config.allowed_chat_ids:
+            chat_id = self.config.allowed_chat_ids[0]
+
+        if chat_id:
+            try:
+                result = await self.send(chat_id, msg)
+                if result.success:
+                    logger.info("Sent startup greeting to chat %d", chat_id)
+                    if self.session_mgr:
+                        session_key = f"telegram:{chat_id}"
+                        self.session_mgr.get_or_create(session_key)
+            except Exception as exc:
+                logger.warning("Failed to send startup greeting: %s", exc)
+        else:
+            logger.info("No known chat ID for startup greeting (will create session on first message)")
+
     async def stop(self) -> None:
         """Graceful shutdown of the Telegram bot."""
         if self._app and self._running:
@@ -258,6 +325,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.user_id,
             )
             return
+
+        # Persist chat ID for startup greeting on next restart
+        self._save_chat_id(event.chat_id)
 
         await self._dispatch_to_agent(event)
 
