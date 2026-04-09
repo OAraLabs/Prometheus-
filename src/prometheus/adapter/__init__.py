@@ -54,7 +54,8 @@ class ModelAdapter:
       - "off"   — API enforces structure (Anthropic, OpenAI). Skip everything.
       - "light" — Model has native tool calling but server doesn't guarantee
                   structure (Gemma 4/Qwen on llama.cpp). GBNF on, validator
-                  at NONE, enforcer off, max_retries=1.
+                  at NONE, enforcer ON (model may emit tool calls as text),
+                  max_retries=1.
       - "full"  — Model lacks tool calling training. Full adapter pipeline.
 
     Args:
@@ -114,7 +115,12 @@ class ModelAdapter:
 
         Returns (formatted_system_prompt, formatted_tools).
         """
-        formatted_tools = self.formatter.format_tools(tools)
+        # Tier off/light: server handles tool format natively (--jinja / peg-gemma4).
+        # Only rewrite tool schemas for tier full where they go in the prompt.
+        if self.tier == self.TIER_FULL:
+            formatted_tools = self.formatter.format_tools(tools)
+        else:
+            formatted_tools = tools
         formatted_system = self.formatter.format_system_prompt(
             system_prompt, tools  # pass original tools for description extraction
         )
@@ -197,9 +203,11 @@ class ModelAdapter:
         tool_registry: Any = None,
     ):
         """Extract tool calls from raw model text (for models that embed JSON in prose)."""
-        # Tier off/light: model outputs structured calls, no text extraction needed
-        if self.tier in (self.TIER_OFF, self.TIER_LIGHT):
+        # Tier off: API guarantees structured output, no text extraction needed
+        if self.tier == self.TIER_OFF:
             return []
+        # Tier light + full: model may emit tool calls as <tool_call> XML or
+        # JSON in response text — the enforcer extracts them
         return self.enforcer.extract_tool_calls(text, tool_registry)
 
     # ------------------------------------------------------------------

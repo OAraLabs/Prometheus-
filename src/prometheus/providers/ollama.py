@@ -137,8 +137,14 @@ class OllamaProvider(ModelProvider):
             # the server handles tool calling natively and grammar conflicts with it
             payload["grammar"] = self._grammar
 
+        # Final safety: grammar + tools in same request = 400 from llama-server
+        if "tools" in payload and payload["tools"]:
+            payload.pop("grammar", None)
+
         url = f"{self._base_url}/v1/chat/completions"
-        log.debug("POST %s model=%s messages=%d", url, request.model, len(messages))
+        log.debug("POST %s model=%s messages=%d tools=%d grammar=%s",
+                  url, request.model, len(messages),
+                  len(payload.get("tools", [])), bool(payload.get("grammar")))
 
         accumulated_text = ""
         accumulated_tool_calls: dict[int, dict[str, Any]] = {}
