@@ -125,10 +125,49 @@ class WebSocketBridge:
                         },
                     })
 
+    async def _describe_image(self, image_path: str) -> str | None:
+        """Run vision analysis on a cached image file, matching Telegram gateway flow."""
+        try:
+            from prometheus.tools.builtin.vision import VisionTool
+            tool = VisionTool()
+            result = await tool.arun(image_path=image_path)
+            if result and not result.startswith("Error"):
+                return result
+        except Exception as exc:
+            logger.warning("Vision analysis failed for %s: %s", image_path, exc)
+        return None
+
     async def _handle_send_message(self, session_id: str, content: str) -> None:
-        """Process a user message — add to session and run agent loop if context available."""
+        """Process a user message — add to session and run agent loop if context available.
+
+        If the content contains [Image: /path/to/file] references (from Beacon
+        dashboard uploads), run vision analysis to describe the image before
+        passing to the agent — matching the Telegram gateway's flow.
+        """
         if not self.session_mgr:
             return
+
+        import re
+        # Detect image references from Beacon: [Image: /path/to/file.ext]
+        image_pattern = re.compile(r'\[Image:\s*(/[^\]]+)\]')
+        matches = image_pattern.findall(content)
+        if matches:
+            import os
+            described_parts = []
+            for img_path in matches:
+                if os.path.isfile(img_path):
+                    desc = await self._describe_image(img_path)
+                    if desc:
+                        described_parts.append(f"[Image: {desc}]")
+                    else:
+                        described_parts.append(f"[The user sent an image: {img_path}]")
+                else:
+                    described_parts.append(f"[Image reference: {img_path}]")
+            # Replace raw paths with descriptions
+            processed = content
+            for match, replacement in zip(matches, described_parts):
+                processed = processed.replace(f"[Image: {match}]", replacement, 1)
+            content = processed
 
         session = self.session_mgr.get_or_create(session_id)
         session.add_user_message(content)
