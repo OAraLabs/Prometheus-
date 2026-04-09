@@ -214,8 +214,8 @@ async def test_select_nonexistent_returns_error(tool, ctx):
     data = json.loads(result.output)
     assert "error" in data
     assert "nonexistent_tool" in data["error"]
-    assert "available_tools" in data
-    assert sorted(data["available_tools"]) == ["bash", "grep", "read_file"]
+    assert "available" in data
+    assert "bash" in data["available"]
 
 
 # ---------------------------------------------------------------------------

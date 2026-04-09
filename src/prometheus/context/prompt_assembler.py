@@ -237,22 +237,13 @@ def build_runtime_system_prompt(
         "still completing the task."
     )
 
-    # Skills listing
+    # Skills — searchable via tool_search, loaded on demand via skill tool
     if skills:
-        lines = [
-            "# Available Skills",
-            "",
-            "The following skills are available via the `skill` tool. "
-            "When a user's request matches a skill, invoke it with "
-            '`skill(name="<skill_name>")` to load detailed instructions '
-            "before proceeding.",
-            "",
-        ]
-        for skill in skills:
-            name = skill.get("name", "unknown")
-            desc = skill.get("description", "")
-            lines.append(f"- **{name}**: {desc}")
-        dynamic_sections.append("\n".join(lines))
+        dynamic_sections.append(
+            "You have additional skills available beyond your loaded tools. "
+            "Use tool_search to find skills for any task you're unsure how "
+            "to approach, then use the skill tool to load the skill's instructions."
+        )
 
     # PROMETHEUS.md project instructions
     prometheus_md = load_prometheus_md_prompt(cwd)

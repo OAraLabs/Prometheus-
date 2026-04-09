@@ -49,26 +49,31 @@ class ToolSearchInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ToolSearchTool(BaseTool):
-    """Search for available tools by name or description.
+    """Search for available tools and skills by name or description.
 
-    Use 'search' to find tools matching a query, or 'select' to load a
-    specific tool by exact name.
+    Use 'search' to find tools or skills matching a query, or 'select'
+    to load a specific tool/skill by exact name.
     """
 
     name = "tool_search"
     description = (
-        "Search for available tools by name or description. "
-        "Use 'search' to find tools matching a query, or 'select' to "
-        "load a specific tool by exact name."
+        "Search for available tools and skills by name or description. "
+        "Use 'search' to find tools or skills matching a query, or 'select' to "
+        "load a specific tool by exact name. Use the skill tool to load a skill's instructions."
     )
     input_model = ToolSearchInput
 
     def __init__(self) -> None:
         self._registry: ToolRegistry | None = None
+        self._skill_registry: Any | None = None
 
     def set_registry(self, registry: ToolRegistry) -> None:
         """Inject the tool registry (called after construction)."""
         self._registry = registry
+
+    def set_skill_registry(self, skill_registry: Any) -> None:
+        """Inject the skill registry (called after construction)."""
+        self._skill_registry = skill_registry
 
     def is_read_only(self, arguments: BaseModel) -> bool:
         del arguments
@@ -92,50 +97,74 @@ class ToolSearchTool(BaseTool):
     # -- action handlers ----------------------------------------------------
 
     def _handle_select(self, name: str) -> ToolResult:
-        """Exact-name lookup; return the full schema for one tool."""
+        """Exact-name lookup; return the full schema for one tool or skill."""
         assert self._registry is not None
         tool = self._registry.get(name)
-        if tool is None:
-            available = sorted(t.name for t in self._registry.list_tools())
-            return ToolResult(
-                output=json.dumps(
-                    {
-                        "error": f"No tool named '{name}'.",
-                        "available_tools": available,
-                    },
-                    indent=2,
-                ),
-                is_error=True,
-            )
-        return ToolResult(output=json.dumps(tool.to_api_schema(), indent=2))
+        if tool is not None:
+            result = tool.to_api_schema()
+            result["type"] = "tool"
+            return ToolResult(output=json.dumps(result, indent=2))
+
+        # Check skills
+        if self._skill_registry is not None:
+            skill = self._skill_registry.get(name)
+            if skill is not None:
+                return ToolResult(output=json.dumps({
+                    "type": "skill",
+                    "name": skill.name,
+                    "description": skill.description,
+                    "source": skill.source,
+                    "path": skill.path,
+                    "hint": f'Use skill(name="{skill.name}") to load full instructions.',
+                }, indent=2))
+
+        available = sorted(t.name for t in self._registry.list_tools())
+        if self._skill_registry is not None:
+            available.extend(f"[skill] {s.name}" for s in self._skill_registry.list_skills())
+        return ToolResult(
+            output=json.dumps({"error": f"No tool or skill named '{name}'.", "available": available}, indent=2),
+            is_error=True,
+        )
 
     def _handle_search(self, query: str) -> ToolResult:
-        """Fuzzy search across tool names and descriptions."""
+        """Fuzzy search across tool names, descriptions, AND skill names/descriptions."""
         assert self._registry is not None
         tools = self._registry.list_tools()
 
-        # Empty query: return all tool names
+        # Empty query: return all tool + skill names
         if not query.strip():
             names = sorted(t.name for t in tools)
-            return ToolResult(output=json.dumps({"tools": names}, indent=2))
+            result: dict[str, Any] = {"tools": names}
+            if self._skill_registry is not None:
+                result["skills"] = sorted(s.name for s in self._skill_registry.list_skills())
+            return ToolResult(output=json.dumps(result, indent=2))
 
         query_lower = query.lower()
-        scored: list[tuple[float, BaseTool]] = []
+        scored: list[tuple[float, str, dict[str, Any]]] = []  # (score, type, entry)
 
+        # Score tools
         for tool in tools:
             score = self._score_tool(tool, query_lower)
-            scored.append((score, tool))
-
-        # Sort ascending by score (lower = better match)
-        scored.sort(key=lambda pair: pair[0])
-
-        top = scored[:5]
-        results: list[dict[str, Any]] = []
-        for score, tool in top:
             entry = tool.to_api_schema()
+            entry["type"] = "tool"
             entry["match_score"] = round(score, 3)
-            results.append(entry)
+            scored.append((score, "tool", entry))
 
+        # Score skills
+        if self._skill_registry is not None:
+            for skill in self._skill_registry.list_skills():
+                score = self._score_skill(skill, query_lower)
+                entry = {
+                    "type": "skill",
+                    "name": skill.name,
+                    "description": skill.description,
+                    "source": skill.source,
+                    "match_score": round(score, 3),
+                }
+                scored.append((score, "skill", entry))
+
+        scored.sort(key=lambda t: t[0])
+        results = [entry for _, _, entry in scored[:5]]
         return ToolResult(output=json.dumps(results, indent=2))
 
     # -- scoring ------------------------------------------------------------
@@ -175,3 +204,25 @@ class ToolSearchTool(BaseTool):
         max_len = max(len(query_lower), len(name_lower), 1)
         normalized = dist / max_len
         return 4.0 + normalized
+
+    @staticmethod
+    def _score_skill(skill: Any, query_lower: str) -> float:
+        """Score a skill against a query (lower is better). Same tiers as _score_tool."""
+        name_lower = skill.name.lower()
+        desc_lower = skill.description.lower()
+
+        if query_lower == name_lower:
+            return 0.0
+        if query_lower in name_lower:
+            return 1.0
+        if query_lower in desc_lower:
+            return 2.0
+
+        words = query_lower.split()
+        word_hits = sum(1 for w in words if w in name_lower or w in desc_lower)
+        if word_hits > 0:
+            return 3.0 - (word_hits / max(len(words), 1))
+
+        dist = _levenshtein(query_lower, name_lower)
+        max_len = max(len(query_lower), len(name_lower), 1)
+        return 4.0 + dist / max_len

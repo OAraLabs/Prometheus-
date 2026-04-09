@@ -188,10 +188,15 @@ def create_tool_registry(security_cfg: dict[str, Any], security_gate=None) -> An
     ]:
         registry.register(tool)
 
-    # ToolSearchTool — always loaded, enables deferred tool loading
+    # ToolSearchTool — always loaded, enables deferred tool loading + skill search
     from prometheus.tools.tool_search import ToolSearchTool
     ts = ToolSearchTool()
     ts.set_registry(registry)
+    try:
+        from prometheus.skills.loader import load_skill_registry
+        ts.set_skill_registry(load_skill_registry())
+    except Exception:
+        pass
     registry.register(ts)
 
     # Sprint 11: Audit query tool (requires audit logger from security gate)
@@ -439,7 +444,15 @@ def build_system_prompt(config: dict[str, Any]) -> str:
     """Assemble the full system prompt."""
     try:
         from prometheus.context.prompt_assembler import build_runtime_system_prompt
-        return build_runtime_system_prompt(cwd=str(Path.cwd()), config=config)
+        skills_list = None
+        try:
+            from prometheus.skills.loader import load_skill_registry
+            sr = load_skill_registry()
+            if sr.list_skills():
+                skills_list = [{"name": s.name, "description": s.description} for s in sr.list_skills()]
+        except Exception:
+            pass
+        return build_runtime_system_prompt(cwd=str(Path.cwd()), config=config, skills=skills_list)
     except Exception:
         return config.get("gateway", {}).get(
             "system_prompt",
