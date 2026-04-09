@@ -256,6 +256,15 @@ def build_runtime_system_prompt(
     if memory_content:
         dynamic_sections.append(f"# Memory\n\n{memory_content}")
 
+    # User's saved files — so the agent knows what files exist without searching
+    try:
+        from prometheus.utils.user_files import files_context_block
+        files_block = files_context_block()
+        if files_block:
+            dynamic_sections.append(f"# Saved Files\n\n{files_block}")
+    except Exception:
+        pass  # Non-critical — skip if module not available
+
     # Task state
     if task_state:
         dynamic_sections.append(f"# Current Task State\n\n{task_state}")

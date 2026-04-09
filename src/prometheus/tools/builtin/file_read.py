@@ -41,7 +41,13 @@ class FileReadTool(BaseTool):
     ) -> ToolResult:
         path = _resolve_path(context.cwd, arguments.path)
         if not path.exists():
-            return ToolResult(output=f"File not found: {path}", is_error=True)
+            # Check ~/.prometheus/files/ as a fallback for user-saved files
+            # (user might say "read my research brief" without full path)
+            alt = _check_user_files(arguments.path)
+            if alt:
+                path = alt
+            else:
+                return ToolResult(output=f"File not found: {path}", is_error=True)
         if path.is_dir():
             return ToolResult(output=f"Cannot read directory: {path}", is_error=True)
 
@@ -66,3 +72,25 @@ def _resolve_path(base: Path, candidate: str) -> Path:
     if not path.is_absolute():
         path = base / path
     return path.resolve()
+
+
+def _check_user_files(filename: str) -> Path | None:
+    """Check ~/.prometheus/files/ for a matching file (case-insensitive partial match)."""
+    try:
+        from prometheus.config.paths import get_config_dir
+        files_dir = get_config_dir() / "files"
+        if not files_dir.is_dir():
+            return None
+
+        name_lower = Path(filename).name.lower()
+        for entry in files_dir.iterdir():
+            if entry.is_file() and entry.name.lower() == name_lower:
+                return entry
+
+        # Partial match — filename might be a substring
+        for entry in files_dir.iterdir():
+            if entry.is_file() and name_lower in entry.name.lower():
+                return entry
+    except Exception:
+        pass
+    return None
