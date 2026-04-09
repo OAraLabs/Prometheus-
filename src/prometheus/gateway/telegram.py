@@ -204,7 +204,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _last_chat_id_path(self) -> str:
         """Path to persist the last active Telegram chat ID across restarts."""
-        from prometheus.config import get_config_dir
+        from prometheus.config.paths import get_config_dir
         return str(get_config_dir() / "last_telegram_chat_id")
 
     def _save_chat_id(self, chat_id: int) -> None:
@@ -241,8 +241,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Find chat ID: persisted file → session manager → config
         chat_id: int | None = self._load_chat_id()
 
-        if not chat_id and self.session_mgr:
-            for key in list(self.session_mgr._sessions.keys()):
+        if not chat_id and self.session_manager:
+            for key in list(self.session_manager._sessions.keys()):
                 if key.startswith("telegram:"):
                     try:
                         chat_id = int(key.split(":", 1)[1])
@@ -258,9 +258,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 result = await self.send(chat_id, msg)
                 if result.success:
                     logger.info("Sent startup greeting to chat %d", chat_id)
-                    if self.session_mgr:
+                    if self.session_manager:
                         session_key = f"telegram:{chat_id}"
-                        self.session_mgr.get_or_create(session_key)
+                        self.session_manager.get_or_create(session_key)
             except Exception as exc:
                 logger.warning("Failed to send startup greeting: %s", exc)
         else:
