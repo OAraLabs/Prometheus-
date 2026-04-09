@@ -107,6 +107,19 @@ class WebSocketBridge:
             if session_id and content:
                 await self._handle_send_message(session_id, content)
 
+        elif cmd_type == "chat_upload":
+            # File upload from Beacon: { type: "chat_upload", payload: {
+            #   session_id, filename, content_base64, mime_type, caption? } }
+            session_id = payload.get("session_id", "")
+            filename = payload.get("filename", "file")
+            content_b64 = payload.get("content_base64", "")
+            mime_type = payload.get("mime_type", "")
+            caption = payload.get("caption", "")
+            if session_id and content_b64:
+                await self._handle_file_upload(
+                    session_id, filename, content_b64, mime_type, caption
+                )
+
         elif cmd_type == "switch_session":
             session_id = payload.get("session_id", "")
             if session_id and self.session_mgr:
@@ -124,6 +137,88 @@ class WebSocketBridge:
                             "message_id": f"hist-{i}",
                         },
                     })
+
+    async def _handle_file_upload(
+        self,
+        session_id: str,
+        filename: str,
+        content_base64: str,
+        mime_type: str,
+        caption: str,
+    ) -> None:
+        """Handle a file upload from Beacon dashboard.
+
+        Routes by type:
+          - Images → cache + vision analysis (same as Telegram photos)
+          - Documents → cache + text extraction (same as Telegram documents)
+        """
+        import base64
+
+        try:
+            data = base64.b64decode(content_base64)
+        except Exception:
+            logger.warning("Invalid base64 in chat_upload")
+            return
+
+        # Size guard: 20 MB
+        if len(data) > 20 * 1024 * 1024:
+            await self.broadcast({
+                "type": "chat_message",
+                "timestamp": time.time(),
+                "payload": {
+                    "session_id": session_id,
+                    "role": "system",
+                    "content": "File too large (max 20 MB).",
+                    "message_id": f"sys-{int(time.time() * 1000)}",
+                },
+            })
+            return
+
+        from pathlib import Path as _Path
+        ext = _Path(filename).suffix.lower()
+
+        if mime_type.startswith("image/"):
+            # Image upload → cache + vision
+            from prometheus.gateway.media_cache import cache_image_from_bytes, sniff_image_extension
+            img_ext = ext if ext in (".png", ".jpg", ".jpeg", ".gif", ".webp") else sniff_image_extension(filename)
+            cached_path = cache_image_from_bytes(data, ext=img_ext)
+
+            desc = await self._describe_image(cached_path)
+            if desc:
+                user_text = f"[Image: {desc}]"
+            else:
+                user_text = f"[The user sent an image: {filename}]"
+            if caption:
+                user_text = f"{user_text}\n{caption}"
+        else:
+            # Document upload → cache + text extraction
+            from prometheus.gateway.media_cache import cache_document_from_bytes
+            from prometheus.utils.file_extract import extract_text, is_supported, unsupported_message
+
+            if not is_supported(filename):
+                await self.broadcast({
+                    "type": "chat_message",
+                    "timestamp": time.time(),
+                    "payload": {
+                        "session_id": session_id,
+                        "role": "system",
+                        "content": unsupported_message(filename),
+                        "message_id": f"sys-{int(time.time() * 1000)}",
+                    },
+                })
+                return
+
+            cached_path = cache_document_from_bytes(data, filename)
+            extracted = extract_text(cached_path)
+            if extracted:
+                user_text = f"[Content of {filename}]:\n{extracted}"
+                if caption:
+                    user_text = f"{caption}\n\n{user_text}"
+            else:
+                user_text = caption or f"[The user sent a document: {filename}]"
+
+        # Dispatch as a user message (same as _handle_send_message)
+        await self._handle_send_message(session_id, user_text)
 
     async def _describe_image(self, image_path: str) -> str | None:
         """Run vision analysis on a cached image file, matching Telegram gateway flow."""

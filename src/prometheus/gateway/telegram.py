@@ -1086,18 +1086,22 @@ class TelegramAdapter(BasePlatformAdapter):
         from prometheus.gateway.media_cache import (
             SUPPORTED_DOCUMENT_TYPES,
             cache_document_from_bytes,
-            extract_text_from_document,
+        )
+        from prometheus.utils.file_extract import (
+            extract_text,
+            is_supported as is_extractable,
+            unsupported_message,
         )
 
         doc = update.message.document
         original_name = doc.file_name or "unknown"
         ext = Path(original_name).suffix.lower()
 
-        # Validate document type
-        if ext not in SUPPORTED_DOCUMENT_TYPES:
+        # Validate document type — accept both media_cache types and file_extract types
+        if ext not in SUPPORTED_DOCUMENT_TYPES and not is_extractable(original_name):
             await self.send(
                 update.effective_chat.id,
-                f"Unsupported document type: {ext}",
+                unsupported_message(original_name),
             )
             return
 
@@ -1121,8 +1125,9 @@ class TelegramAdapter(BasePlatformAdapter):
         caption = update.message.caption or ""
         mime = SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
 
-        # Try to extract text for inline injection
-        extracted = extract_text_from_document(cached_path)
+        # Try to extract text for inline injection (shared extractor handles
+        # plain text, PDF, DOCX, XLSX — same logic as Beacon web uploads)
+        extracted = extract_text(cached_path)
         if extracted:
             user_text = f"[Content of {original_name}]:\n{extracted}"
             if caption:
