@@ -96,45 +96,52 @@ async def run_daemon(args: argparse.Namespace) -> None:
     gateway_config = config.get("gateway", {})
     security_config = config.get("security", {})
 
-    # ── Config drift guard ────────────────────────────────────────────────
-    # Validate critical config fields against expected values to catch
-    # accidental drift (e.g. provider switched from llama_cpp to ollama).
-    # If drift is detected, AUTO-FIX and reload rather than running with
-    # wrong settings.
-    _gpu_host = config.get("infrastructure", {}).get("gpu_host", "")
-    _EXPECTED = {
-        "model.provider": "llama_cpp",
-        "model.base_url": f"http://{_gpu_host}:8080" if _gpu_host else None,
-    }
-    _drifted = False
-    for dotpath, expected in _EXPECTED.items():
-        if expected is None:
-            continue
-        parts = dotpath.split(".")
-        val = config
-        for p in parts:
-            val = val.get(p, {}) if isinstance(val, dict) else None
-        if val and val != expected:
-            logger.warning(
-                "CONFIG DRIFT DETECTED: %s = %r (expected %r). Auto-fixing.",
-                dotpath, val, expected,
-            )
-            # Auto-fix in the loaded config dict
-            obj = config
-            for p in parts[:-1]:
-                obj = obj.setdefault(p, {})
-            obj[parts[-1]] = expected
-            _drifted = True
-
-    if _drifted:
-        # Write corrected config back to disk so it sticks
-        config_path = Path(args.config) if args.config else Path("config/prometheus.yaml")
+    # ── Config drift guard (opt-in) ─────────────────────────────────────
+    # Users can create ~/.prometheus/config_pins.yaml to pin critical
+    # config values. If a pinned value drifts, the daemon auto-corrects
+    # both in-memory and on disk.
+    #
+    # Example ~/.prometheus/config_pins.yaml:
+    #   model.provider: llama_cpp
+    #   model.base_url: http://<gpu-host>:8080
+    #
+    # If the file doesn't exist, no checking happens — users who run
+    # Ollama, Anthropic, etc. are unaffected.
+    _pins_path = get_config_dir() / "config_pins.yaml"
+    if _pins_path.is_file():
         try:
-            with config_path.open("w", encoding="utf-8") as fh:
-                yaml.dump(config, fh, default_flow_style=False, sort_keys=False)
-            logger.info("CONFIG AUTO-FIXED: wrote corrected values to %s", config_path)
-        except Exception as exc:
-            logger.error("Failed to auto-fix config file: %s", exc)
+            with _pins_path.open(encoding="utf-8") as fh:
+                _pins = yaml.safe_load(fh) or {}
+        except Exception:
+            _pins = {}
+
+        _drifted = False
+        for dotpath, expected in _pins.items():
+            if expected is None:
+                continue
+            parts = str(dotpath).split(".")
+            val = config
+            for p in parts:
+                val = val.get(p, {}) if isinstance(val, dict) else None
+            if val and str(val) != str(expected):
+                logger.warning(
+                    "CONFIG DRIFT DETECTED: %s = %r (pinned: %r). Auto-fixing.",
+                    dotpath, val, expected,
+                )
+                obj = config
+                for p in parts[:-1]:
+                    obj = obj.setdefault(p, {})
+                obj[parts[-1]] = expected
+                _drifted = True
+
+        if _drifted:
+            config_path = Path(args.config) if args.config else Path("config/prometheus.yaml")
+            try:
+                with config_path.open("w", encoding="utf-8") as fh:
+                    yaml.dump(config, fh, default_flow_style=False, sort_keys=False)
+                logger.info("CONFIG AUTO-FIXED: wrote corrected values to %s", config_path)
+            except Exception as exc:
+                logger.error("Failed to auto-fix config file: %s", exc)
 
     # Sprint 15 GRAFT: scoped daemon lock — prevent duplicate instances
     from prometheus.gateway.status import acquire_daemon_lock, release_daemon_lock
