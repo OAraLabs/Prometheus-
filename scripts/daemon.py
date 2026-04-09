@@ -96,6 +96,28 @@ async def run_daemon(args: argparse.Namespace) -> None:
     gateway_config = config.get("gateway", {})
     security_config = config.get("security", {})
 
+    # ── Config drift guard ────────────────────────────────────────────────
+    # Validate critical config fields against expected values to catch
+    # accidental drift (e.g. provider switched from llama_cpp to ollama).
+    # Expected values loaded from infra config to avoid hardcoding IPs
+    _gpu_host = config.get("infrastructure", {}).get("gpu_host", "")
+    _EXPECTED = {
+        "model.provider": "llama_cpp",
+        "model.base_url": f"http://{_gpu_host}:8080" if _gpu_host else None,
+    }
+    for dotpath, expected in _EXPECTED.items():
+        parts = dotpath.split(".")
+        val = config
+        for p in parts:
+            val = val.get(p, {}) if isinstance(val, dict) else None
+        if val and val != expected:
+            logger.warning(
+                "CONFIG DRIFT DETECTED: %s = %r (expected %r). "
+                "This may cause incorrect model routing. "
+                "Fix config/prometheus.yaml and restart.",
+                dotpath, val, expected,
+            )
+
     # Sprint 15 GRAFT: scoped daemon lock — prevent duplicate instances
     from prometheus.gateway.status import acquire_daemon_lock, release_daemon_lock
     lock_ok, lock_reason = acquire_daemon_lock()
