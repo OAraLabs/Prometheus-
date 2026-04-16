@@ -1,17 +1,51 @@
 # Prometheus
 
-**A sovereign AI agent harness that makes open models actually work.**
+A sovereign, model-agnostic agent framework for local hardware. Built by assembling the strongest ideas from proven agent projects — Claude Code's orchestration patterns, Hermes' always-on gateway, OpenHarness' tool pipeline, and a DAG-based lossless context engine — into a new skeleton, with a validation layer that makes open models actually reliable in a tool-calling loop.
 
-Run Qwen, Gemma, Llama, Mistral — whatever llama.cpp can serve — with the same quality of tool calling, memory, and orchestration you'd expect from Claude or GPT. Except it runs on your hardware, with your models, and your data never leaves your network.
+Built in the open, shipped while still rough, improving weekly.
+
+**The model is the agent. The harness is the vehicle.**
+
+> **Status:** Active development. Expect rough edges. Fixes land weekly. Feedback welcome.
 
 ```bash
-git clone https://github.com/whieber1/Prometheus-.git
+git clone https://github.com/OAraLabs/Prometheus-.git
 cd Prometheus-
 pip install -e .
 python3 -m prometheus --setup
 ```
 
 Four questions. Five minutes. Working agent.
+
+MIT License · Python 3.11+ · Active Development · 1,179+ Tests
+
+---
+
+## What Prometheus inherits
+
+Not a fork. Prometheus is a new codebase that extracts specific subsystems from proven MIT-licensed projects:
+
+| Subsystem | Donor | What was extracted |
+|---|---|---|
+| Agent loop | Claude Code (via OpenHarness, MIT) | Tool registry, hook pipeline, permission governance — clean-room reimplementation |
+| Always-on gateway | Hermes (MIT) | Telegram/Slack messaging, cron scheduling, credential rotation |
+| Context management | OpenClaw plugin (MIT) | DAG-based lossless compression with full-text search (11,600 lines TS → Python) |
+| Production patterns | OpenClaw (MIT) | Memory extractor, archive bridge, heartbeat |
+| Knowledge base | Karpathy's LLM Wiki (concept) | Memory extraction → wiki pages → cross-referenced knowledge |
+
+All extracted code carries a provenance header: Source, Original path, License, Modified.
+
+---
+
+## What we had to build
+
+Three subsystems had no good donor and were built from scratch:
+
+- **Model Adapter Layer** — the gap between Claude-quality tool-calling and what open models actually produce. Validates, auto-repairs, enforces output schemas, retries with specific error context.
+- **SENTINEL** — a proactive layer that watches for idle time and acts, instead of only reacting to prompts. Nudges, dreams, synthesizes.
+- **Wiki Knowledge System** — turns every conversation into a compounding knowledge base that cross-references itself over time.
+
+These are where most of the interesting work lives.
 
 ---
 
@@ -153,7 +187,7 @@ Markdown skill files in `skills/` that teach the agent patterns — from code re
 ### Install
 
 ```bash
-git clone https://github.com/whieber1/Prometheus-.git
+git clone https://github.com/OAraLabs/Prometheus-.git
 cd Prometheus-
 pip install -e .
 python3 -m prometheus --setup
@@ -330,22 +364,6 @@ prometheus/
 
 ---
 
-## Provenance
-
-Prometheus is assembled from the best parts of five MIT-licensed projects — but it's a new codebase, not a fork or patchwork. Every donor file includes a header with source, license, and what was modified. The novel systems (Model Adapter Layer, SENTINEL, evaluation framework, LSP integration, AnatomyScanner) were written from scratch.
-
-| Source | What Was Taken | How It Was Used |
-|--------|---------------|-----------------|
-| OpenHarness (HKUDS) | Agent loop, tool registry, hooks, permissions | Clean-room Python reimplementation |
-| Hermes (NousResearch) | Telegram gateway, cron, memory patterns | Extracted, adapted interfaces |
-| OpenClaw | Integration patterns, heartbeat, security lessons | Patterns adapted, CVE analysis informed security |
-| Lossless-Claw (Martian) | DAG-based context management | Full port from 11.6K lines TypeScript |
-| Karpathy's LLM Wiki | Compounding knowledge base concept | Adapted into wiki pipeline |
-
-No proprietary source code is in this project. Claude Code-inspired architecture is based on [Sigrid Jin's](https://github.com/instructkr) clean-room reimplementation (@realsigridjin).
-
----
-
 ## Benchmarks
 
 ```bash
@@ -411,6 +429,6 @@ MIT
 
 ## Credits
 
-Built by [Will Hieber](https://github.com/whieber1) / OAra Labs.
+Built by [Will Hieber](https://github.com/OAraLabs) / OAra Labs.
 
 Architecture informed by: [OpenHarness](https://github.com/HKUDS/OpenHarness), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Lossless-Claw](https://github.com/Martian-Engineering/lossless-claw), and Andrej Karpathy's [LLM Wiki concept](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). Claude Code architecture patterns derived from [Sigrid Jin's](https://github.com/instructkr) clean-room analysis.
